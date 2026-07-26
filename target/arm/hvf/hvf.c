@@ -45,6 +45,15 @@
 #define MDSCR_EL1_SS_SHIFT  0
 #define MDSCR_EL1_MDE_SHIFT 15
 
+/*
+ * Apple GXF guarded-mode entry/exit under HVF. GENTER/GEXIT UNDEF on this host
+ * (they require a private hypervisor ISA level we cannot reach), so the kernel
+ * patcher rewrites them to HVC with these immediates and we emulate guarded
+ * mode in the EC_AA64_HVC handler. These values must match the kernel patcher.
+ */
+#define HVF_HVC_GXF_ENTER 0xF000
+#define HVF_HVC_GXF_EXIT  0xF001
+
 static const uint16_t dbgbcr_regs[] = {
     HV_SYS_REG_DBGBCR0_EL1,
     HV_SYS_REG_DBGBCR1_EL1,
@@ -1959,8 +1968,58 @@ static int hvf_handle_exception(CPUState *cpu, hv_vcpu_exit_exception_t *excp)
             hvf_wfi(cpu);
         }
         break;
-    case EC_AA64_HVC:
+    case EC_AA64_HVC: {
+        uint32_t hvc_imm = syndrome & 0xffff;
+
         cpu_synchronize_state(cpu);
+
+        /*
+         * Apple GXF under HVF: a patched GENTER/GEXIT arrives as HVC with one
+         * of our reserved immediates. Emulate guarded-mode entry/exit here.
+         * The GXF-banked EL1 registers (TPIDR/VBAR/SPSR/ELR/ESR/FAR/SP) are
+         * then swapped automatically by the guarded-aware cpreg sync in
+         * hvf_arch_{get,put}_registers(), which routes through arm_is_guarded()
+         * -- i.e. off the gxf_status_el[] bit these two paths toggle.
+         */
+        if (arm_feature(env, ARM_FEATURE_GXF) &&
+            (hvc_imm == HVF_HVC_GXF_ENTER || hvc_imm == HVF_HVC_GXF_EXIT)) {
+            if (hvc_imm == HVF_HVC_GXF_ENTER) {
+                /*
+                 * Reuse the shared GXF entry in arm_cpu_do_interrupt(): it
+                 * saves ELR_GL/SPSR_GL, sets the guarded status bit, and
+                 * vectors to GXF_ENTER_EL1. ELR_GL must point past the patched
+                 * GENTER, so advance $pc first.
+                 */
+                env->pc += 4;
+                env->exception.target_el = 1;
+                env->exception.syndrome = syn_aa64_genter(0);
+                cpu->exception_index = EXCP_GENTER;
+                arm_cpu_do_interrupt(cpu);
+            } else {
+                /*
+                 * GXF exit: mirror helper_gexit() -- restore PSTATE and PC
+                 * from the GL bank and clear the guarded status bit.
+                 */
+                int el = arm_current_el(env);
+                uint32_t spsr = env->gxf.spsr_gl[el];
+
+                aarch64_save_sp(env, el);
+                if (arm_generate_debug_exceptions(env)) {
+                    spsr &= ~PSTATE_SS;
+                }
+                spsr &= aarch64_pstate_valid_mask(&env_archcpu(env)->isar);
+                pstate_write(env, spsr);
+                if (!arm_singlestep_active(env)) {
+                    env->pstate &= ~PSTATE_SS;
+                }
+                env->gxf.gxf_status_el[el] &= ~1;
+                aarch64_restore_sp(env, el);
+                env->pc = env->gxf.elr_gl[el];
+            }
+            cpu->vcpu_dirty = true;
+            break;
+        }
+
         if (arm_cpu->psci_conduit == QEMU_PSCI_CONDUIT_HVC) {
             /* Do NOT advance $pc for HVC */
             if (!hvf_handle_psci_call(cpu)) {
@@ -1974,6 +2033,7 @@ static int hvf_handle_exception(CPUState *cpu, hv_vcpu_exit_exception_t *excp)
             hvf_raise_exception(cpu, EXCP_UDEF, syn_uncategorized(), 1);
         }
         break;
+    }
     case EC_AA64_SMC:
         cpu_synchronize_state(cpu);
         if (arm_cpu->psci_conduit == QEMU_PSCI_CONDUIT_SMC) {
