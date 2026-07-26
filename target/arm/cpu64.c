@@ -749,9 +749,24 @@ static void aarch64_apple_gxf_initfn(Object *obj)
     ARMCPU *cpu = ARM_CPU(obj);
 
     aarch64_max_initfn(obj);
-    SET_IDREG(&cpu->isar, ID_AA64ISAR1, REG_FIELD_DP64(GET_IDREG(&cpu->isar, ID_AA64ISAR1), ID_AA64ISAR1, APA, PauthFeat_2));
 
+    /*
+     * Apple's forced PAuth advertisement (APA = PauthFeat_2) and the
+     * pauth-noop behaviour are TCG execution details: under HVF/KVM the CPU's
+     * ID registers come from the host, so forcing an APA field there just
+     * disagrees with the host's real PAC and is overwritten anyway. Keep both
+     * on the TCG path only.
+     *
+     * ARM_FEATURE_GXF, by contrast, is required in BOTH paths. TCG decodes
+     * GENTER/GEXIT with it, and the HVF backend emulates guarded mode (see the
+     * EC_AA64_HVC handling in target/arm/hvf/hvf.c) which keys off
+     * arm_is_guarded() -- and that helper gates on this feature bit. So set it
+     * unconditionally.
+     */
     if (tcg_enabled()) {
+        SET_IDREG(&cpu->isar, ID_AA64ISAR1,
+                  REG_FIELD_DP64(GET_IDREG(&cpu->isar, ID_AA64ISAR1),
+                                 ID_AA64ISAR1, APA, PauthFeat_2));
         object_property_set_bool(obj, "pauth-noop", true, NULL);
     }
 
