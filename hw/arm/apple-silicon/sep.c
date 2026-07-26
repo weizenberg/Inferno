@@ -40,6 +40,7 @@
 #include "system/address-spaces.h"
 #include "system/block-backend-global-state.h"
 #include "system/block-backend-io.h"
+#include "system/hw_accel.h"
 #include "system/tcg.h"
 #include "trace.h"
 #include <nettle/ccm.h>
@@ -4028,6 +4029,16 @@ static void apple_sep_cpu_moni_reset_regs(CPUState *cpu, hwaddr load_addr,
     env->cp15.rvbar = load_addr;
     env->cp15.vbar_el[1] = load_addr;
     cpu_set_pc(cpu, load_addr);
+
+    /*
+     * Everything above rewrites env by hand. Under TCG that is the CPU state
+     * and there is nothing more to do, but under HVF env is only a shadow of
+     * the hardware vCPU: unless the new state is pushed out, the SEP core
+     * carries on with SEPROM's PC, SCTLR, TTBRs and VBAR and never enters
+     * SEPOS, which the AP then reports as "SEP/OS failed to boot at stage 1".
+     * cpu_synchronize_post_reset() is a no-op for TCG.
+     */
+    cpu_synchronize_post_reset(cpu);
 }
 
 // some race conditions might happen before, during and/or after the jump.
@@ -4051,6 +4062,8 @@ static void apple_sep_cpu_moni_jump(CPUState *cpu, run_on_cpu_data data)
             load_addr);
 
     AppleA13State *acpu = container_of(arm_cpu, AppleA13State, parent_obj);
+    // env is stale under HVF until the live vCPU state is pulled in.
+    cpu_synchronize_state(cpu);
     hwaddr pwr_dn_save = acpu->A13_CPREG_VAR_NAME(SYS_ACC_PWR_DN_SAVE);
     cpu_pause(cpu);
     apple_sep_cpu_moni_reset_regs(cpu, load_addr, pwr_dn_save);
