@@ -1947,11 +1947,13 @@ static void hvf_wait_for_ipi(CPUState *cpu, struct timespec *ts)
 static void hvf_wfi(CPUState *cpu)
 {
     ARMCPU *arm_cpu = ARM_CPU(cpu);
+    CPUARMState *env = &arm_cpu->env;
+    ARMGenericTimer *pgt = &env->cp15.c14_timer[GTIMER_PHYS];
     struct timespec ts;
     hv_return_t r;
     uint64_t ctl;
     uint64_t cval;
-    int64_t ticks_to_sleep;
+    int64_t ticks_to_sleep = INT64_MAX;
     uint64_t seconds;
     uint64_t nanos;
     uint32_t cntfrq;
@@ -1961,19 +1963,39 @@ static void hvf_wfi(CPUState *cpu)
         return;
     }
 
+    /* The virtual timer is HVF's own; ask it for the deadline. */
     r = hv_vcpu_get_sys_reg(cpu->accel->fd, HV_SYS_REG_CNTV_CTL_EL0, &ctl);
     assert_hvf_ok(r);
 
-    if (!(ctl & 1) || (ctl & 2)) {
-        /* Timer disabled or masked, just wait for an IPI. */
+    if ((ctl & 3) == 1) {
+        r = hv_vcpu_get_sys_reg(cpu->accel->fd, HV_SYS_REG_CNTV_CVAL_EL0,
+                                &cval);
+        assert_hvf_ok(r);
+        ticks_to_sleep = cval - hvf_vtimer_val();
+    }
+
+    /*
+     * The physical timer is not. XNU on Apple silicon and SEPOS both drive
+     * their tick from it, so CNTP_CTL_EL0 is handed to QEMU's cpreg model (see
+     * hvf_sysreg_write()) and HVF knows nothing about the deadline the guest
+     * programmed. Without accounting for it here, a guest that WFIs waiting on
+     * the physical timer sleeps with no timeout at all and only ever wakes if
+     * something else happens to kick the vCPU -- which is how the SEP came to
+     * sit in WFI forever after arming CNTP and masking its other interrupts.
+     */
+    if ((pgt->ctl & 1) != 0) {
+        int64_t phys_ticks = pgt->cval - qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) /
+                                             gt_cntfrq_period_ns(arm_cpu);
+
+        ticks_to_sleep = MIN(ticks_to_sleep, phys_ticks);
+    }
+
+    if (ticks_to_sleep == INT64_MAX) {
+        /* Both timers disabled or masked, just wait for an IPI. */
         hvf_wait_for_ipi(cpu, NULL);
         return;
     }
 
-    r = hv_vcpu_get_sys_reg(cpu->accel->fd, HV_SYS_REG_CNTV_CVAL_EL0, &cval);
-    assert_hvf_ok(r);
-
-    ticks_to_sleep = cval - hvf_vtimer_val();
     if (ticks_to_sleep < 0) {
         return;
     }
