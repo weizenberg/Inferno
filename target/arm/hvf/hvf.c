@@ -1267,6 +1267,18 @@ static uint32_t hvf_reg2cp_reg(uint32_t reg)
 }
 
 /*
+ * env has to be authoritative before emulating a register from QEMU's cpreg
+ * table, and the result has to get back to the guest. Several Apple registers
+ * decide what to do from env -- access_gxf() and the GXF banking accessors in
+ * a13_gxf.c branch on arm_is_guarded(env), and the GL registers alias state that
+ * the GXF bank swap moves between env and the hardware. Previously only the
+ * *unhandled* sysreg paths synchronised, so a successfully emulated access read
+ * and wrote a stale shadow and was never pushed back: while guarded the live
+ * SP_EL1 is the hardware copy, so a trapped SP_GL11 access saw a snapshot.
+ * cpu_synchronize_state() also marks the vCPU dirty, which is what gets the
+ * emulated write flushed.
+ */
+/*
  * `denied` (when not NULL) reports that the register exists but this access was
  * refused, which the guest has to see as a system register trap rather than an
  * undefined instruction -- see the tail of hvf_sysreg_read().
@@ -1280,6 +1292,7 @@ static bool hvf_sysreg_read_cp(CPUState *cpu, const char *cpname,
 
     ri = ARMCPRegTable_cget(arm_cpu->cp_regs, hvf_reg2cp_reg(reg));
     if (ri) {
+        cpu_synchronize_state(cpu);
         if (!cp_access_ok(1, ri, true)) {
             if (denied != NULL) {
                 *denied = true;
@@ -1319,6 +1332,7 @@ static bool hvf_sysreg_write_cp(CPUState *cpu, const char *cpname,
     ri = ARMCPRegTable_cget(arm_cpu->cp_regs, hvf_reg2cp_reg(reg));
 
     if (ri) {
+        cpu_synchronize_state(cpu);
         if (!cp_access_ok(1, ri, false)) {
             if (denied != NULL) {
                 *denied = true;
