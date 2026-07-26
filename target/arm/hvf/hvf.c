@@ -450,8 +450,11 @@ static const hv_sys_reg_t hvf_sreg_list[] = {
  * around the sync while the guest is guarded, since the hardware copies then
  * hold the GL bank.
  *
- * SP is deliberately absent: aarch64_save_sp()/aarch64_restore_sp() and the
- * explicit SP_GL11 cpreg already handle it.
+ * SP_EL1 has to be in here too. TCG does not bank it -- there env is
+ * authoritative, and aarch64_save_sp()/aarch64_restore_sp() across GENTER/GEXIT
+ * are enough -- but under HVF the hardware copy is the live one, so without the
+ * swap the guest returns from guarded mode on the wrong stack and XNU's
+ * exception vectors spin on their stack-bounds check.
  */
 typedef struct {
     size_t arch_off;
@@ -471,6 +474,8 @@ static const HvfGxfBankedReg hvf_gxf_banked_regs[] = {
       offsetof(CPUARMState, gxf.esr_gl[1]) },
     { offsetof(CPUARMState, cp15.far_el[1]),
       offsetof(CPUARMState, gxf.far_gl[1]) },
+    { offsetof(CPUARMState, sp_el[1]),
+      offsetof(CPUARMState, gxf.sp_gl[1]) },
 };
 
 static inline uint64_t *hvf_gxf_field(CPUARMState *env, size_t off)
