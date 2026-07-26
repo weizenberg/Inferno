@@ -48,11 +48,10 @@
 /*
  * Apple GXF guarded-mode entry/exit under HVF. GENTER/GEXIT UNDEF on this host
  * (they require a private hypervisor ISA level we cannot reach), so the kernel
- * patcher rewrites them to HVC with these immediates and we emulate guarded
- * mode in the EC_AA64_HVC handler. These values must match the kernel patcher.
+ * patcher rewrites them to HVC and we emulate guarded mode in the EC_AA64_HVC
+ * handler. The immediates are the shared ABI in this header.
  */
-#define HVF_HVC_GXF_ENTER 0xF000
-#define HVF_HVC_GXF_EXIT  0xF001
+#include "hw/arm/apple-silicon/gxf-hvc.h"
 
 static const uint16_t dbgbcr_regs[] = {
     HV_SYS_REG_DBGBCR0_EL1,
@@ -1982,17 +1981,21 @@ static int hvf_handle_exception(CPUState *cpu, hv_vcpu_exit_exception_t *excp)
          * -- i.e. off the gxf_status_el[] bit these two paths toggle.
          */
         if (arm_feature(env, ARM_FEATURE_GXF) &&
-            (hvc_imm == HVF_HVC_GXF_ENTER || hvc_imm == HVF_HVC_GXF_EXIT)) {
-            if (hvc_imm == HVF_HVC_GXF_ENTER) {
+            (HVF_HVC_IS_GXF_ENTER(hvc_imm) || hvc_imm == HVF_HVC_GXF_EXIT)) {
+            if (HVF_HVC_IS_GXF_ENTER(hvc_imm)) {
                 /*
                  * Reuse the shared GXF entry in arm_cpu_do_interrupt(): it
                  * saves ELR_GL/SPSR_GL, sets the guarded status bit, and
                  * vectors to GXF_ENTER_EL1. ELR_GL must point past the patched
                  * GENTER, so advance $pc first.
+                 *
+                 * GENTER's Rd reaches the guest via ESR_GL, so recover it from
+                 * the immediate rather than reporting a constant.
                  */
                 env->pc += 4;
                 env->exception.target_el = 1;
-                env->exception.syndrome = syn_aa64_genter(0);
+                env->exception.syndrome =
+                    syn_aa64_genter(HVF_HVC_GXF_ENTER_RD(hvc_imm));
                 cpu->exception_index = EXCP_GENTER;
                 arm_cpu_do_interrupt(cpu);
             } else {

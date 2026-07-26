@@ -18,10 +18,13 @@
  */
 
 #include "qemu/osdep.h"
+#include "hw/arm/apple-silicon/gxf-hvc.h"
 #include "hw/arm/apple-silicon/kernel_patches.h"
 #include "hw/arm/apple-silicon/patcher.h"
 #include "qemu/bitops.h"
+#include "qemu/bswap.h"
 #include "qemu/error-report.h"
+#include "system/hvf.h"
 
 #define NOP (0xD503201F)
 #define MOV_W0_0 (0x52800000)
@@ -761,6 +764,63 @@ static void ck_kp_pmap_cs_enforce_patch(CKPatcherRange *range)
                             sizeof(repl));
 }
 
+/*
+ * Rewrite every occurrence of one Apple GXF instruction to HVC. Unlike the
+ * other patches here this has to hit *all* matches -- GENTER/GEXIT appear at
+ * every PPL trampoline -- and `ck_patcher_find_callback_ctx` stops at the first
+ * callback returning true, so the scan is open-coded. Returns the match count.
+ */
+static size_t ck_kp_gxf_rewrite_all(CKPatcherRange *range, uint32_t pattern,
+                                    uint16_t hvc_imm, bool carry_rd)
+{
+    size_t count;
+    vaddr off;
+
+    count = 0;
+    for (off = 0; off + sizeof(uint32_t) <= range->length;
+         off += sizeof(uint32_t)) {
+        uint8_t *insn_ptr;
+        uint32_t insn;
+        uint16_t imm;
+
+        insn_ptr = (uint8_t *)range->ptr + off;
+        insn = ldl_le_p(insn_ptr);
+        if ((insn & APPLE_GXF_INSN_MASK) != pattern) {
+            continue;
+        }
+
+        imm = carry_rd ? (hvc_imm | APPLE_GXF_INSN_RD(insn)) : hvc_imm;
+        stl_le_p(insn_ptr, APPLE_GXF_HVC_INSN(imm));
+        count += 1;
+    }
+
+    return count;
+}
+
+static void ck_kp_gxf_hvc_patches(CKPatcherRange *range)
+{
+    size_t genter;
+    size_t gexit;
+
+    if (range == NULL) {
+        return;
+    }
+
+    genter = ck_kp_gxf_rewrite_all(range, APPLE_GXF_INSN_GENTER,
+                                   HVF_HVC_GXF_ENTER_BASE, true);
+    gexit = ck_kp_gxf_rewrite_all(range, APPLE_GXF_INSN_GEXIT,
+                                  HVF_HVC_GXF_EXIT, false);
+
+    if (genter == 0 && gexit == 0) {
+        warn_report("`GXF to HVC` patch found no GENTER/GEXIT in `%s`.",
+                    range->name);
+        return;
+    }
+
+    info_report("`GXF to HVC` patch rewrote %zu GENTER and %zu GEXIT in `%s`.",
+                genter, gexit, range->name);
+}
+
 void ck_patch_kernel(MachoHeader64 *hdr)
 {
     MachoHeader64 *apfs_hdr;
@@ -809,5 +869,16 @@ void ck_patch_kernel(MachoHeader64 *hdr)
     } else {
         ck_kp_tc_patch(kernel_ppltext);
         ck_kp_pmap_cs_enforce_patch(kernel_ppltext);
+    }
+
+    /*
+     * HVF cannot trap GENTER/GEXIT, so without this the guest takes its own
+     * UNDEF and panics; see gxf-hvc.h. TCG decodes the real instructions in
+     * disas_apple_insn(), where an HVC would instead fault, so only rewrite
+     * them when running under HVF.
+     */
+    if (hvf_enabled()) {
+        ck_kp_gxf_hvc_patches(kernel_text);
+        ck_kp_gxf_hvc_patches(kernel_ppltext);
     }
 }
