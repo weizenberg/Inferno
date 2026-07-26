@@ -790,6 +790,23 @@ int hvf_arch_put_registers(CPUState *cpu)
         }
 
         val = arm_cpu->cpreg_values[i];
+        if (hvf_id == HV_SYS_REG_SCTLR_EL1 &&
+            arm_feature(env, ARM_FEATURE_GXF)) {
+            /*
+             * Force PAC off, mirroring what TCG already does.
+             *
+             * `pauth-noop` makes every PAC and AUT instruction a no-op under TCG,
+             * so the guest never really authenticates a pointer. HVF runs the
+             * host's IMPDEF PAC for real (ID_AA64ISAR1_EL1.API = 0x5 here, so
+             * FPAC too) while Apple's key management -- APCTL_EL1,
+             * KERNELKEY_LO/HI, the per-boot M-key XOR -- lives only in QEMU's
+             * shadow state and never reaches the hardware. Clearing the SCTLR
+             * enables is the architected way to make PAC and AUT pass pointers
+             * through unchanged, which is what TCG effectively does.
+             */
+            val &= ~((uint64_t)(SCTLR_EnIA | SCTLR_EnIB |
+                                SCTLR_EnDA | SCTLR_EnDB));
+        }
         ret = hv_vcpu_set_sys_reg(cpu->accel->fd, hvf_id, val);
         assert_hvf_ok(ret);
     }
