@@ -2000,7 +2000,16 @@ static int hvf_handle_exception(CPUState *cpu, hv_vcpu_exit_exception_t *excp)
 
         trace_hvf_insn_abort(env->pc, set, fnv, ea, s1ptw, ifsc);
 
-        /* fall through */
+        /*
+         * A stage-1 instruction abort belongs to the guest: inject it into
+         * EL1 so the guest's own handler runs, rather than falling through to
+         * the fatal "unhandled exception" path. Symmetric with EC_DATAABORT
+         * above (which injects EXCP_DATA_ABORT). This is the exception an iOS
+         * guest takes if a page is left non-EL1-executable -- e.g. PPL text
+         * once SPRR is no longer enforcing permissions under HVF.
+         */
+        hvf_raise_exception(cpu, EXCP_PREFETCH_ABORT, syndrome, 1);
+        break;
     }
     default:
         cpu_synchronize_state(cpu);
