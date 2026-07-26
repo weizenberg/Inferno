@@ -1702,9 +1702,21 @@ static int hvf_sysreg_write(CPUState *cpu, uint32_t reg, uint64_t trap_syndrome,
         return 0;
     case SYSREG_CNTP_CTL_EL0:
         /*
-         * Guests should not rely on the physical counter, but macOS emits
-         * disable writes to it. Let it do so, but ignore the requests.
+         * A macOS guest only ever disables the physical timer, so ignoring
+         * these writes is harmless for it. XNU on Apple silicon drives its
+         * tick from the physical timer instead, and dropping the write leaves
+         * the timer asserting forever -- the guest then spins in its FIQ
+         * handler, polling ARM64_REG_IPI_SR and PMCR0 for a source that is
+         * never there.
+         *
+         * QEMU's cpreg table implements CNTP fully, and CNTPCT_EL0 above is
+         * already answered from the same clock, so hand the write to the
+         * model; it drives the CPU timer outputs from there. Fall back to
+         * ignoring it if the register somehow is not in the table.
          */
+        if (hvf_sysreg_write_cp(cpu, "fallback", reg, val, &denied)) {
+            return 0;
+        }
         qemu_log_mask(LOG_UNIMP, "Unsupported write to CNTP_CTL_EL0\n");
         return 0;
     case SYSREG_OSDLR_EL1:
@@ -1846,17 +1858,26 @@ static int hvf_sysreg_write(CPUState *cpu, uint32_t reg, uint64_t trap_syndrome,
 /* Must be called by the owning thread */
 static int hvf_inject_interrupts(CPUState *cpu)
 {
-    if (cpu_test_interrupt(cpu, CPU_INTERRUPT_FIQ)) {
-        trace_hvf_inject_fiq();
-        hv_vcpu_set_pending_interrupt(cpu->accel->fd, HV_INTERRUPT_TYPE_FIQ,
-                                      true);
-    }
+    bool fiq = cpu_test_interrupt(cpu, CPU_INTERRUPT_FIQ);
+    bool irq = cpu_test_interrupt(cpu, CPU_INTERRUPT_HARD);
 
-    if (cpu_test_interrupt(cpu, CPU_INTERRUPT_HARD)) {
-        trace_hvf_inject_irq();
-        hv_vcpu_set_pending_interrupt(cpu->accel->fd, HV_INTERRUPT_TYPE_IRQ,
-                                      true);
+    /*
+     * HVF's pending interrupt is a level, so it has to be deasserted as well as
+     * asserted. Only ever raising it works for a guest whose interrupts come
+     * from the vtimer, but the Apple machines drive FIQ from the AIC and the
+     * fast-IPI registers: once the model dropped the line, a latched FIQ left
+     * the guest spinning in its handler looking for a source that was no longer
+     * there.
+     */
+    if (fiq) {
+        trace_hvf_inject_fiq();
     }
+    hv_vcpu_set_pending_interrupt(cpu->accel->fd, HV_INTERRUPT_TYPE_FIQ, fiq);
+
+    if (irq) {
+        trace_hvf_inject_irq();
+    }
+    hv_vcpu_set_pending_interrupt(cpu->accel->fd, HV_INTERRUPT_TYPE_IRQ, irq);
 
     return 0;
 }
