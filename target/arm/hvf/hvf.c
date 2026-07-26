@@ -435,6 +435,64 @@ static const hv_sys_reg_t hvf_sreg_list[] = {
 
 #undef DEF_SYSREG
 
+/*
+ * GXF banks a handful of EL1 registers behind GL copies. They are architected
+ * registers, so under HVF the guest's accesses to them execute natively and the
+ * banking readfn/writefn in a13_gxf.c never run. The cpreg sync cannot cover
+ * for that either: it goes through raw_read/raw_write, which deliberately
+ * bypass banking so that migration sees unbanked state.
+ *
+ * The result, before this table existed, was that a guarded-mode write to
+ * ELR_EL1 -- how XNU sets the address GEXIT returns to -- landed in the
+ * non-guarded field and was lost, so GEXIT resumed at the GENTER return
+ * address instead. Keep the invariant that env's architected fields always
+ * hold the non-guarded bank and gxf.*_gl always holds the GL bank, and swap
+ * around the sync while the guest is guarded, since the hardware copies then
+ * hold the GL bank.
+ *
+ * SP is deliberately absent: aarch64_save_sp()/aarch64_restore_sp() and the
+ * explicit SP_GL11 cpreg already handle it.
+ */
+typedef struct {
+    size_t arch_off;
+    size_t gl_off;
+} HvfGxfBankedReg;
+
+static const HvfGxfBankedReg hvf_gxf_banked_regs[] = {
+    { offsetof(CPUARMState, cp15.tpidr_el[1]),
+      offsetof(CPUARMState, gxf.tpidr_gl[1]) },
+    { offsetof(CPUARMState, cp15.vbar_el[1]),
+      offsetof(CPUARMState, gxf.vbar_gl[1]) },
+    { offsetof(CPUARMState, banked_spsr[BANK_SVC]),
+      offsetof(CPUARMState, gxf.spsr_gl[1]) },
+    { offsetof(CPUARMState, elr_el[1]),
+      offsetof(CPUARMState, gxf.elr_gl[1]) },
+    { offsetof(CPUARMState, cp15.esr_el[1]),
+      offsetof(CPUARMState, gxf.esr_gl[1]) },
+    { offsetof(CPUARMState, cp15.far_el[1]),
+      offsetof(CPUARMState, gxf.far_gl[1]) },
+};
+
+static inline uint64_t *hvf_gxf_field(CPUARMState *env, size_t off)
+{
+    return (uint64_t *)((void *)env + off);
+}
+
+/* Exchange the architected EL1 copies with their GL counterparts. */
+static void hvf_gxf_swap_banks(CPUARMState *env)
+{
+    int i;
+
+    for (i = 0; i < ARRAY_SIZE(hvf_gxf_banked_regs); i++) {
+        uint64_t *arch = hvf_gxf_field(env, hvf_gxf_banked_regs[i].arch_off);
+        uint64_t *gl = hvf_gxf_field(env, hvf_gxf_banked_regs[i].gl_off);
+        uint64_t tmp = *arch;
+
+        *arch = *gl;
+        *gl = tmp;
+    }
+}
+
 int hvf_arch_get_registers(CPUState *cpu)
 {
     ARMCPU *arm_cpu = ARM_CPU(cpu);
@@ -443,6 +501,20 @@ int hvf_arch_get_registers(CPUState *cpu)
     uint64_t val;
     hv_simd_fp_uchar16_t fpval;
     int i, n;
+    /*
+     * Sampled before the sync overwrites the architected fields: while guarded,
+     * what comes back from the hardware is the GL bank, and these are the
+     * non-guarded values that have to survive the guarded epoch.
+     */
+    bool gxf_guarded = arm_feature(env, ARM_FEATURE_GXF) && arm_is_guarded(env);
+    uint64_t gxf_saved[ARRAY_SIZE(hvf_gxf_banked_regs)];
+
+    if (gxf_guarded) {
+        for (i = 0; i < ARRAY_SIZE(hvf_gxf_banked_regs); i++) {
+            gxf_saved[i] =
+                *hvf_gxf_field(env, hvf_gxf_banked_regs[i].arch_off);
+        }
+    }
 
     for (i = 0; i < ARRAY_SIZE(hvf_reg_match); i++) {
         ret = hv_vcpu_get_reg(cpu->accel->fd, hvf_reg_match[i].reg, &val);
@@ -570,6 +642,19 @@ int hvf_arch_get_registers(CPUState *cpu)
     }
     assert(write_list_to_cpustate(arm_cpu));
 
+    if (gxf_guarded) {
+        /*
+         * The sync just deposited the hardware (GL) values in the architected
+         * fields. Move them to the GL bank and put the non-guarded values back.
+         */
+        for (i = 0; i < ARRAY_SIZE(hvf_gxf_banked_regs); i++) {
+            uint64_t *arch = hvf_gxf_field(env, hvf_gxf_banked_regs[i].arch_off);
+
+            *hvf_gxf_field(env, hvf_gxf_banked_regs[i].gl_off) = *arch;
+            *arch = gxf_saved[i];
+        }
+    }
+
     aarch64_restore_sp(env, arm_current_el(env));
 
     return 0;
@@ -584,6 +669,7 @@ int hvf_arch_put_registers(CPUState *cpu)
     hv_simd_fp_uchar16_t fpval;
     int i, n;
     bool b;
+    bool gxf_guarded = arm_feature(env, ARM_FEATURE_GXF) && arm_is_guarded(env);
 
     for (i = 0; i < ARRAY_SIZE(hvf_reg_match); i++) {
         val = *(uint64_t *)((void *)env + hvf_reg_match[i].offset);
@@ -608,6 +694,14 @@ int hvf_arch_put_registers(CPUState *cpu)
     assert_hvf_ok(ret);
 
     aarch64_save_sp(env, arm_current_el(env));
+
+    /*
+     * While guarded the hardware has to see the GL bank, so present it to the
+     * sync. Swapping is its own inverse, hence the second call below.
+     */
+    if (gxf_guarded) {
+        hvf_gxf_swap_banks(env);
+    }
 
     assert(write_cpustate_to_list(arm_cpu, false));
     for (i = 0, n = arm_cpu->cpreg_array_len; i < n; i++) {
@@ -693,6 +787,11 @@ int hvf_arch_put_registers(CPUState *cpu)
         val = arm_cpu->cpreg_values[i];
         ret = hv_vcpu_set_sys_reg(cpu->accel->fd, hvf_id, val);
         assert_hvf_ok(ret);
+    }
+
+    if (gxf_guarded) {
+        /* Undo the swap above, restoring env's non-guarded view. */
+        hvf_gxf_swap_banks(env);
     }
 
     ret = hv_vcpu_set_vtimer_offset(cpu->accel->fd, hvf_state->vtimer_offset);
@@ -1162,8 +1261,13 @@ static uint32_t hvf_reg2cp_reg(uint32_t reg)
                               (reg >> SYSREG_OP2_SHIFT) & SYSREG_OP2_MASK);
 }
 
+/*
+ * `denied` (when not NULL) reports that the register exists but this access was
+ * refused, which the guest has to see as a system register trap rather than an
+ * undefined instruction -- see the tail of hvf_sysreg_read().
+ */
 static bool hvf_sysreg_read_cp(CPUState *cpu, const char *cpname,
-                               uint32_t reg, uint64_t *val)
+                               uint32_t reg, uint64_t *val, bool *denied)
 {
     ARMCPU *arm_cpu = ARM_CPU(cpu);
     CPUARMState *env = &arm_cpu->env;
@@ -1172,10 +1276,16 @@ static bool hvf_sysreg_read_cp(CPUState *cpu, const char *cpname,
     ri = ARMCPRegTable_cget(arm_cpu->cp_regs, hvf_reg2cp_reg(reg));
     if (ri) {
         if (!cp_access_ok(1, ri, true)) {
+            if (denied != NULL) {
+                *denied = true;
+            }
             return false;
         }
         if (ri->accessfn) {
             if (ri->accessfn(env, ri, true) != CP_ACCESS_OK) {
+                if (denied != NULL) {
+                    *denied = true;
+                }
                 return false;
             }
         }
@@ -1193,8 +1303,9 @@ static bool hvf_sysreg_read_cp(CPUState *cpu, const char *cpname,
     return false;
 }
 
+/* See hvf_sysreg_read_cp() for `denied`. */
 static bool hvf_sysreg_write_cp(CPUState *cpu, const char *cpname,
-                                uint32_t reg, uint64_t val)
+                                uint32_t reg, uint64_t val, bool *denied)
 {
     ARMCPU *arm_cpu = ARM_CPU(cpu);
     CPUARMState *env = &arm_cpu->env;
@@ -1204,10 +1315,16 @@ static bool hvf_sysreg_write_cp(CPUState *cpu, const char *cpname,
 
     if (ri) {
         if (!cp_access_ok(1, ri, false)) {
+            if (denied != NULL) {
+                *denied = true;
+            }
             return false;
         }
         if (ri->accessfn) {
             if (ri->accessfn(env, ri, false) != CP_ACCESS_OK) {
+                if (denied != NULL) {
+                    *denied = true;
+                }
                 return false;
             }
         }
@@ -1224,10 +1341,12 @@ static bool hvf_sysreg_write_cp(CPUState *cpu, const char *cpname,
     return false;
 }
 
-static int hvf_sysreg_read(CPUState *cpu, uint32_t reg, uint64_t *val)
+static int hvf_sysreg_read(CPUState *cpu, uint32_t reg, uint64_t trap_syndrome,
+                           uint64_t *val)
 {
     ARMCPU *arm_cpu = ARM_CPU(cpu);
     CPUARMState *env = &arm_cpu->env;
+    bool denied = false;
 
     if (arm_feature(env, ARM_FEATURE_PMU)) {
         switch (reg) {
@@ -1306,7 +1425,7 @@ static int hvf_sysreg_read(CPUState *cpu, uint32_t reg, uint64_t *val)
     case SYSREG_ICC_SRE_EL1:
     case SYSREG_ICC_CTLR_EL1:
         /* Call the TCG sysreg handler. This is only safe for GICv3 regs. */
-        if (hvf_sysreg_read_cp(cpu, "GICv3", reg, val)) {
+        if (hvf_sysreg_read_cp(cpu, "GICv3", reg, val, &denied)) {
             return 0;
         }
         break;
@@ -1387,12 +1506,28 @@ static int hvf_sysreg_read(CPUState *cpu, uint32_t reg, uint64_t *val)
             /* ID system registers read as RES0 */
             *val = 0;
             return 0;
-        } else if (hvf_sysreg_read_cp(cpu, "fallback", reg, val)) {
+        } else if (hvf_sysreg_read_cp(cpu, "fallback", reg, val, &denied)) {
             return 0;
         }
     }
 
     cpu_synchronize_state(cpu);
+    if (denied) {
+        /*
+         * The register exists, but its accessfn refused this access. TCG
+         * reports that as a system register trap (EC 0x18) to EL1, and the
+         * syndrome is how the guest distinguishes "not permitted from this
+         * state" from "no such register". XNU's GXF prologue reads the
+         * GL-banked registers from both guarded and non-guarded state and
+         * takes this trap deliberately; reporting EC 0x0 instead makes it
+         * treat the access as an undefined instruction and derail.
+         *
+         * HVF already handed us a well-formed EC_SYSTEMREGISTERTRAP syndrome
+         * for this exit, so reflect it back unchanged.
+         */
+        hvf_raise_exception(cpu, EXCP_UDEF, trap_syndrome, 1);
+        return 1;
+    }
     trace_hvf_unhandled_sysreg_read(env->pc, reg,
                                     SYSREG_OP0(reg),
                                     SYSREG_OP1(reg),
@@ -1479,8 +1614,10 @@ static void pmswinc_write(CPUARMState *env, uint64_t value)
     }
 }
 
-static int hvf_sysreg_write(CPUState *cpu, uint32_t reg, uint64_t val)
+static int hvf_sysreg_write(CPUState *cpu, uint32_t reg, uint64_t trap_syndrome,
+                            uint64_t val)
 {
+    bool denied = false;
     ARMCPU *arm_cpu = ARM_CPU(cpu);
     CPUARMState *env = &arm_cpu->env;
 
@@ -1598,7 +1735,7 @@ static int hvf_sysreg_write(CPUState *cpu, uint32_t reg, uint64_t val)
     case SYSREG_ICC_SGI1R_EL1:
     case SYSREG_ICC_SRE_EL1:
         /* Call the TCG sysreg handler. This is only safe for GICv3 regs. */
-        if (hvf_sysreg_write_cp(cpu, "GICv3", reg, val)) {
+        if (hvf_sysreg_write_cp(cpu, "GICv3", reg, val, &denied)) {
             return 0;
         }
         break;
@@ -1678,13 +1815,19 @@ static int hvf_sysreg_write(CPUState *cpu, uint32_t reg, uint64_t val)
         env->cp15.dbgwcr[SYSREG_CRM(reg)] = val;
         return 0;
     default:
-        if (!is_id_sysreg(reg) && hvf_sysreg_write_cp(cpu, "fallback", reg, val)) {
+        if (!is_id_sysreg(reg) &&
+            hvf_sysreg_write_cp(cpu, "fallback", reg, val, &denied)) {
             return 0;
         }
         break;
     }
 
     cpu_synchronize_state(cpu);
+    if (denied) {
+        /* See hvf_sysreg_read(): reflect the real access trap, not UNDEF. */
+        hvf_raise_exception(cpu, EXCP_UDEF, trap_syndrome, 1);
+        return 1;
+    }
     trace_hvf_unhandled_sysreg_write(env->pc, reg,
                                      SYSREG_OP0(reg),
                                      SYSREG_OP1(reg),
@@ -1942,7 +2085,7 @@ static int hvf_handle_exception(CPUState *cpu, hv_vcpu_exit_exception_t *excp)
         int sysreg_ret = 0;
 
         if (isread) {
-            sysreg_ret = hvf_sysreg_read(cpu, reg, &val);
+            sysreg_ret = hvf_sysreg_read(cpu, reg, syndrome, &val);
             if (!sysreg_ret) {
                 trace_hvf_sysreg_read(reg,
                                       SYSREG_OP0(reg),
@@ -1955,7 +2098,7 @@ static int hvf_handle_exception(CPUState *cpu, hv_vcpu_exit_exception_t *excp)
             }
         } else {
             val = hvf_get_reg(cpu, rt);
-            sysreg_ret = hvf_sysreg_write(cpu, reg, val);
+            sysreg_ret = hvf_sysreg_write(cpu, reg, syndrome, val);
         }
 
         advance_pc = !sysreg_ret;
@@ -1986,13 +2129,19 @@ static int hvf_handle_exception(CPUState *cpu, hv_vcpu_exit_exception_t *excp)
                 /*
                  * Reuse the shared GXF entry in arm_cpu_do_interrupt(): it
                  * saves ELR_GL/SPSR_GL, sets the guarded status bit, and
-                 * vectors to GXF_ENTER_EL1. ELR_GL must point past the patched
-                 * GENTER, so advance $pc first.
+                 * vectors to GXF_ENTER_EL1.
+                 *
+                 * ELR_GL must point past the patched GENTER, which is where
+                 * $pc already is: HVF advances it over the HVC before the exit
+                 * (see the PSCI path below). Adding 4 here would skip the
+                 * instruction after GENTER -- the guest would resume on
+                 * whatever follows and fault.
                  *
                  * GENTER's Rd reaches the guest via ESR_GL, so recover it from
                  * the immediate rather than reporting a constant.
                  */
-                env->pc += 4;
+                trace_hvf_gxf_enter(env->pc, HVF_HVC_GXF_ENTER_RD(hvc_imm),
+                                    env->gxf.gxf_enter_el[1]);
                 env->exception.target_el = 1;
                 env->exception.syndrome =
                     syn_aa64_genter(HVF_HVC_GXF_ENTER_RD(hvc_imm));
@@ -2017,6 +2166,7 @@ static int hvf_handle_exception(CPUState *cpu, hv_vcpu_exit_exception_t *excp)
                 }
                 env->gxf.gxf_status_el[el] &= ~1;
                 aarch64_restore_sp(env, el);
+                trace_hvf_gxf_exit(env->pc, env->gxf.elr_gl[el]);
                 env->pc = env->gxf.elr_gl[el];
             }
             cpu->vcpu_dirty = true;
