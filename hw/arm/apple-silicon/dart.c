@@ -203,7 +203,13 @@ struct AppleDARTState {
     uint32_t l_shift[3];
     uint64_t sid_mask;
     uint32_t dart_options;
+    AddressSpace *target_as;
 };
+
+void apple_dart_set_target_as(AppleDARTState *dart, AddressSpace *as)
+{
+    dart->target_as = as;
+}
 
 static int apple_dart_device_list(Object *obj, void *opaque)
 {
@@ -302,7 +308,7 @@ static void apple_dart_mapper_reg_write(void *opaque, hwaddr addr,
                 }
 
                 event.type = IOMMU_NOTIFIER_UNMAP;
-                event.entry.target_as = &address_space_memory;
+                event.entry.target_as = mapper->common.dart->target_as;
                 event.entry.iova = 0;
                 event.entry.perm = IOMMU_NONE;
                 event.entry.addr_mask = HWADDR_MAX;
@@ -515,7 +521,7 @@ static IOMMUTLBEntry apple_dart_mapper_translate(IOMMUMemoryRegion *mr,
     uint64_t iova;
 
     IOMMUTLBEntry entry = {
-        .target_as = &address_space_memory,
+        .target_as = dart->target_as,
         .iova = addr,
         .addr_mask = dart->page_bits,
         .perm = IOMMU_NONE,
@@ -621,6 +627,12 @@ static void apple_dart_reset(DeviceState *dev)
 
 static void apple_dart_realize(DeviceState *dev, Error **errp)
 {
+    AppleDARTState *dart = APPLE_DART(dev);
+
+    /* Unless a machine redirected us, translations land in system memory. */
+    if (dart->target_as == NULL) {
+        dart->target_as = &address_space_memory;
+    }
 }
 
 IOMMUMemoryRegion *apple_dart_iommu_mr(AppleDARTState *dart, uint32_t sid)

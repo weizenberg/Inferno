@@ -861,6 +861,37 @@ static uint64_t hvf_get_reg(CPUState *cpu, int rt)
     return val;
 }
 
+static void hvf_get_vreg(CPUState *cpu, int rt, uint8_t val[16])
+{
+    hv_simd_fp_uchar16_t v;
+    hv_return_t r;
+
+    flush_cpu_state(cpu);
+
+    r = hv_vcpu_get_simd_fp_reg(cpu->accel->fd, HV_SIMD_FP_REG_Q0 + rt, &v);
+    assert_hvf_ok(r);
+    memcpy(val, &v, sizeof(v));
+}
+
+static void hvf_set_vreg(CPUState *cpu, int rt, const uint8_t val[16])
+{
+    hv_simd_fp_uchar16_t v;
+    hv_return_t r;
+
+    flush_cpu_state(cpu);
+
+    memcpy(&v, val, sizeof(v));
+    r = hv_vcpu_set_simd_fp_reg(cpu->accel->fd, HV_SIMD_FP_REG_Q0 + rt, v);
+    assert_hvf_ok(r);
+}
+
+static const ArmAarch64FallbackEmuOps hvf_fallback_emu_ops = {
+    .get_reg = hvf_get_reg,
+    .set_reg = hvf_set_reg,
+    .get_vreg = hvf_get_vreg,
+    .set_vreg = hvf_set_vreg,
+};
+
 static void clamp_id_aa64mmfr0_parange_to_ipa_size(ARMISARegisters *isar)
 {
     uint32_t ipa_size = chosen_ipa_bit_size ?
@@ -2147,8 +2178,8 @@ static int hvf_handle_exception(CPUState *cpu, hv_vcpu_exit_exception_t *excp)
                 }
                 hvf_set_reg(cpu, srt, val);
             }
-        } else if (!arm_aarch64_fallback_emu_single(cpu, as, hvf_get_reg,
-                                                    hvf_set_reg)) {
+        } else if (!arm_aarch64_fallback_emu_single(cpu, as,
+                                                    &hvf_fallback_emu_ops)) {
             hvf_raise_exception(cpu, EXCP_DATA_ABORT, syndrome, 1);
             fprintf(stderr, "%s: instruction decoding failed\n", __func__);
             break;

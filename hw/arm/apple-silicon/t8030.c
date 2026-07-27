@@ -2213,6 +2213,9 @@ static void t8030_create_sep(AppleT8030MachineState *t8030)
     AppleDTProp *prop;
     uint32_t *ints;
     AppleDARTState *dart;
+    MemoryRegion *sep_dma_mr;
+    MemoryRegion *sep_dma_sysmem_mr;
+    AddressSpace *sep_dma_as;
 
     prop = apple_dt_get_prop(apple_dt_get_node(t8030->device_tree, "chosen"),
                              "chip-id");
@@ -2235,11 +2238,36 @@ static void t8030_create_sep(AppleT8030MachineState *t8030)
 
     apple_dt_set_prop_u32(child, "low-power-enable", 1);
 
+    /*
+     * Give dart-sep a downstream view of its own instead of letting it resolve
+     * into system memory. The SEP's DMA staging RAM lives only in here, so the
+     * only way to reach it is through a DART translation.
+     *
+     * That matters solely because of HVF. Hypervisor.framework maps one
+     * VM-wide address space and has no per-vCPU notion, so a region that is
+     * also present in the global map gets a stage-2 mapping and the SEP's
+     * accesses are walked by hardware -- bypassing the IOMMU and reading the
+     * wrong memory with no fault raised. Under TCG each CPU translates through
+     * its own AddressSpace, so this is equivalent to what happened before.
+     */
+    sep_dma_mr = g_new0(MemoryRegion, 1);
+    memory_region_init(sep_dma_mr, OBJECT(t8030), "sep-dma-downstream",
+                       UINT64_MAX);
+    sep_dma_sysmem_mr = g_new0(MemoryRegion, 1);
+    memory_region_init_alias(sep_dma_sysmem_mr, OBJECT(t8030), "sep-dma-sysmem",
+                             get_system_memory(), 0, UINT64_MAX);
+    memory_region_add_subregion_overlap(sep_dma_mr, 0, sep_dma_sysmem_mr, -1);
+    allocate_ram(sep_dma_mr, "SEPFW_", 0x0, SEP_DMA_MAPPING_SIZE, 0);
+    sep_dma_as = g_new0(AddressSpace, 1);
+    address_space_init(sep_dma_as, sep_dma_mr, "sep.dma-downstream");
+    apple_dart_set_target_as(dart, sep_dma_as);
+
     sep = apple_sep_from_node(
         child,
         MEMORY_REGION(apple_dart_iommu_mr(dart, *(uint32_t *)prop->data)),
         SEPROM_BASE, A13_MAX_CPU, true, chip_id);
     assert_nonnull(sep);
+    sep->dma_target_as = sep_dma_as;
 
     object_property_add_child(OBJECT(t8030), "sep", OBJECT(sep));
 
@@ -2794,11 +2822,6 @@ static void t8030_init(MachineState *machine)
                      0x4000, 0);
         // dram_scr address 0x23D2C0000 size 0x8000 inside pmgr-unk-reg-2
         // dram_pln0 address 0x200000000 size 0x8000, inside amcc
-    }
-
-    if (t8030->sep_fw_filename != NULL) {
-        allocate_ram(get_system_memory(), "SEPFW_", 0x0, SEP_DMA_MAPPING_SIZE,
-                     0);
     }
 
     t8030->device_tree = apple_boot_load_dt_file(machine->dtb);

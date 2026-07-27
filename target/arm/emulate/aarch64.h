@@ -25,8 +25,25 @@
 typedef uint64_t (*ArmAarch64FallbackEmuGetReg)(CPUState *cpu, int rt);
 typedef void (*ArmAarch64FallbackEmuSetReg)(CPUState *cpu, int rt,
                                             uint64_t val);
+/*
+ * SIMD&FP register access, little-endian, 16 bytes. A guest copying a buffer
+ * through a trapping window does it with `str q0` and friends, not with integer
+ * stores, so without these the copy fails and the guest takes a data abort it
+ * cannot explain. Optional: leave both NULL and the SIMD&FP forms are refused,
+ * which is the behaviour this emulator had before they existed.
+ */
+typedef void (*ArmAarch64FallbackEmuGetVReg)(CPUState *cpu, int rt,
+                                             uint8_t val[16]);
+typedef void (*ArmAarch64FallbackEmuSetVReg)(CPUState *cpu, int rt,
+                                             const uint8_t val[16]);
+
+typedef struct {
+    ArmAarch64FallbackEmuGetReg get_reg;
+    ArmAarch64FallbackEmuSetReg set_reg;
+    ArmAarch64FallbackEmuGetVReg get_vreg;
+    ArmAarch64FallbackEmuSetVReg set_vreg;
+} ArmAarch64FallbackEmuOps;
 
 bool arm_aarch64_fallback_emu_single(CPUState *cpu, AddressSpace *as,
-                                     ArmAarch64FallbackEmuGetReg get_reg,
-                                     ArmAarch64FallbackEmuSetReg set_reg);
+                                     const ArmAarch64FallbackEmuOps *ops);
 #endif /* TARGET_ARM_EMULATE_AARCH64_H */

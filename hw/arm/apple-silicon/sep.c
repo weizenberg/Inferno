@@ -4524,7 +4524,8 @@ static void pka_reset(ApplePKAState *s)
 static void map_sepfw(AppleSEPState *s)
 {
     DPRINTF("%s: entered function\n", __func__);
-    AddressSpace *nsas = &address_space_memory;
+    AddressSpace *nsas =
+        s->dma_target_as != NULL ? s->dma_target_as : &address_space_memory;
     MemTxResult r;
 
     /*

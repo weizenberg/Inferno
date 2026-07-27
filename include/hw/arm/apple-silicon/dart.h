@@ -44,4 +44,14 @@ IOMMUMemoryRegion *apple_dart_instance_iommu_mr(AppleDARTState *s,
                                                 uint32_t sid);
 AppleDARTState *apple_dart_from_node(AppleDTNode *node);
 
+/*
+ * Choose the AddressSpace this DART's translations resolve into. Defaults to
+ * address_space_memory. A machine can point a DART at a private downstream view
+ * so that the memory behind it is reachable only through translation, which is
+ * what an HVF vCPU requires: Hypervisor.framework maps one VM-wide address
+ * space, so anything also present in the global map is walked by hardware and
+ * bypasses the IOMMU entirely.
+ */
+void apple_dart_set_target_as(AppleDARTState *dart, AddressSpace *as);
+
 #endif /* HW_ARM_APPLE_SILICON_DART_H */

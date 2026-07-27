@@ -310,6 +310,13 @@ struct AppleSEPState {
     bool modern;
     MemoryRegion *ool_mr;
     AddressSpace *ool_as;
+    /*
+     * Where the SEP's DMA actually lands, i.e. what dart-sep translates into.
+     * The firmware staging copy has to be written through this rather than
+     * through system memory, because under HVF the staging RAM must not also be
+     * present in the global map -- see apple_dart_set_target_as().
+     */
+    AddressSpace *dma_target_as;
     MemoryRegion pmgr_base_mr;
     MemoryRegion trng_regs_mr;
     MemoryRegion key_base_mr;
