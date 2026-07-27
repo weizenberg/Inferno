@@ -34,6 +34,7 @@
 #include "hw/qdev-properties-system.h"
 #include "qapi/error.h"
 #include "qemu/cutils.h"
+#include "qemu/error-report.h"
 #include "qemu/guest-random.h"
 #include "qemu/log.h"
 #include "qemu/units.h"
@@ -4216,7 +4217,15 @@ AppleSEPState *apple_sep_from_node(AppleDTNode *node, MemoryRegion *ool_mr,
         unset_feature(&s->cpu->env, ARM_FEATURE_AARCH64);
         memory_region_add_subregion(&APPLE_A9(s->cpu)->memory, 0, mr0);
     }
-    if (s->chip_id >= 0x8020) {
+    /*
+     * shmbuf_base is only ever assigned under SEP_ENABLE_TRACE_BUFFER, so in a
+     * default build it is still 0 here and this alias lands at GPA 0 rather
+     * than at the buffer the AP advertises. That it does no harm today is luck:
+     * 0x4000 stops exactly where map_sepfw() writes the firmware image, so
+     * widening it by even one page silently eats that copy. Only install it
+     * once there is a real base to install it at.
+     */
+    if (s->chip_id >= 0x8020 && s->shmbuf_base != 0) {
         // hack to make SEP_ENABLE_OVERWRITE_SHMBUF_OBJECTS work properly
         MemoryRegion *mr1 = g_new0(MemoryRegion, 1);
         memory_region_init_alias(mr1, OBJECT(s), "sep_shmbuf_hdr", ool_mr,
@@ -4516,13 +4525,30 @@ static void map_sepfw(AppleSEPState *s)
 {
     DPRINTF("%s: entered function\n", __func__);
     AddressSpace *nsas = &address_space_memory;
+    MemTxResult r;
+
+    /*
+     * Both of these used to discard their MemTxResult, which hid a whole class
+     * of failure: anything overlaying this range in the global address space --
+     * an IOMMU alias, say -- swallows the firmware copy, and the SEP then runs
+     * against a zero-filled hole with no indication of why.
+     */
     // Apparently needed because of a bug occurring on XNU
     // clear lowest 0x4000 bytes as well, because they shouldn't contain any
     // valid data
-    address_space_set(nsas, 0x0, 0, SEPFW_MAPPING_SIZE, MEMTXATTRS_UNSPECIFIED);
+    r = address_space_set(nsas, 0x0, 0, SEPFW_MAPPING_SIZE,
+                          MEMTXATTRS_UNSPECIFIED);
+    if (r != MEMTX_OK) {
+        error_report("%s: failed to clear the SEPFW mapping (result %d)",
+                     __func__, r);
+    }
 #ifdef SEP_ENABLE_HARDCODED_FIRMWARE
-    address_space_rw(nsas, 0x4000ULL, MEMTXATTRS_UNSPECIFIED,
-                     (uint8_t *)s->fw_data, s->sep_fw_size, true);
+    r = address_space_rw(nsas, 0x4000ULL, MEMTXATTRS_UNSPECIFIED,
+                         (uint8_t *)s->fw_data, s->sep_fw_size, true);
+    if (r != MEMTX_OK) {
+        error_report("%s: failed to write SEPFW at 0x4000 (result %d)",
+                     __func__, r);
+    }
 #endif
 }
 
