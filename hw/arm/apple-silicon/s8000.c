@@ -1522,13 +1522,23 @@ static void s8000_init(MachineState *machine)
     apple_dt_set_prop_strn(s8000->device_tree, "platform-name", 32, "s8000");
     apple_dt_set_prop_strn(s8000->device_tree, "model-number", 32, "MWL72");
     apple_dt_set_prop_strn(s8000->device_tree, "region-info", 32, "LL/A");
-    apple_dt_set_prop_strn(s8000->device_tree, "config-number", 64, "");
+    apple_dt_set_prop_strn(s8000->device_tree, "config-number", 64,
+                           "MWL72LL/A");
+    /*
+     * Synthetic, but in the right shape: 12 alphanumerics for the serial and 17
+     * for the MLB, with no character outside the set Apple uses. iOS parses
+     * these -- a serial containing e.g. an underscore is not a harmless
+     * placeholder, it made every Apple media-services request fail with 401
+     * until t8030's equivalent default was corrected. They are deliberately not
+     * a real device's identifiers, and "A2111" previously here was both real and
+     * the wrong model (that is an iPhone 11; this machine is an iPhone 6s Plus).
+     */
     apple_dt_set_prop_strn(s8000->device_tree, "serial-number", 32,
-                           "C39ZRMDEN72J");
+                           "INFERNO08000");
     apple_dt_set_prop_strn(s8000->device_tree, "mlb-serial-number", 32,
-                           "C39948108J9N72J1F");
+                           "INFERNOMLB0080000");
     apple_dt_set_prop_strn(s8000->device_tree, "regulatory-model-number", 32,
-                           "A2111");
+                           "INFERN8000");
 
     child = apple_dt_get_node(s8000->device_tree, "chosen");
     apple_dt_set_prop_u32(child, "chip-id", 0x8000);
