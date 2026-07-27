@@ -791,7 +791,8 @@ int hvf_arch_put_registers(CPUState *cpu)
 
         val = arm_cpu->cpreg_values[i];
         if (hvf_id == HV_SYS_REG_SCTLR_EL1 &&
-            arm_feature(env, ARM_FEATURE_GXF)) {
+            arm_feature(env, ARM_FEATURE_GXF) &&
+            arm_cpu->prop_hvf_pauth_noop) {
             /*
              * Force PAC off, mirroring what TCG already does.
              *

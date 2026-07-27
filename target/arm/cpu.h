@@ -1157,6 +1157,12 @@ struct ArchCPU {
     bool prop_pauth_qarma3;
     bool prop_pauth_qarma5;
     bool prop_pauth_noop;
+    /*
+     * Apple CPUs only: make PAC a no-op under HVF by clearing the SCTLR_EL1
+     * PAC enables, the way prop_pauth_noop does it for TCG. Defaults true;
+     * the SEP core turns it off because SEPFW is never patched.
+     */
+    bool prop_hvf_pauth_noop;
     bool prop_lpa2;
 
     /* DCZ blocksize, in log_2(words), ie low 4 bits of DCZID_EL0 */

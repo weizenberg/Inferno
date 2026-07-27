@@ -4197,6 +4197,18 @@ AppleSEPState *apple_sep_from_node(AppleDTNode *node, MemoryRegion *ool_mr,
     if (modern) {
         s->cpu = &apple_a13_create("sep-cpu", cpu_id, BIT_ULL(30), -1, 'S')
                       ->parent_obj;
+        /*
+         * SEPFW is never patched -- ck_sep_seprom_patches() only touches
+         * SEPROM -- and SEPOS signs and authenticates pointers constantly
+         * (6625 PACIBSP in the n104 image). Under HVF the host implements PAC
+         * natively with FPAC, and clearing the SCTLR_EL1 PAC enables only holds
+         * until the guest writes SCTLR itself, which SEPOS does: it then signs
+         * with PAC enabled and authenticates with it disabled, and FPAC turns
+         * the mismatch into a fault it never recovers from. Let this core use
+         * the host's PAC, whose keys the cpreg sync already carries.
+         */
+        object_property_set_bool(OBJECT(s->cpu), "hvf-pauth-noop", false,
+                                 &error_abort);
         memory_region_add_subregion(&APPLE_A13(s->cpu)->memory, 0, mr0);
     } else {
         s->cpu = &apple_a9_create("sep-cpu", cpu_id, BIT_ULL(30))->parent_obj;

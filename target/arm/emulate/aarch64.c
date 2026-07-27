@@ -36,10 +36,9 @@ static hwaddr arm_aarch64_fallback_emu_vtop(CPUState *cpu, vaddr addr)
 
 /*
  * Rn == 31 encodes SP, but the register callbacks map 31 to XZR, which is what
- * it means for Rt. Under HVF there is no way to reach SP through them either:
- * hvf_reg_match has no SP entry and SP_EL0/SP_EL1 are ARM_CP_ALIAS, so they are
- * left out of the cpreg list the sync walks. Nothing addresses MMIO through SP,
- * so refuse the instruction instead of silently using zero as the base.
+ * it means for Rt and is all hvf_get_reg()/hvf_set_reg() implement. Nothing
+ * addresses MMIO through SP, so refuse the instruction rather than silently
+ * using zero as the base address.
  */
 static bool emu_base(CPUState *cpu, ArmAarch64FallbackEmuGetReg get_reg,
                      uint32_t rn, uint64_t *base)
