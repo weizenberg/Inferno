@@ -2431,7 +2431,18 @@ static QCryptoCipherAlgo get_aes_cipher_alg(uint32_t flags)
     case SEP_AESS_CMD_FLAG_KEYSIZE_AES256:
         return QCRYPTO_CIPHER_ALGO_AES_256;
     default:
-        assert_not_reached();
+        /*
+         * These flags come straight from a guest register write, and this is
+         * called unconditionally at the top of the operate path, so an
+         * unexpected combination must not take the emulator down with it. The
+         * hardware's choice here is unknown; AES-256 is what every command the
+         * SEP actually issues uses, and what the keywrap path coerces to.
+         */
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "SEP AESS: no valid key size in flags 0x%X, "
+                      "assuming AES-256\n",
+                      flags);
+        return QCRYPTO_CIPHER_ALGO_AES_256;
     }
 }
 
@@ -2474,7 +2485,6 @@ static void aess_keywrap_uid(AppleAESSState *s, uint8_t *in, uint8_t *out,
     uint32_t normalized_cmd = SEP_AESS_CMD_WITHOUT_FLAGS(cmd);
     size_t key_len = qcrypto_cipher_get_key_len(cipher_alg);
     size_t data_len = 0x20;
-    assert_cmpuint(data_len, ==, 0x20);
     uint8_t used_key[0x20] = { 0 };
     if (normalized_cmd == 0x02 && s->keywrap_uid0_enabled) {
         memcpy(used_key, (uint8_t *)s->keywrap_key_uid0,
@@ -2490,8 +2500,9 @@ static void aess_keywrap_uid(AppleAESSState *s, uint8_t *in, uint8_t *out,
     }
     // TODO: Dirty hack, so iteration_register being set/unset shouldn't result
     // in the same output keys.
-    xor_32bit_value(&used_key[0x10], s->reg_0x14_keywrap_iterations_counter,
-                    0x8 / 4); // seed_bits are only for keywrap
+    uint32_t iterations = s->reg_0x14_keywrap_iterations_counter;
+    xor_32bit_value(&used_key[0x10], iterations,
+                    2); // 2 dwords; seed_bits are only for keywrap
     DPRINTF("%s: cmd: 0x%02x normalized_cmd: 0x%02x cipher_alg: %u; "
             "key_len: %lu; iterations: %u, seed_bits: 0x%02x, "
             "reg_0x18_keydisable: 0x%02x\n",
@@ -2503,20 +2514,23 @@ static void aess_keywrap_uid(AppleAESSState *s, uint8_t *in, uint8_t *out,
     cipher = qcrypto_cipher_new(cipher_alg, QCRYPTO_CIPHER_MODE_CBC, used_key,
                                 key_len, &error_abort);
     assert_nonnull(cipher);
-    // uint8_t iv[0x10] = { 0 };
-    // qcrypto_cipher_setiv(cipher, iv, sizeof(iv), &error_abort);
+    /*
+     * Pin the IV. QEMU's cipher context is allocated zeroed, so leaving this
+     * implicit gives an all-zero IV today -- but these derived keys wrap the
+     * guest's keybag, so they must not depend on an allocator detail or on the
+     * crypto backend QEMU was built against. Set once: the CBC state chains
+     * across the iterations below, which is what it did before.
+     */
+    uint8_t iv[0x10] = { 0 };
+    qcrypto_cipher_setiv(cipher, iv, sizeof(iv), &error_abort);
     uint8_t enc_temp[0x20] = { 0 };
     memcpy(enc_temp, in, sizeof(enc_temp));
 
     // TODO: iteration register is actually for the iterations inside the
     // algorithm, not how often the algorihm is being called.
-    if (s->reg_0x14_keywrap_iterations_counter == 0) {
-        s->reg_0x14_keywrap_iterations_counter = 1;
-    }
-    while (s->reg_0x14_keywrap_iterations_counter) {
+    for (uint32_t i = 0; i < MAX(iterations, 1); i++) {
         qcrypto_cipher_encrypt(cipher, enc_temp, enc_temp, sizeof(enc_temp),
                                &error_abort);
-        s->reg_0x14_keywrap_iterations_counter--;
     }
 
     memcpy(out, enc_temp, data_len);
@@ -2546,7 +2560,13 @@ static int aess_get_custom_keywrap_index(uint32_t cmd)
     case 0xC8:
         return 3;
     default:
-        assert_not_reached();
+        /*
+         * Guest-supplied command. Callers index custom_key_index[] with this,
+         * so refuse rather than abort or return an out-of-range slot.
+         */
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "SEP AESS: no custom keywrap slot for cmd 0x%02X\n", cmd);
+        return -1;
     }
 }
 
@@ -2691,7 +2711,8 @@ static void aess_handle_cmd(AppleAESSState *s)
         if (custom_encryption) {
             int custom_keywrap_index =
                 aess_get_custom_keywrap_index(cmd & 0xFF);
-            if (s->custom_key_index_enabled[custom_keywrap_index]) {
+            if (custom_keywrap_index >= 0 &&
+                s->custom_key_index_enabled[custom_keywrap_index]) {
                 memcpy(used_key, s->custom_key_index[custom_keywrap_index],
                        sizeof(used_key));
             }
@@ -2800,6 +2821,9 @@ static void aess_handle_cmd(AppleAESSState *s)
     // 0x248/0x2C8(0x2C1)
     else if (normalized_cmd == 0x1) {
         int custom_keywrap_index = aess_get_custom_keywrap_index(cmd & 0xFF);
+        if (custom_keywrap_index < 0) {
+            return;
+        }
         memcpy(s->custom_key_index[custom_keywrap_index], s->in_full,
                sizeof(s->custom_key_index[custom_keywrap_index]));
         // unset (real zero-key) != zero-key set (not real zero-key)
