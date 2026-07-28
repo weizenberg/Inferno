@@ -2045,6 +2045,7 @@ static void t8030_create_wlan(AppleT8030MachineState *t8030)
     child = apple_dt_get_node(child, "wlan");
     assert_nonnull(child);
 
+
     ApplePCIEPort *port = APPLE_PCIE_PORT(
         object_property_get_link(OBJECT(t8030), "pcie.bridge2", &error_fatal));
     PCIBus *sec_bus = pci_bridge_get_sec_bus(PCI_BRIDGE(PCI_DEVICE(port)));
@@ -3125,6 +3126,29 @@ static void t8030_init(MachineState *machine)
     if (t8030->enable_wlan) {
         // after SMC: apple_wlan_create registers the gP11 key handler
         t8030_create_wlan(t8030);
+    {
+        /*
+         * AppleBCMWLANBusInterfacePCIe matches on AppleARMIODevice/IONameMatch
+         * "wlan", so its provider is arm-io/wlan and that is the node it reads
+         * provisioning data from. Its stock `local-mac-address` is the
+         * indirection string "macaddr/wifiaddr,syscfg/WMac/6,..." which iOS
+         * resolves out of syscfg; the emulated syscfg namespace has no WMac
+         * entry, so the driver logs "'local-mac-address' is invalid!" and then
+         * "unable to obtain MAC address, can't proceed any further", failing
+         * provisioning. Hand it a synthetic address directly -- 02:.. is
+         * locally administered, so it is not any real device's identity.
+         */
+        static const uint8_t wlan_mac[6] = {
+            0x02, 0x1B, 0x63, 0x84, 0x45, 0xE6
+        };
+        AppleDTNode *wlan_node =
+            apple_dt_get_node(t8030->device_tree, "arm-io/wlan");
+
+        assert_nonnull(wlan_node);
+        apple_dt_set_prop(wlan_node, "local-mac-address", sizeof(wlan_mac),
+                          wlan_mac);
+    }
+
     }
 #ifdef ENABLE_BASEBAND
     t8030_create_baseband_spmi(t8030, "spmi1", "baseband-spmi");
