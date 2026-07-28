@@ -34,6 +34,7 @@
 #include "hw/qdev-properties.h"
 #include "qapi/error.h"
 #include "qemu/log.h"
+#include "trace.h"
 
 // #define DEBUG_APCIE
 
@@ -371,22 +372,9 @@ static uint64_t apple_pcie_root_conf_access(void *opaque, hwaddr addr,
     if (pcidev) {
         addr &= pci_config_size(pcidev) - 1;
 
-#if 0
-        if (addr == 0x890) {
-            cpu_dump_state(CPU(first_cpu), stderr, CPU_DUMP_CODE);
-        }
-#endif
         if (data) {
-#if 0
-            if (addr == 0x80c) {
-                // offset 0x80c: setLinkSpeed: bit17: left-over from synopsys designware: ignored by iOS.
-                ApplePCIEPort *port = APPLE_PCIE_PORT(pcidev);
-                PCIESlot *slot = PCIE_SLOT(pcidev);
-
-                DPRINTF("%s: port->bus_nr == %u ; slot->width == %u ; slot->speed == %u\n", __func__, port->bus_nr, slot->width, slot->speed);
-                pcie_cap_fill_link_ep_usp(pcidev, slot->width, slot->speed);
-            }
-#endif
+            trace_apple_pcie_root_conf_wr(busnum, device, function, addr, size,
+                                          *data);
             pci_host_config_write_common(pcidev, addr, pci_config_size(pcidev),
                                          *data, size);
             DPRINTF("%s: test0: %02u:%02u.%01u: orig_addr == 0x" HWADDR_FMT_plx
@@ -395,12 +383,16 @@ static uint64_t apple_pcie_root_conf_access(void *opaque, hwaddr addr,
         } else {
             uint64_t ret = pci_host_config_read_common(
                 pcidev, addr, pci_config_size(pcidev), size);
+            trace_apple_pcie_root_conf_rd(busnum, device, function, addr, size,
+                                          ret);
             DPRINTF("%s: test0: %02u:%02u.%01u: orig_addr == 0x" HWADDR_FMT_plx
                     " ; size %u ; read 0x" HWADDR_FMT_plx "\n",
                     __func__, busnum, device, function, orig_addr, size, ret);
             return ret;
         }
     } else {
+        trace_apple_pcie_root_conf_wr(busnum, device, function, addr, size,
+                                      data ? *data : UINT64_MAX);
         if (data) {
             DPRINTF("%s: test0: %02u:%02u.%01u: orig_addr == 0x" HWADDR_FMT_plx
                     " ; size %u ; write UNKNOWN DEVICE\n",
@@ -445,6 +437,7 @@ static const MemoryRegionOps apple_pcie_root_conf_ops = {
 static uint64_t apple_pcie_root_common_read(void *opaque, hwaddr addr,
                                             unsigned int size)
 {
+    trace_apple_pcie_root_common_rd(addr, size);
     ApplePCIEHost *host = opaque;
     uint32_t val = 0;
 
@@ -488,6 +481,7 @@ static uint64_t apple_pcie_root_common_read(void *opaque, hwaddr addr,
 static void apple_pcie_root_common_write(void *opaque, hwaddr addr,
                                          uint64_t data, unsigned int size)
 {
+    trace_apple_pcie_root_common_wr(addr, size, data);
     ApplePCIEHost *host = opaque;
     ApplePCIEPort *port;
     int i;
@@ -835,6 +829,7 @@ static uint64_t apple_pcie_port_config_read(void *opaque, hwaddr addr,
                                             unsigned size)
 {
     ApplePCIEPort *port = opaque;
+    trace_apple_pcie_port_config_rd(port->bus_nr, addr, size);
     uint32_t is_port_enabled;
     uint32_t val = 0;
     int msi_intr_index = 0;
@@ -982,6 +977,7 @@ static void apple_pcie_port_config_write(void *opaque, hwaddr addr,
                                          uint64_t data, unsigned size)
 {
     ApplePCIEPort *port = opaque;
+    trace_apple_pcie_port_config_wr(port->bus_nr, addr, size, data);
     uint32_t is_port_enabled;
     int msi_intr_index = 0;
 
@@ -1084,6 +1080,16 @@ static void apple_pcie_port_config_write(void *opaque, hwaddr addr,
         break;
     case 0x800: // for setPortEnable/initializeRootComplex/expressCapOffset?
                 // bit0 seems to be "enable port"
+        if ((port->port_cfg_port_config & 1) == 0 && (data & 1) != 0) {
+            // The t8030 guest enables the link here instead of via the 0x80
+            // LTSSM-enable register: mirror that path's power-up and link-up
+            // interrupt, or the driver waits for the link event forever.
+            if (port->manual_enable) {
+                port_devices_set_power(port, true);
+            }
+            port->port_last_interrupt |= 0x1000;
+            apple_pcie_set_own_irq(port, 1);
+        }
         port->port_cfg_port_config = data;
         is_port_enabled = (port->port_cfg_port_config & 1) != 0;
         DPRINTF("%s: reg==0x800: Port %u: port_cfg_port_config: 0x%x ;"
@@ -1223,6 +1229,7 @@ static uint64_t apple_pcie_port_config_ltssm_debug_read(void *opaque,
                                                         unsigned size)
 {
     ApplePCIEPort *port = opaque;
+    trace_apple_pcie_port_ltssm_rd(port->bus_nr, addr, size);
     uint32_t val = 0;
 
 // #ifdef ENABLE_CPU_DUMP_STATE
@@ -1255,6 +1262,7 @@ static void apple_pcie_port_config_ltssm_debug_write(void *opaque, hwaddr addr,
                                                      unsigned size)
 {
     ApplePCIEPort *port = opaque;
+    trace_apple_pcie_port_ltssm_wr(port->bus_nr, addr, size, data);
 
     DPRINTF("%s: Port %u: WRITE @ 0x" HWADDR_FMT_plx " value: 0x" HWADDR_FMT_plx
             "\n",
@@ -1300,6 +1308,7 @@ static uint64_t apple_pcie_port_phy_glue_read(void *opaque, hwaddr addr,
                                               unsigned size)
 {
     ApplePCIEPort *port = opaque;
+    trace_apple_pcie_port_phy_glue_rd(port->bus_nr, addr, size);
     uint32_t val = 0;
 
 // #ifdef ENABLE_CPU_DUMP_STATE
@@ -1329,6 +1338,7 @@ static void apple_pcie_port_phy_glue_write(void *opaque, hwaddr addr,
                                            uint64_t data, unsigned size)
 {
     ApplePCIEPort *port = opaque;
+    trace_apple_pcie_port_phy_glue_wr(port->bus_nr, addr, size, data);
 
     DPRINTF("%s: Port %u: WRITE @ 0x" HWADDR_FMT_plx " value: 0x" HWADDR_FMT_plx
             "\n",
@@ -1376,6 +1386,7 @@ static uint64_t apple_pcie_port_phy_ip_read(void *opaque, hwaddr addr,
                                             unsigned size)
 {
     ApplePCIEPort *port = opaque;
+    trace_apple_pcie_port_phy_ip_rd(port->bus_nr, addr, size);
     uint32_t val = 0;
 
 // #ifdef ENABLE_CPU_DUMP_STATE
@@ -1407,6 +1418,7 @@ static void apple_pcie_port_phy_ip_write(void *opaque, hwaddr addr,
                                          uint64_t data, unsigned size)
 {
     ApplePCIEPort *port = opaque;
+    trace_apple_pcie_port_phy_ip_wr(port->bus_nr, addr, size, data);
 
     DPRINTF("%s: Port %u: WRITE @ 0x" HWADDR_FMT_plx " value: 0x" HWADDR_FMT_plx
             "\n",
@@ -1549,7 +1561,7 @@ static ApplePCIEPort *apple_pcie_create_port(AppleDTNode *node, uint32_t bus_nr,
         }
         assert_nonnull(dma_mr);
         assert_nonnull(object_property_add_const_link(OBJECT(port), "dma-mr",
-                                                        OBJECT(dma_mr)));
+                                                      OBJECT(dma_mr)));
         port->dma_mr = MEMORY_REGION(dma_mr);
 
 #if 1

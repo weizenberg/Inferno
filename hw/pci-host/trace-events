@@ -19,3 +19,17 @@ sabre_pci_config_write(uint64_t addr, uint64_t val) "addr 0x%"PRIx64" val 0x%"PR
 sabre_pci_config_read(uint64_t addr, uint64_t val) "addr 0x%"PRIx64" val 0x%"PRIx64
 sabre_pci_set_irq(int irq_num, int level) "set irq_in %d level %d"
 sabre_pci_set_obio_irq(int irq_num, int level) "set irq %d level %d"
+
+# apcie.c
+apple_pcie_root_common_rd(uint64_t addr, unsigned size) "addr 0x%03"PRIx64" size %u"
+apple_pcie_root_common_wr(uint64_t addr, unsigned size, uint64_t data) "addr 0x%03"PRIx64" size %u data 0x%"PRIx64
+apple_pcie_port_config_rd(uint32_t bus, uint64_t addr, unsigned size) "port %u addr 0x%03"PRIx64" size %u"
+apple_pcie_port_config_wr(uint32_t bus, uint64_t addr, unsigned size, uint64_t data) "port %u addr 0x%03"PRIx64" size %u data 0x%"PRIx64
+apple_pcie_port_ltssm_rd(uint32_t bus, uint64_t addr, unsigned size) "port %u addr 0x%03"PRIx64" size %u"
+apple_pcie_port_ltssm_wr(uint32_t bus, uint64_t addr, unsigned size, uint64_t data) "port %u addr 0x%03"PRIx64" size %u data 0x%"PRIx64
+apple_pcie_port_phy_glue_rd(uint32_t bus, uint64_t addr, unsigned size) "port %u addr 0x%03"PRIx64" size %u"
+apple_pcie_port_phy_glue_wr(uint32_t bus, uint64_t addr, unsigned size, uint64_t data) "port %u addr 0x%03"PRIx64" size %u data 0x%"PRIx64
+apple_pcie_port_phy_ip_rd(uint32_t bus, uint64_t addr, unsigned size) "port %u addr 0x%03"PRIx64" size %u"
+apple_pcie_port_phy_ip_wr(uint32_t bus, uint64_t addr, unsigned size, uint64_t data) "port %u addr 0x%03"PRIx64" size %u data 0x%"PRIx64
+apple_pcie_root_conf_rd(uint8_t bus, uint8_t dev, uint8_t fn, uint64_t addr, unsigned size, uint64_t ret) "%02u:%02u.%u addr 0x%03"PRIx64" size %u -> 0x%"PRIx64
+apple_pcie_root_conf_wr(uint8_t bus, uint8_t dev, uint8_t fn, uint64_t addr, unsigned size, uint64_t data) "%02u:%02u.%u addr 0x%03"PRIx64" size %u <- 0x%"PRIx64
