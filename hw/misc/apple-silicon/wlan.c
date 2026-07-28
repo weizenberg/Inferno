@@ -47,6 +47,49 @@ OBJECT_DECLARE_SIMPLE_TYPE(AppleWLANState, APPLE_WLAN)
 #define APPLE_WLAN_SUBVENDOR_ID (0x106b) // Apple
 #define APPLE_WLAN_SUBDEVICE_ID (0x4378)
 
+/*
+ * On Broadcom PCIe parts the low 4 KiB of BAR0 is a moveable window into the
+ * chip's backplane; the window base lives in PCI config space (BAR0_WINDOW).
+ * The chip identity is the ChipCommon `chipid` register at backplane 0x18000000
+ * offset 0, encoded as id | rev << 16 | package << 20 | type << 28.
+ */
+#define APPLE_WLAN_BAR0_WINDOW_CFG (0x80)
+#define APPLE_WLAN_BAR0_WINDOW_SIZE (4 * KiB)
+#define APPLE_WLAN_CHIPCOMMON_BASE (0x18000000)
+#define APPLE_WLAN_CHIPID_OFFSET (0x0)
+// n104 ships a BCM4378 stepping B1; the guest picks its firmware directory from
+// this (`/usr/share/firmware/wifi/C-4378__s-B1`).
+#define APPLE_WLAN_CHIP_ID (0x4378)
+#define APPLE_WLAN_CHIP_REV (0x3)
+#define APPLE_WLAN_CHIP_PKG (0x0)
+#define APPLE_WLAN_CHIP_TYPE (0x1) // AXI backplane
+
+/*
+ * Measured: before publishing hardware identifiers the guest reads backplane
+ * 0x18011120..0x180113fe as 16-bit words (880 accesses, immediately before
+ * "publishHWIdentifiers: Bad argument"), i.e. the chip's OTP starting at offset
+ * 0x120 -- the same OTP base the public brcmfmac driver uses for BCM4378, whose
+ * contents are CIS/TLV tuples. It is not modelled yet, so the guest finds no
+ * valid tuples and cannot publish identifiers. Serving a synthesised blank or a
+ * bare SROM signature there was measured to change nothing.
+ */
+#define APPLE_WLAN_OTP_BASE (0x18011000)
+#define APPLE_WLAN_OTP_CIS_OFFSET (0x120)
+#define APPLE_WLAN_OTP_WORDS (0x170) // matches brcmfmac's BCM4378 OTP size
+#define APPLE_WLAN_OTP_END \
+    (APPLE_WLAN_OTP_CIS_OFFSET + APPLE_WLAN_OTP_WORDS * 2)
+
+/*
+ * Measured, for whoever models the OTP: the guest reads this region as 0x170
+ * 16-bit words starting at offset 0x120 -- the same core/base/size the public
+ * brcmfmac driver uses for BCM4378's OTP, whose payload is CIS/TLV tuples.
+ * Tested and ruled out as the cause of "publishHWIdentifiers: Bad argument":
+ * a bare SROM signature, a synthesised CIS vendor tuple naming the module, and
+ * the driver's own `wlan.debug.module-instance` boot-arg override all left that
+ * failure unchanged -- and it also reproduces on boots where this region is
+ * never read at all, so the failing check is upstream of the OTP contents.
+ */
+
 // BAR0 is the backplane window; BAR2 is the PCIe core register window.
 #define APPLE_WLAN_DEVICE_BAR0_SIZE (16 * KiB)
 #define APPLE_WLAN_DEVICE_BAR2_SIZE (4 * KiB)
@@ -69,6 +112,11 @@ struct AppleWLANDeviceState {
      */
     uint8_t bar0_backing[APPLE_WLAN_DEVICE_BAR0_SIZE];
     uint8_t bar2_backing[APPLE_WLAN_DEVICE_BAR2_SIZE];
+
+    // Backplane address currently mapped into the low 4 KiB of BAR0, set by
+    // the guest through PCI config space (BAR0_WINDOW). Tracking it turns the
+    // otherwise opaque BAR0 offsets into real backplane addresses.
+    uint32_t bar0_window;
 };
 
 struct AppleWLANState {
@@ -102,6 +150,15 @@ static SMCResult apple_wlan_smc_gp11_write(SMCKey *key, SMCKeyData *data,
     }
     s->gp11 = ldl_le_p(in);
     trace_apple_wlan_gp11_write(s->gp11);
+
+    /*
+     * Measured: after this gate is written the driver logs "Power transition
+     * before init" and then waits 120 s before failing with "AdjustBusy timeout
+     * in 120000 ms!". It never re-reads gP11, so it waits on an event from the
+     * device. Raising a bare PCI interrupt here was tested and is NOT enough --
+     * the chip also has to present coherent mailbox/shared-memory state for the
+     * handler to read, i.e. the boot/firmware-download interface has to exist.
+     */
     return SMC_RESULT_SUCCESS;
 }
 
@@ -110,9 +167,18 @@ static uint64_t apple_wlan_bar0_ops_read(void *opaque, hwaddr offset,
 {
     AppleWLANDeviceState *s = opaque;
     uint64_t value = 0;
+    bool windowed = offset < APPLE_WLAN_BAR0_WINDOW_SIZE;
+    uint32_t backplane = s->bar0_window + (uint32_t)offset;
 
-    if (offset + size <= sizeof(s->bar0_backing)) {
+    if (windowed &&
+        backplane == APPLE_WLAN_CHIPCOMMON_BASE + APPLE_WLAN_CHIPID_OFFSET) {
+        value = APPLE_WLAN_CHIP_ID | (APPLE_WLAN_CHIP_REV << 16) |
+                (APPLE_WLAN_CHIP_PKG << 20) | (APPLE_WLAN_CHIP_TYPE << 28);
+    } else if (offset + size <= sizeof(s->bar0_backing)) {
         memcpy(&value, s->bar0_backing + offset, size);
+    }
+    if (windowed) {
+        trace_apple_wlan_backplane_read(backplane, offset, size, value);
     }
     trace_apple_wlan_bar0_read(offset, size, value);
     return value;
@@ -220,6 +286,20 @@ static void apple_wlan_device_qdev_reset_hold(Object *obj, ResetType type)
                  PCI_COMMAND_MEMORY | PCI_COMMAND_MASTER);
 }
 
+// Track BAR0_WINDOW so BAR0 accesses can be resolved to backplane addresses.
+static void apple_wlan_device_config_write(PCIDevice *dev, uint32_t addr,
+                                           uint32_t val, int len)
+{
+    AppleWLANDeviceState *s = APPLE_WLAN_DEVICE(dev);
+
+    pci_default_write_config(dev, addr, val, len);
+
+    if (addr == APPLE_WLAN_BAR0_WINDOW_CFG && len == 4) {
+        s->bar0_window = val;
+        trace_apple_wlan_bar0_window(val);
+    }
+}
+
 static void apple_wlan_device_pci_uninit(PCIDevice *dev)
 {
     pcie_aer_exit(dev);
@@ -235,6 +315,7 @@ static void apple_wlan_device_class_init(ObjectClass *klass, const void *data)
 
     c->realize = apple_wlan_device_pci_realize;
     c->exit = apple_wlan_device_pci_uninit;
+    c->config_write = apple_wlan_device_config_write;
     c->vendor_id = APPLE_WLAN_VENDOR_ID;
     c->device_id = APPLE_WLAN_DEVICE_ID;
     c->revision = 0x01;
