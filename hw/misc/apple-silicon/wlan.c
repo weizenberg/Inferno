@@ -65,6 +65,32 @@ OBJECT_DECLARE_SIMPLE_TYPE(AppleWLANState, APPLE_WLAN)
 #define APPLE_WLAN_CHIP_TYPE (0x1) // AXI backplane
 
 /*
+ * ChipCommon's indirect SROM interface, which is how the guest actually reads
+ * the chip's provisioning data. Derived from the driver, not guessed:
+ * AppleBCMWLANChipManagerPCIe::readChipProvisioningData() maps core 0
+ * (ChipCommon) and then only touches offsets 0x04, 0x190, 0x194 and 0x198 --
+ * the public Broadcom ChipCommon capabilities, sromcontrol, sromaddress and
+ * sromdata registers. It validates the result with
+ * AppleBCMWLANUtil::getcrc8(buf, len, 0xFF) and compares against 0x9F, i.e.
+ * Broadcom's CRC8_INIT_VALUE / CRC8_GOOD_VALUE. The CRC table the driver uses
+ * (at 0xfffffff007308f30) is a reflected CRC8 with polynomial 0xAB.
+ */
+#define APPLE_WLAN_CC_CAPABILITIES (0x004)
+#define APPLE_WLAN_CC_CAP_SPROM_PRESENT (1U << 30)
+#define APPLE_WLAN_CC_SROM_CONTROL (0x190)
+#define APPLE_WLAN_CC_SROM_CONTROL_BUSY (1U << 31)
+#define APPLE_WLAN_CC_SROM_ADDRESS (0x194)
+#define APPLE_WLAN_CC_SROM_DATA (0x198)
+#define APPLE_WLAN_CRC8_POLY (0xAB)
+#define APPLE_WLAN_CRC8_INIT (0xFF)
+#define APPLE_WLAN_CRC8_GOOD (0x9F)
+// Provisioning blob: body plus one trailing byte chosen so the CRC lands on
+// CRC8_GOOD_VALUE. Deliberately empty for now -- an empty-but-valid blob tests
+// whether the driver's parse merely needs to succeed, without guessing at key
+// names we have not yet identified.
+#define APPLE_WLAN_SROM_BYTES (64)
+
+/*
  * Measured: before publishing hardware identifiers the guest reads backplane
  * 0x18011120..0x180113fe as 16-bit words (880 accesses, immediately before
  * "publishHWIdentifiers: Bad argument"), i.e. the chip's OTP starting at offset
@@ -73,9 +99,33 @@ OBJECT_DECLARE_SIMPLE_TYPE(AppleWLANState, APPLE_WLAN)
  * valid tuples and cannot publish identifiers. Serving a synthesised blank or a
  * bare SROM signature there was measured to change nothing.
  */
+/*
+ * OTP layout, read out of the driver rather than guessed:
+ *
+ *   AppleBCMWLANChipManagerPCIe::readChipProvisioningData() pulls 0x170 16-bit
+ *   words starting at offset 0x120 of the GCI core -- the same base/size the
+ *   public brcmfmac driver uses for BCM4378 -- and validates them with
+ *   AppleBCMWLANUtil::getcrc8(buf, len, 0xFF), requiring Broadcom's
+ *   CRC8_GOOD_VALUE of 0x9F. The CRC table it uses is a reflected CRC8 with
+ *   polynomial 0xAB.
+ *
+ *   AppleBCMWLANBusInterface::parseOTPData() then walks it as CIS tuples:
+ *   a type byte, 0x00 meaning "skip one byte" and 0xFF meaning end-of-list,
+ *   otherwise a length byte at +1 and the payload at +2.
+ *
+ *   AppleBCMWLANBusInterface::parseOTPTuple() dispatches type 0x15 with
+ *   length > 6 to parseVersion1Tuple(), which strlcpy()s identity strings into
+ *   the bus interface. publishHWIdentifiers() then requires those strings to be
+ *   non-empty, and FilesDB is keyed off them -- which is why an empty OTP ends
+ *   as "publishHWIdentifiers: Bad argument" and no firmware is ever selected.
+ */
 #define APPLE_WLAN_OTP_BASE (0x18011000)
 #define APPLE_WLAN_OTP_CIS_OFFSET (0x120)
 #define APPLE_WLAN_OTP_WORDS (0x170) // matches brcmfmac's BCM4378 OTP size
+#define APPLE_WLAN_OTP_SIZE (APPLE_WLAN_OTP_WORDS * 2)
+#define APPLE_WLAN_CIS_TYPE_NULL (0x00)
+#define APPLE_WLAN_CIS_TYPE_VERS1 (0x15)
+#define APPLE_WLAN_CIS_TYPE_END (0xFF)
 #define APPLE_WLAN_OTP_END \
     (APPLE_WLAN_OTP_CIS_OFFSET + APPLE_WLAN_OTP_WORDS * 2)
 
@@ -106,18 +156,98 @@ struct AppleWLANDeviceState {
     MemoryRegion bar2;
 
     /*
-     * Until the backplane is modelled, the windows are flat RAM so that
-     * write-then-verify sequences (backplane window register, OTP block,
-     * mailbox indices) behave sanely instead of reading back zero.
+     * BAR2 and the part of BAR0 above the window are flat RAM, so that
+     * write-then-verify sequences behave sanely instead of reading back zero.
      */
-    uint8_t bar0_backing[APPLE_WLAN_DEVICE_BAR0_SIZE];
+    uint8_t bar0_regs[APPLE_WLAN_DEVICE_BAR0_SIZE - APPLE_WLAN_BAR0_WINDOW_SIZE];
     uint8_t bar2_backing[APPLE_WLAN_DEVICE_BAR2_SIZE];
 
     // Backplane address currently mapped into the low 4 KiB of BAR0, set by
     // the guest through PCI config space (BAR0_WINDOW). Tracking it turns the
     // otherwise opaque BAR0 offsets into real backplane addresses.
     uint32_t bar0_window;
+
+    /*
+     * Backplane storage, sparse and keyed by *backplane* address rather than by
+     * BAR offset. A flat BAR-indexed buffer is wrong here: the low 4 KiB of BAR0
+     * is a moveable window, so every window base would alias onto the same
+     * bytes, and the megabyte-scale firmware image the driver pushes through it
+     * would collapse into 4 KiB of garbage.
+     */
+    GHashTable *backplane;
+    uint64_t written_bytes;
+    uint32_t written_hash; // FNV-1a over everything written, for image identity
+
+    // ChipCommon indirect SROM interface state and its backing provisioning blob.
+    uint32_t cc_srom_control;
+    uint32_t cc_srom_address;
+    uint8_t srom[APPLE_WLAN_SROM_BYTES];
+    uint8_t otp[APPLE_WLAN_OTP_SIZE];
 };
+
+// The identity strings the guest image expects: its firmware directory is
+// C-4378__s-B1 and the NVRAM file there is P-moana_M-GODF_V-m__m-4.3.txt, i.e.
+// platform "moana", module "GODF", vendor "m". These are model identity, not any
+// real device's calibration or MAC.
+static const char apple_wlan_otp_identity[] = "moana\0GODF\0m";
+
+static void apple_wlan_build_otp(AppleWLANDeviceState *s, const uint8_t *table)
+{
+    uint8_t crc = APPLE_WLAN_CRC8_INIT;
+    uint32_t i, n = 0;
+
+    memset(s->otp, APPLE_WLAN_CIS_TYPE_NULL, sizeof(s->otp));
+    s->otp[n++] = APPLE_WLAN_CIS_TYPE_VERS1;
+    s->otp[n++] = (uint8_t)sizeof(apple_wlan_otp_identity);
+    memcpy(&s->otp[n], apple_wlan_otp_identity,
+           sizeof(apple_wlan_otp_identity));
+    n += sizeof(apple_wlan_otp_identity);
+    s->otp[n++] = APPLE_WLAN_CIS_TYPE_END;
+    g_assert_cmpuint(n, <, sizeof(s->otp));
+
+    // Trailing byte chosen so getcrc8(otp, sizeof(otp), 0xFF) == CRC8_GOOD_VALUE.
+    for (i = 0; i < sizeof(s->otp) - 1; i++) {
+        crc = table[(s->otp[i] ^ crc) & 0xFF];
+    }
+    for (i = 0; i < 256; i++) {
+        if (table[(i ^ crc) & 0xFF] == APPLE_WLAN_CRC8_GOOD) {
+            s->otp[sizeof(s->otp) - 1] = (uint8_t)i;
+            return;
+        }
+    }
+    g_assert_not_reached();
+}
+
+static void apple_wlan_build_provisioning(AppleWLANDeviceState *s)
+{
+    uint8_t table[256];
+    uint8_t crc = APPLE_WLAN_CRC8_INIT;
+    uint32_t i;
+
+    for (i = 0; i < 256; i++) {
+        uint32_t c = i;
+        uint32_t bit;
+
+        for (bit = 0; bit < 8; bit++) {
+            c = (c >> 1) ^ ((c & 1) ? APPLE_WLAN_CRC8_POLY : 0);
+        }
+        table[i] = (uint8_t)c;
+    }
+
+    // Body stays zeroed; solve the last byte so getcrc8() yields CRC8_GOOD_VALUE.
+    for (i = 0; i < sizeof(s->srom) - 1; i++) {
+        crc = table[(s->srom[i] ^ crc) & 0xFF];
+    }
+    for (i = 0; i < 256; i++) {
+        if (table[(i ^ crc) & 0xFF] == APPLE_WLAN_CRC8_GOOD) {
+            s->srom[sizeof(s->srom) - 1] = (uint8_t)i;
+            break;
+        }
+    }
+    g_assert_cmpuint(i, <, 256);
+
+    apple_wlan_build_otp(s, table);
+}
 
 struct AppleWLANState {
     SysBusDevice parent_obj;
@@ -162,6 +292,25 @@ static SMCResult apple_wlan_smc_gp11_write(SMCKey *key, SMCKeyData *data,
     return SMC_RESULT_SUCCESS;
 }
 
+#define APPLE_WLAN_BACKPLANE_PAGE_SIZE (4 * KiB)
+#define APPLE_WLAN_FNV_OFFSET (2166136261u)
+#define APPLE_WLAN_FNV_PRIME (16777619u)
+// Log download progress this often, so a multi-MiB push is visible but not spammy.
+#define APPLE_WLAN_DL_LOG_STRIDE (256 * KiB)
+
+static uint8_t *apple_wlan_backplane_page(AppleWLANDeviceState *s, uint32_t addr,
+                                          bool allocate)
+{
+    uint32_t base = addr & ~(APPLE_WLAN_BACKPLANE_PAGE_SIZE - 1);
+    uint8_t *page = g_hash_table_lookup(s->backplane, GUINT_TO_POINTER(base));
+
+    if (page == NULL && allocate) {
+        page = g_malloc0(APPLE_WLAN_BACKPLANE_PAGE_SIZE);
+        g_hash_table_insert(s->backplane, GUINT_TO_POINTER(base), page);
+    }
+    return page;
+}
+
 static uint64_t apple_wlan_bar0_ops_read(void *opaque, hwaddr offset,
                                          unsigned size)
 {
@@ -171,11 +320,51 @@ static uint64_t apple_wlan_bar0_ops_read(void *opaque, hwaddr offset,
     uint32_t backplane = s->bar0_window + (uint32_t)offset;
 
     if (windowed &&
+        backplane >= APPLE_WLAN_OTP_BASE + APPLE_WLAN_OTP_CIS_OFFSET &&
+        backplane < APPLE_WLAN_OTP_BASE + APPLE_WLAN_OTP_CIS_OFFSET +
+                        APPLE_WLAN_OTP_SIZE) {
+        uint32_t off =
+            backplane - (APPLE_WLAN_OTP_BASE + APPLE_WLAN_OTP_CIS_OFFSET);
+
+        for (unsigned i = 0; i < size && off + i < sizeof(s->otp); i++) {
+            value |= (uint64_t)s->otp[off + i] << (i * 8);
+        }
+        trace_apple_wlan_otp_read(off, size, value);
+    } else if (windowed && backplane == APPLE_WLAN_CHIPCOMMON_BASE +
+                                     APPLE_WLAN_CC_CAPABILITIES) {
+        value = APPLE_WLAN_CC_CAP_SPROM_PRESENT;
+    } else if (windowed && backplane == APPLE_WLAN_CHIPCOMMON_BASE +
+                                            APPLE_WLAN_CC_SROM_CONTROL) {
+        // Operations complete immediately, so never report BUSY.
+        value = s->cc_srom_control & ~APPLE_WLAN_CC_SROM_CONTROL_BUSY;
+    } else if (windowed && backplane == APPLE_WLAN_CHIPCOMMON_BASE +
+                                            APPLE_WLAN_CC_SROM_DATA) {
+        uint32_t off = s->cc_srom_address;
+
+        value = 0;
+        for (unsigned i = 0; i < size; i++) {
+            if (off + i < sizeof(s->srom)) {
+                value |= (uint64_t)s->srom[off + i] << (i * 8);
+            }
+        }
+        trace_apple_wlan_srom_read(off, size, value);
+    } else if (windowed &&
         backplane == APPLE_WLAN_CHIPCOMMON_BASE + APPLE_WLAN_CHIPID_OFFSET) {
         value = APPLE_WLAN_CHIP_ID | (APPLE_WLAN_CHIP_REV << 16) |
                 (APPLE_WLAN_CHIP_PKG << 20) | (APPLE_WLAN_CHIP_TYPE << 28);
-    } else if (offset + size <= sizeof(s->bar0_backing)) {
-        memcpy(&value, s->bar0_backing + offset, size);
+    } else if (windowed) {
+        uint8_t *page = apple_wlan_backplane_page(s, backplane, false);
+
+        if (page != NULL) {
+            memcpy(&value, page + (backplane & (APPLE_WLAN_BACKPLANE_PAGE_SIZE - 1)),
+                   size);
+        }
+    } else {
+        uint32_t reg_off = (uint32_t)offset - APPLE_WLAN_BAR0_WINDOW_SIZE;
+
+        if (reg_off + size <= sizeof(s->bar0_regs)) {
+            memcpy(&value, s->bar0_regs + reg_off, size);
+        }
     }
     if (windowed) {
         trace_apple_wlan_backplane_read(backplane, offset, size, value);
@@ -189,8 +378,39 @@ static void apple_wlan_bar0_ops_write(void *opaque, hwaddr offset,
 {
     AppleWLANDeviceState *s = opaque;
 
-    if (offset + size <= sizeof(s->bar0_backing)) {
-        memcpy(s->bar0_backing + offset, &value, size);
+    if (offset < APPLE_WLAN_BAR0_WINDOW_SIZE) {
+        uint32_t backplane = s->bar0_window + (uint32_t)offset;
+
+        if (backplane == APPLE_WLAN_CHIPCOMMON_BASE +
+                             APPLE_WLAN_CC_SROM_CONTROL) {
+            s->cc_srom_control = (uint32_t)value;
+        } else if (backplane == APPLE_WLAN_CHIPCOMMON_BASE +
+                                    APPLE_WLAN_CC_SROM_ADDRESS) {
+            s->cc_srom_address = (uint32_t)value;
+        }
+        uint8_t *page = apple_wlan_backplane_page(s, backplane, true);
+        uint64_t before = s->written_bytes;
+
+        memcpy(page + (backplane & (APPLE_WLAN_BACKPLANE_PAGE_SIZE - 1)), &value,
+               size);
+        for (unsigned i = 0; i < size; i++) {
+            s->written_hash ^= (uint8_t)(value >> (i * 8));
+            s->written_hash *= APPLE_WLAN_FNV_PRIME;
+        }
+        s->written_bytes += size;
+        if (before / APPLE_WLAN_DL_LOG_STRIDE !=
+            s->written_bytes / APPLE_WLAN_DL_LOG_STRIDE) {
+            trace_apple_wlan_backplane_written(
+                s->written_bytes, g_hash_table_size(s->backplane),
+                s->written_hash);
+        }
+        trace_apple_wlan_backplane_write(backplane, offset, size, value);
+    } else {
+        uint32_t reg_off = (uint32_t)offset - APPLE_WLAN_BAR0_WINDOW_SIZE;
+
+        if (reg_off + size <= sizeof(s->bar0_regs)) {
+            memcpy(s->bar0_regs + reg_off, &value, size);
+        }
     }
     trace_apple_wlan_bar0_write(offset, size, value);
 }
@@ -245,6 +465,11 @@ static void apple_wlan_device_pci_realize(PCIDevice *dev, Error **errp)
     pci_conf[PCI_INTERRUPT_PIN] = 1;
     pci_set_word(pci_conf + PCI_SUBSYSTEM_VENDOR_ID, APPLE_WLAN_SUBVENDOR_ID);
     pci_set_word(pci_conf + PCI_SUBSYSTEM_ID, APPLE_WLAN_SUBDEVICE_ID);
+
+    s->backplane = g_hash_table_new_full(g_direct_hash, g_direct_equal, NULL,
+                                        g_free);
+    s->written_hash = APPLE_WLAN_FNV_OFFSET;
+    apple_wlan_build_provisioning(s);
 
     memory_region_init_io(&s->bar0, OBJECT(dev), &apple_wlan_bar0_ops, s,
                           TYPE_APPLE_WLAN_DEVICE ".bar0",
@@ -302,6 +527,9 @@ static void apple_wlan_device_config_write(PCIDevice *dev, uint32_t addr,
 
 static void apple_wlan_device_pci_uninit(PCIDevice *dev)
 {
+    AppleWLANDeviceState *s = APPLE_WLAN_DEVICE(dev);
+
+    g_clear_pointer(&s->backplane, g_hash_table_unref);
     pcie_aer_exit(dev);
     pcie_cap_exit(dev);
     msi_uninit(dev);
