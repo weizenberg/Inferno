@@ -2217,6 +2217,7 @@ static void t8030_create_sep(AppleT8030MachineState *t8030)
     MemoryRegion *sep_dma_mr;
     MemoryRegion *sep_dma_sysmem_mr;
     AddressSpace *sep_dma_as;
+    IOMMUMemoryRegion *sep_iommu_mr;
 
     prop = apple_dt_get_prop(apple_dt_get_node(t8030->device_tree, "chosen"),
                              "chip-id");
@@ -2263,10 +2264,24 @@ static void t8030_create_sep(AppleT8030MachineState *t8030)
     address_space_init(sep_dma_as, sep_dma_mr, "sep.dma-downstream");
     apple_dart_set_target_as(dart, sep_dma_as);
 
-    sep = apple_sep_from_node(
-        child,
-        MEMORY_REGION(apple_dart_iommu_mr(dart, *(uint32_t *)prop->data)),
-        SEPROM_BASE, A13_MAX_CPU, true, chip_id);
+    sep_iommu_mr = apple_dart_iommu_mr(dart, *(uint32_t *)prop->data);
+    assert_nonnull(sep_iommu_mr);
+
+    /*
+     * Now buy back the speed that costs. Every SEP access to the window above
+     * traps under HVF -- around 550k software-emulated accesses per boot, since
+     * HVF caches no IOMMU translations -- so publish the resolved pages as RAM
+     * once the guest's mapping turns out to be a single contiguous run. TCG
+     * caches translations itself and its global map must stay as it was, so
+     * this is HVF-only.
+     */
+    if (t8030->sep_dma_mirror && hvf_enabled()) {
+        apple_dart_install_dma_mirror(dart, sep_iommu_mr, get_system_memory(),
+                                      0x0, SEP_DMA_MAPPING_SIZE);
+    }
+
+    sep = apple_sep_from_node(child, MEMORY_REGION(sep_iommu_mr), SEPROM_BASE,
+                              A13_MAX_CPU, true, chip_id);
     assert_nonnull(sep);
     sep->dma_target_as = sep_dma_as;
 
@@ -2752,6 +2767,92 @@ static void t8030_init_done(Notifier *notifier, void *data)
     t8030_cpu_reset(t8030);
 }
 
+/*
+ * Preflight the firmware inputs the machine needs before any setup runs.
+ *
+ * The individual loaders each fail fatally, but deep into init and one file at
+ * a time, with messages like "Failed to load device tree" that don't say which
+ * flag was missing or that several other inputs are also required. This gate
+ * checks everything the selected boot mode consumes up front and reports every
+ * problem at once, so a user who has not supplied firmware gets one actionable
+ * message instead of a cryptic downstream failure. Returns false (after raising
+ * a fatal error) if any required input is missing or unreadable.
+ */
+static bool t8030_preflight_firmware(AppleT8030MachineState *t8030,
+                                     MachineState *machine)
+{
+    bool securerom = t8030->securerom_filename != NULL;
+    bool sep_specified =
+        t8030->sep_rom_filename != NULL || t8030->sep_fw_filename != NULL;
+    bool sep_required = false;
+    GString *errs = g_string_new(NULL);
+    GString *warns = g_string_new(NULL);
+
+#ifdef ENABLE_DATA_ENCRYPTION
+    /* Data encryption requires the real SEP (SEPROM + SEPFW), not the sim. */
+    sep_required = !securerom;
+#endif
+
+#define REQUIRE(path, label)                                                 \
+    do {                                                                     \
+        if ((path) == NULL) {                                                \
+            g_string_append_printf(errs, "\n  - %s: not specified", label);  \
+        } else if (!g_file_test((path), G_FILE_TEST_IS_REGULAR)) {           \
+            g_string_append_printf(                                          \
+                errs, "\n  - %s: `%s` not found or not a regular file",      \
+                label, (path));                                              \
+        }                                                                    \
+    } while (0)
+
+    if (securerom) {
+        REQUIRE(t8030->securerom_filename, "securerom=");
+    } else {
+        REQUIRE(machine->kernel_filename, "-kernel (kernelcache)");
+        REQUIRE(machine->dtb, "-dtb (device tree)");
+        REQUIRE(t8030->trustcache_filename, "trustcache=");
+        /* The ticket is consumed only if present; recommend rather than require. */
+        if (t8030->ticket_filename == NULL) {
+            g_string_append(warns, " ticket=");
+        } else if (!g_file_test(t8030->ticket_filename, G_FILE_TEST_IS_REGULAR)) {
+            g_string_append_printf(
+                errs, "\n  - ticket=: `%s` not found or not a regular file",
+                t8030->ticket_filename);
+        }
+    }
+
+    if (sep_required || sep_specified) {
+        REQUIRE(t8030->sep_rom_filename, "sep-rom= (SEPROM)");
+        REQUIRE(t8030->sep_fw_filename, "sep-fw= (SEP firmware)");
+    }
+
+    if (machine->initrd_filename != NULL &&
+        !g_file_test(machine->initrd_filename, G_FILE_TEST_IS_REGULAR)) {
+        g_string_append_printf(
+            errs, "\n  - -initrd: `%s` not found or not a regular file",
+            machine->initrd_filename);
+    }
+
+#undef REQUIRE
+
+    if (warns->len > 0) {
+        warn_report("t8030: recommended firmware input(s) not specified:%s",
+                    warns->str);
+    }
+    g_string_free(warns, TRUE);
+
+    if (errs->len > 0) {
+        error_setg(&error_fatal,
+                   "t8030: missing or unreadable firmware input(s):%s\n"
+                   "See https://chefkiss.dev/guides/inferno/ for how to obtain "
+                   "and pass them.",
+                   errs->str);
+        g_string_free(errs, TRUE);
+        return false;
+    }
+    g_string_free(errs, TRUE);
+    return true;
+}
+
 static void t8030_init(MachineState *machine)
 {
     AppleT8030MachineState *t8030;
@@ -2766,6 +2867,10 @@ static void t8030_init(MachineState *machine)
     }
 
     t8030 = APPLE_T8030(machine);
+
+    if (!t8030_preflight_firmware(t8030, machine)) {
+        return;
+    }
 
     if ((t8030->sep_fw_filename == NULL) != (t8030->sep_rom_filename == NULL)) {
         error_setg(&error_fatal,
@@ -3087,6 +3192,7 @@ static char *t8030_get_boot_mode(Object *obj, Error **errp)
 PROP_VISIT_GETTER_SETTER(uint64, ecid);
 PROP_GETTER_SETTER(bool, kaslr_off);
 PROP_GETTER_SETTER(bool, force_dfu);
+PROP_GETTER_SETTER(bool, sep_dma_mirror);
 PROP_GETTER_SETTER(int, usb_conn_type);
 PROP_STR_GETTER_SETTER(trustcache_filename);
 PROP_STR_GETTER_SETTER(ticket_filename);
@@ -3154,6 +3260,14 @@ static void t8030_class_init(ObjectClass *klass, const void *data)
     object_class_property_add_bool(klass, "force-dfu", t8030_get_force_dfu,
                                    t8030_set_force_dfu);
     object_class_property_set_description(klass, "force-dfu", "Force DFU");
+    oprop = object_class_property_add_bool(klass, "sep-dma-mirror",
+                                           t8030_get_sep_dma_mirror,
+                                           t8030_set_sep_dma_mirror);
+    object_property_set_default_bool(oprop, true);
+    object_class_property_set_description(
+        klass, "sep-dma-mirror",
+        "Publish the SEP's resolved DART mapping as RAM under HVF "
+        "(faster; no effect under TCG)");
     object_class_property_add_enum(
         klass, "usb-conn-type", "USBTCPRemoteConnType",
         &USBTCPRemoteConnType_lookup, t8030_get_usb_conn_type,

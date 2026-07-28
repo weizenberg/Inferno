@@ -2,3 +2,7 @@
 
 apple_sep_iop_start(const char *role) "%s"
 apple_sep_iop_wakeup(const char *role) "%s"
+
+# dart.c
+
+apple_dart_dma_mirror_install(const char *id, uint64_t mapped, uint64_t total, uint32_t mirrored) "%s: %" PRIu64 "/%" PRIu64 " pages mapped, %u mirrored as RAM"

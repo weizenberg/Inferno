@@ -28,8 +28,12 @@
 #include "monitor/monitor.h"
 #include "qapi/error.h"
 #include "qemu/bitops.h"
+#include "qemu/error-report.h"
+#include "qemu/main-loop.h"
+#include "system/address-spaces.h"
 #include "system/dma.h"
 #include "qobject/qdict.h"
+#include "trace.h"
 
 #if 0
 #define DPRINTF(fmt, ...)                             \
@@ -190,6 +194,48 @@ struct AppleDARTMapperInstance {
     AppleDARTDARTRegs regs;
 };
 
+/*
+ * See apple_dart_install_dma_mirror().
+ *
+ * The mirror is page-granular because that is the shape the guest actually
+ * produces: on t8030 the SEP's DART maps 17 of the window's 2048 pages -- the
+ * shared buffer the AP advertises -- and they are *not* physically contiguous,
+ * so nothing coarser can be aliased.
+ *
+ * Every alias is page-sized and embedded here, which is what makes re-pointing
+ * cheap and safe: a MemoryRegion's size is fixed at init, but its offset is not,
+ * so each slot is initialised at most once and afterwards only ever gets
+ * memory_region_set_alias_offset(). No MemoryRegion is created or destroyed
+ * after setup.
+ *
+ * MAX_PAGES is a hard cap, not a guess: each mirrored page costs one HVF memory
+ * slot (hvf_slot slots[] in include/system/hvf_int.h) and running out of those
+ * is an abort(), so the mirror must never be able to grow into that wall.
+ */
+#define DART_DMA_MIRROR_MAX_PAGES (24)
+
+typedef struct AppleDARTDMAMirror {
+    AppleDARTState *dart;
+    IOMMUMemoryRegion *iommu_mr;
+    MemoryRegion *into;
+    hwaddr base;
+    uint64_t size;
+    struct {
+        MemoryRegion alias;
+        MemoryRegion *target;
+        hwaddr iova;
+        hwaddr offset;
+        bool inited;
+        bool installed;
+    } page[DART_DMA_MIRROR_MAX_PAGES];
+    uint32_t installed_pages;
+    bool evaluating;
+    bool quiesced;
+    bool capped;
+    IOMMUNotifier notifier;
+    QEMUBH *bh;
+} AppleDARTDMAMirror;
+
 struct AppleDARTState {
     SysBusDevice parent_obj;
     qemu_irq irq;
@@ -204,12 +250,14 @@ struct AppleDARTState {
     uint64_t sid_mask;
     uint32_t dart_options;
     AddressSpace *target_as;
+    AppleDARTDMAMirror *mirror;
 };
 
 void apple_dart_set_target_as(AppleDARTState *dart, AddressSpace *as)
 {
     dart->target_as = as;
 }
+
 
 static int apple_dart_device_list(Object *obj, void *opaque)
 {
@@ -508,6 +556,242 @@ static inline uint32_t apple_dart_mapper_ptw(AppleDARTMapperInstance *mapper,
     return 0;
 }
 
+/*
+ * Walk one IOVA with none of apple_dart_mapper_translate()'s side effects.
+ * Probing a window through the public path would latch error_status and raise
+ * the DART interrupt for every unmapped page, and the guest treats that as a
+ * fatal DART exception -- `DART exception ERROR_STATUS 0x80000004` followed by a
+ * panic. A speculative probe must be invisible to the guest.
+ */
+static bool apple_dart_mirror_probe(AppleDARTDMAMirror *mirror, hwaddr addr,
+                                   hwaddr *pa)
+{
+    AppleDARTIOMMUMemoryRegion *iommu =
+        container_of(mirror->iommu_mr, AppleDARTIOMMUMemoryRegion, iommu);
+    AppleDARTMapperInstance *mapper = iommu->mapper;
+    AppleDARTState *dart = mapper->common.dart;
+    IOMMUTLBEntry entry = {
+        .target_as = dart->target_as,
+        .iova = addr,
+        .addr_mask = dart->page_bits,
+        .perm = IOMMU_NONE,
+    };
+    uint32_t sid;
+
+    if (REG_FIELD_EX32(qatomic_read(&mapper->regs.tlb_op), DART_TLB_OP, BUSY)) {
+        return false;
+    }
+
+    QEMU_LOCK_GUARD(&mapper->common.mutex);
+
+    sid = mapper->regs.sid_remap[iommu->sid];
+
+    if (REG_FIELD_EX32(mapper->regs.sid_config[sid], DART_SID_CONFIG,
+                       TRANSLATION_ENABLE) == 0 ||
+        REG_FIELD_EX32(mapper->regs.sid_config[sid], DART_SID_CONFIG,
+                       FULL_BYPASS) != 0) {
+        return false;
+    }
+
+    if (apple_dart_mapper_ptw(mapper, sid, addr >> dart->page_shift, &entry) !=
+        0) {
+        return false;
+    }
+
+    if ((entry.perm & IOMMU_RW) != IOMMU_RW) {
+        return false;
+    }
+
+    *pa = entry.translated_addr & ~dart->page_bits;
+    return true;
+}
+
+/*
+ * Re-evaluate the whole window and make the installed set match it.
+ *
+ * Runs as a bottom half, so the memory transaction happens with the BQL held
+ * and the accelerator's memory listener sees one atomic update.
+ */
+static void apple_dart_mirror_evaluate(void *opaque)
+{
+    AppleDARTDMAMirror *mirror = opaque;
+    AppleDARTState *dart = mirror->dart;
+    uint64_t page_size = dart->page_size;
+    uint64_t pages = mirror->size / page_size;
+    uint64_t mapped = 0;
+    uint32_t used = 0;
+    uint64_t i;
+
+    /*
+     * Probing walks every page of the window, so do not do it again until the
+     * guest changes something: the translate hook would otherwise re-arm us on
+     * every trapped access to a page we decided not to mirror.
+     */
+    mirror->evaluating = true;
+    mirror->quiesced = true;
+
+    memory_region_transaction_begin();
+
+    for (i = 0; i < pages && used < DART_DMA_MIRROR_MAX_PAGES; i++) {
+        hwaddr iova = mirror->base + i * page_size;
+        hwaddr pa;
+        hwaddr xlat;
+        hwaddr len;
+        MemoryRegion *mr;
+
+        if (!apple_dart_mirror_probe(mirror, iova, &pa)) {
+            continue;
+        }
+
+        mapped++;
+
+        /*
+         * Alias the backing RAM region directly. Aliasing the downstream
+         * container would also work but can resolve back through its
+         * system-memory alias into the mirror itself, which renders as a loop.
+         */
+        WITH_RCU_READ_LOCK_GUARD()
+        {
+            len = page_size;
+            mr = address_space_translate(dart->target_as, pa, &xlat, &len, true,
+                                         MEMTXATTRS_UNSPECIFIED);
+            if (mr == NULL || !memory_region_is_ram(mr) ||
+                memory_region_is_rom(mr) || len < page_size) {
+                mr = NULL;
+            }
+        }
+
+        if (mr == NULL) {
+            continue;
+        }
+
+        if (!mirror->page[used].inited) {
+            memory_region_init_alias(&mirror->page[used].alias,
+                                     OBJECT(mirror->dart), "dart-dma-mirror",
+                                     mr, xlat, page_size);
+            mirror->page[used].target = mr;
+            mirror->page[used].offset = xlat;
+            mirror->page[used].inited = true;
+        } else if (mirror->page[used].target != mr) {
+            /*
+             * A slot's alias target is fixed once initialised. Nothing observed
+             * so far moves a page between RAM regions, so leave this page
+             * trapping rather than grow a MemoryRegion lifecycle here.
+             */
+            continue;
+        } else if (mirror->page[used].offset != xlat) {
+            memory_region_set_alias_offset(&mirror->page[used].alias, xlat);
+            mirror->page[used].offset = xlat;
+        }
+
+        if (mirror->page[used].installed && mirror->page[used].iova != iova) {
+            memory_region_del_subregion(mirror->into,
+                                        &mirror->page[used].alias);
+            mirror->page[used].installed = false;
+        }
+
+        if (!mirror->page[used].installed) {
+            /* Negative priority: anything really mapped here still wins. */
+            memory_region_add_subregion_overlap(mirror->into, iova,
+                                                &mirror->page[used].alias, -1);
+            mirror->page[used].installed = true;
+            mirror->page[used].iova = iova;
+        }
+
+        used++;
+    }
+
+    /* Anything the guest dropped since last time goes away. */
+    for (i = used; i < DART_DMA_MIRROR_MAX_PAGES; i++) {
+        if (mirror->page[i].installed) {
+            memory_region_del_subregion(mirror->into, &mirror->page[i].alias);
+            mirror->page[i].installed = false;
+        }
+    }
+
+    memory_region_transaction_commit();
+    mirror->evaluating = false;
+
+    if (used == DART_DMA_MIRROR_MAX_PAGES && !mirror->capped) {
+        warn_report("%s: DMA mirror hit its %d-page cap; the rest of the "
+                    "window keeps trapping",
+                    DEVICE(dart)->id, DART_DMA_MIRROR_MAX_PAGES);
+        mirror->capped = true;
+    }
+
+    if (used != mirror->installed_pages) {
+        trace_apple_dart_dma_mirror_install(DEVICE(dart)->id, mapped, pages,
+                                           used);
+        mirror->installed_pages = used;
+    }
+}
+
+static void apple_dart_mirror_invalidate(IOMMUNotifier *notifier,
+                                         IOMMUTLBEntry *entry)
+{
+    AppleDARTDMAMirror *mirror =
+        container_of(notifier, AppleDARTDMAMirror, notifier);
+
+    /* The mapping may have changed under us; re-evaluate from scratch. */
+    mirror->quiesced = false;
+    qemu_bh_schedule(mirror->bh);
+}
+
+/*
+ * Called from the translate path. A mirrored page never reaches translate under
+ * HVF, so a translate arriving here means the guest has mapped something we are
+ * not covering yet -- which is how the mirror gets installed without needing
+ * MAP notifications, which this DART does not emit.
+ */
+static void apple_dart_mirror_note_mapped(AppleDARTState *dart)
+{
+    AppleDARTDMAMirror *mirror = dart->mirror;
+
+    if (mirror == NULL || mirror->evaluating || mirror->quiesced) {
+        return;
+    }
+
+    qemu_bh_schedule(mirror->bh);
+}
+
+void apple_dart_install_dma_mirror(AppleDARTState *dart,
+                                   IOMMUMemoryRegion *iommu_mr,
+                                   MemoryRegion *into, hwaddr base,
+                                   uint64_t size)
+{
+    AppleDARTDMAMirror *mirror;
+
+    g_assert_nonnull(iommu_mr);
+    g_assert_nonnull(into);
+    g_assert_null(dart->mirror);
+    g_assert_cmpuint(size, >, 0);
+    g_assert_true(QEMU_IS_ALIGNED(base, dart->page_size));
+    g_assert_true(QEMU_IS_ALIGNED(size, dart->page_size));
+
+    mirror = g_new0(AppleDARTDMAMirror, 1);
+    mirror->dart = dart;
+    mirror->iommu_mr = iommu_mr;
+    mirror->into = into;
+    mirror->base = base;
+    mirror->size = size;
+    /*
+     * Deliberately *not* guarded. The reentrancy guard is per-DeviceState and
+     * engaged for as long as the BH runs, so a guarded BH would make every
+     * concurrent access to this DART's own registers fail with
+     * MEMTX_ACCESS_ERROR -- which the SEP sees as a bus error and answers with
+     * `SEP Panic: :sars/sars`. This BH touches no DART MMIO, only page tables in
+     * system memory, so there is nothing to guard against.
+     */
+    mirror->bh = qemu_bh_new(apple_dart_mirror_evaluate, mirror);
+
+    iommu_notifier_init(&mirror->notifier, apple_dart_mirror_invalidate,
+                        IOMMU_NOTIFIER_UNMAP, 0, HWADDR_MAX, 0);
+    memory_region_register_iommu_notifier(MEMORY_REGION(iommu_mr),
+                                          &mirror->notifier, &error_abort);
+
+    dart->mirror = mirror;
+}
+
 static IOMMUTLBEntry apple_dart_mapper_translate(IOMMUMemoryRegion *mr,
                                                  hwaddr addr,
                                                  IOMMUAccessFlags flag,
@@ -557,6 +841,8 @@ static IOMMUTLBEntry apple_dart_mapper_translate(IOMMUMemoryRegion *mr,
     }
 
     entry.translated_addr |= addr & entry.addr_mask;
+
+    apple_dart_mirror_note_mapped(dart);
 
     if ((flag & IOMMU_WO) != 0 && (entry.perm & IOMMU_WO) == 0) {
         mapper->regs.error_address = addr;

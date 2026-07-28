@@ -37,11 +37,22 @@ typedef void (*ArmAarch64FallbackEmuGetVReg)(CPUState *cpu, int rt,
 typedef void (*ArmAarch64FallbackEmuSetVReg)(CPUState *cpu, int rt,
                                              const uint8_t val[16]);
 
+/*
+ * Make `env` readable for the duration of one emulation. The emulator only ever
+ * reads it -- the PC to fetch the instruction from, and whatever the software
+ * page-table walk consults -- and returns register results through the
+ * callbacks above, so an accelerator that can offer a cheaper read-only
+ * snapshot than a full bidirectional state sync should do so here. Optional;
+ * cpu_synchronize_state() is used when it is NULL.
+ */
+typedef void (*ArmAarch64FallbackEmuSnapshotState)(CPUState *cpu);
+
 typedef struct {
     ArmAarch64FallbackEmuGetReg get_reg;
     ArmAarch64FallbackEmuSetReg set_reg;
     ArmAarch64FallbackEmuGetVReg get_vreg;
     ArmAarch64FallbackEmuSetVReg set_vreg;
+    ArmAarch64FallbackEmuSnapshotState snapshot_state;
 } ArmAarch64FallbackEmuOps;
 
 bool arm_aarch64_fallback_emu_single(CPUState *cpu, AddressSpace *as,

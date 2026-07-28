@@ -54,4 +54,31 @@ AppleDARTState *apple_dart_from_node(AppleDTNode *node);
  */
 void apple_dart_set_target_as(AppleDARTState *dart, AddressSpace *as);
 
+/*
+ * Publish this DART's translation of [base, base + size) into `into` as a plain
+ * RAM alias, so an accelerator that walks page tables in hardware reaches the
+ * right memory without exiting.
+ *
+ * This exists purely as an HVF optimisation and is the counterpart to
+ * apple_dart_set_target_as(): pointing a DART at a private downstream view is
+ * what makes its translations *correct* under HVF, but it also means every
+ * access by the DMA master traps, since HVF caches no IOMMU translations. When
+ * the guest's mapping of the window turns out to be one contiguous run of RAM
+ * -- which is what a coprocessor carveout normally is -- the same bytes can be
+ * exposed directly, costing one memory slot and zero exits.
+ *
+ * Deliberately all-or-nothing: the mirror is installed only while the *entire*
+ * window is mapped, contiguous, and backed by a single RAM region. Anything
+ * else (partial mapping, scattered pages, MMIO behind the DART) leaves the
+ * window trapping, which is slower but always correct -- in particular an
+ * access to an unmapped IOVA keeps faulting instead of silently reading RAM.
+ * The mirror is re-evaluated whenever the guest invalidates the DART TLB.
+ *
+ * `into` is normally get_system_memory(); `iommu_mr` must belong to `dart`.
+ */
+void apple_dart_install_dma_mirror(AppleDARTState *dart,
+                                   IOMMUMemoryRegion *iommu_mr,
+                                   MemoryRegion *into, hwaddr base,
+                                   uint64_t size);
+
 #endif /* HW_ARM_APPLE_SILICON_DART_H */

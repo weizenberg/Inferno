@@ -522,7 +522,11 @@ bool arm_aarch64_fallback_emu_single(CPUState *cpu, AddressSpace *as,
     uint32_t inst = 0;
     bool success;
 
-    cpu_synchronize_state(cpu);
+    if (ops->snapshot_state != NULL) {
+        ops->snapshot_state(cpu);
+    } else {
+        cpu_synchronize_state(cpu);
+    }
 
     if (address_space_read(as, arm_aarch64_fallback_emu_vtop(cpu, env->pc),
                            MEMTXATTRS_UNSPECIFIED, &inst,

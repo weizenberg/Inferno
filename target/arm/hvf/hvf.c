@@ -885,11 +885,34 @@ static void hvf_set_vreg(CPUState *cpu, int rt, const uint8_t val[16])
     assert_hvf_ok(r);
 }
 
+/*
+ * Read-only state snapshot for the fallback emulator.
+ *
+ * cpu_synchronize_state() reads the whole vCPU -- 32 GPRs, PC, 32 SIMD
+ * registers, FP state, CPSR and every entry of hvf_sreg_match[] -- and marks the
+ * vCPU dirty. That dirty flag then makes the first hvf_get_reg()/hvf_set_reg()
+ * below call flush_cpu_state(), pushing all of it straight back out again. The
+ * emulator never writes `env`: it reads the PC and whatever the page-table walk
+ * needs, and delivers results through the callbacks, which go directly to the
+ * vCPU. So the write-back cannot carry any change, and at 600k+ emulated
+ * accesses per boot it was the largest single cost on this path.
+ *
+ * Clearing the flag here turns `env` into exactly what the emulator wants: a
+ * stale, read-only copy. Nothing may write to `env` between here and the end of
+ * exit handling, or the write would be silently dropped.
+ */
+static void hvf_snapshot_state(CPUState *cpu)
+{
+    cpu_synchronize_state(cpu);
+    cpu->vcpu_dirty = false;
+}
+
 static const ArmAarch64FallbackEmuOps hvf_fallback_emu_ops = {
     .get_reg = hvf_get_reg,
     .set_reg = hvf_set_reg,
     .get_vreg = hvf_get_vreg,
     .set_vreg = hvf_set_vreg,
+    .snapshot_state = hvf_snapshot_state,
 };
 
 static void clamp_id_aa64mmfr0_parange_to_ipa_size(ARMISARegisters *isar)
