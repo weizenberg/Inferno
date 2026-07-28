@@ -409,8 +409,11 @@ void apple_boot_load_raw_file(const char *filename, AddressSpace *as,
 
 AppleDTNode *apple_boot_load_dt_file(const char *filename);
 
+#define APPLE_BOOT_KEEP_WLAN (1U << 0)
+#define APPLE_BOOT_KEEP_AMFM (1U << 1)
+
 void apple_boot_populate_dt(AppleDTNode *root, AppleBootInfo *info,
-                            bool auto_boot, bool keep_wlan);
+                            bool auto_boot, uint32_t keep_flags);
 
 void apple_boot_finalise_dt(AppleDTNode *root, AddressSpace *as,
                             AppleBootInfo *info);

@@ -659,7 +659,10 @@ static void t8030_memory_setup(AppleT8030MachineState *t8030)
     apple_boot_allocate_segment_records(memory_map, hdr);
 
     apple_boot_populate_dt(t8030->device_tree, info, auto_boot,
-                           t8030->enable_wlan);
+                           (t8030->enable_wlan ? APPLE_BOOT_KEEP_WLAN : 0) |
+                               (t8030->enable_wlan && t8030->wlan_amfm ?
+                                    APPLE_BOOT_KEEP_AMFM :
+                                    0));
 
     switch (hdr->file_type) {
     case MH_EXECUTE:
@@ -3224,6 +3227,7 @@ PROP_GETTER_SETTER(bool, kaslr_off);
 PROP_GETTER_SETTER(bool, force_dfu);
 PROP_GETTER_SETTER(bool, sep_dma_mirror);
 PROP_GETTER_SETTER(bool, enable_wlan);
+PROP_GETTER_SETTER(bool, wlan_amfm);
 PROP_GETTER_SETTER(int, usb_conn_type);
 PROP_STR_GETTER_SETTER(trustcache_filename);
 PROP_STR_GETTER_SETTER(ticket_filename);
@@ -3306,6 +3310,13 @@ static void t8030_class_init(ObjectClass *klass, const void *data)
         klass, "enable-wlan",
         "Expose the Broadcom WiFi PCIe endpoint and keep its DeviceTree "
         "nodes (experimental)");
+    oprop = object_class_property_add_bool(
+        klass, "wlan-amfm", t8030_get_wlan_amfm, t8030_set_wlan_amfm);
+    object_property_set_default_bool(oprop, true);
+    object_class_property_set_description(
+        klass, "wlan-amfm",
+        "Keep the /amfm node and use the AMFM-managed port path "
+        "(only meaningful with enable-wlan=on)");
     object_class_property_add_enum(
         klass, "usb-conn-type", "USBTCPRemoteConnType",
         &USBTCPRemoteConnType_lookup, t8030_get_usb_conn_type,

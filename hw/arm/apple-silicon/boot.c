@@ -258,7 +258,7 @@ static uint64_t sstrlen(const char *str)
 }
 
 static void apple_boot_process_dt_node(AppleDTNode *node, AppleDTNode *parent,
-                                       bool keep_wlan)
+                                       uint32_t keep_flags)
 {
     GList *iter = NULL;
     AppleDTNode *child = NULL;
@@ -291,10 +291,12 @@ static void apple_boot_process_dt_node(AppleDTNode *node, AppleDTNode *parent,
         assert_nonnull(prop->data);
         for (i = 0; i < ARRAY_SIZE(REM_NAMES); i++) {
             uint64_t size = MIN(prop->len, sstrlen(REM_NAMES[i]));
-            // The WiFi endpoint/params nodes and the combo-chip power
-            // controller stay when WLAN emulation is enabled.
-            if (keep_wlan && (memcmp(REM_NAMES[i], "wlan\0$", size) == 0 ||
-                              memcmp(REM_NAMES[i], "amfm\0$", size) == 0)) {
+            // The WiFi endpoint/params nodes (and optionally the AMFM
+            // combo-chip power controller) stay when enabled.
+            if (((keep_flags & APPLE_BOOT_KEEP_WLAN) != 0 &&
+                 memcmp(REM_NAMES[i], "wlan\0$", size) == 0) ||
+                ((keep_flags & APPLE_BOOT_KEEP_AMFM) != 0 &&
+                 memcmp(REM_NAMES[i], "amfm\0$", size) == 0)) {
                 continue;
             }
             if (memcmp(prop->data, REM_NAMES[i], size) == 0) {
@@ -311,7 +313,8 @@ static void apple_boot_process_dt_node(AppleDTNode *node, AppleDTNode *parent,
         assert_nonnull(prop->data);
         for (i = 0; i < ARRAY_SIZE(REM_DEV_TYPES); i++) {
             uint64_t size = MIN(prop->len, sstrlen(REM_DEV_TYPES[i]));
-            if (keep_wlan && memcmp(REM_DEV_TYPES[i], "wlan\0$", size) == 0) {
+            if ((keep_flags & APPLE_BOOT_KEEP_WLAN) != 0 &&
+                memcmp(REM_DEV_TYPES[i], "wlan\0$", size) == 0) {
                 continue;
             }
             if (memcmp(prop->data, REM_DEV_TYPES[i], size) == 0) {
@@ -339,7 +342,7 @@ static void apple_boot_process_dt_node(AppleDTNode *node, AppleDTNode *parent,
 
         // iter might get invalidated
         iter = iter->next;
-        apple_boot_process_dt_node(child, node, keep_wlan);
+        apple_boot_process_dt_node(child, node, keep_flags);
     }
 }
 
@@ -537,7 +540,7 @@ static void apple_boot_init_mem_ranges(AppleDTNode *root)
 }
 
 void apple_boot_populate_dt(AppleDTNode *root, AppleBootInfo *info,
-                            bool auto_boot, bool keep_wlan)
+                            bool auto_boot, uint32_t keep_flags)
 {
     AppleDTNode *child;
     AppleDTProp *prop;
@@ -621,7 +624,7 @@ void apple_boot_populate_dt(AppleDTNode *root, AppleBootInfo *info,
 
     apple_boot_init_mem_ranges(root);
 
-    apple_boot_process_dt_node(root, NULL, keep_wlan);
+    apple_boot_process_dt_node(root, NULL, keep_flags);
 
     // Prevent further additions.
     info->device_tree_size = ROUND_UP_16K(apple_dt_finalise(root));

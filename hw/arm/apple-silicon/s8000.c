@@ -492,7 +492,7 @@ static void s8000_memory_setup(MachineState *machine)
 
     apple_boot_allocate_segment_records(memory_map, header);
 
-    apple_boot_populate_dt(s8000->device_tree, info, auto_boot, false);
+    apple_boot_populate_dt(s8000->device_tree, info, auto_boot, 0);
 
     switch (header->file_type) {
     case MH_EXECUTE:

@@ -73,6 +73,7 @@ typedef struct {
     bool force_dfu;
     bool sep_dma_mirror;
     bool enable_wlan;
+    bool wlan_amfm;
     uint32_t board_id;
     uint32_t chip_revision;
     USBTCPRemoteConnType usb_conn_type;
