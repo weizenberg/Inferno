@@ -1106,12 +1106,20 @@ static void apple_pcie_port_config_write(void *opaque, hwaddr addr,
     case 0x800: // for setPortEnable/initializeRootComplex/expressCapOffset?
                 // bit0 seems to be "enable port"
         if ((port->port_cfg_port_config & 1) == 0 && (data & 1) != 0) {
-            // The t8030 guest enables the link here instead of via the 0x80
-            // LTSSM-enable register: mirror that path's power-up and link-up
-            // interrupt, or the driver waits for the link event forever.
-            if (port->manual_enable) {
-                port_devices_set_power(port, true);
-            }
+            /*
+             * Do NOT power the endpoint up here. This register is written by
+             * iOS' own apcie init, long before AppleBCMWLANBusInterfacePCIe
+             * registers its gIOPublishNotification (deferredStart@1499).
+             * Revealing the endpoint now publishes its IOPCIDevice nub before
+             * that listener exists, so notifyPCIeAttached() never fires and the
+             * attach never starts -- measured: endpoint enumerated at trace line
+             * 13273, listener registered only around 23217.
+             *
+             * On real hardware `manual-enable` keeps the port down until the
+             * client driver enables it, which is the 0x80 LTSSM path below, so
+             * power-up belongs there and publication then happens after the
+             * listener is in place.
+             */
             port->port_last_interrupt |= 0x1000;
             apple_pcie_set_own_irq(port, 1);
         }
@@ -1762,6 +1770,39 @@ SysBusDevice *apple_pcie_from_node(AppleDTNode *node, uint32_t chip_id)
         port_mappings = 4;
     } else {
         assert_not_reached();
+    }
+
+    /*
+     * Place the PCI memory space into the system memory map, as described by the
+     * node's `ranges`. Each entry is <child(3) parent(2) size(2)>: the child
+     * (PCI bus) address and the parent (CPU) address are each stored as a
+     * low/high pair of 32-bit cells. On t8030 this yields
+     *   bus 0x6_2000_0000 -> cpu 0x6_2000_0000, size 0x1_a000_0000  (64-bit)
+     *   bus 0x0_4000_0000 -> cpu 0x6_4000_0000, size 0x0_4000_0000  (32-bit)
+     * and the guest assigns endpoint BARs out of the 32-bit window, so without
+     * this mapping every BAR access from the guest goes nowhere.
+     */
+    {
+        AppleDTProp *rprop = apple_dt_get_prop(node, "ranges");
+        uint32_t entries = rprop ? rprop->len / (7 * sizeof(uint32_t)) : 0;
+        uint32_t *cells = rprop ? (uint32_t *)rprop->data : NULL;
+
+        assert_cmpuint(entries, <=, APCIE_MAX_RANGES);
+        for (uint32_t k = 0; k < entries; k++) {
+            const uint32_t *e = cells + k * 7;
+            uint64_t child = ldl_le_p(e + 1) | ((uint64_t)ldl_le_p(e + 2) << 32);
+            uint64_t parent = ldl_le_p(e + 3) | ((uint64_t)ldl_le_p(e + 4) << 32);
+            uint64_t size = ldl_le_p(e + 5) | ((uint64_t)ldl_le_p(e + 6) << 32);
+            g_autofree char *nm = g_strdup_printf("apcie-window%u", k);
+
+            if (size == 0) {
+                continue;
+            }
+            memory_region_init_alias(&host->mmio_windows[k], OBJECT(host), nm,
+                                     &host->mmio, child, size);
+            memory_region_add_subregion(get_system_memory(), parent,
+                                        &host->mmio_windows[k]);
+        }
     }
 
     sysbus_realize_and_unref(SYS_BUS_DEVICE(host_dev), &error_fatal);
