@@ -2017,12 +2017,17 @@ static void apple_pcie_port_realize(DeviceState *dev, Error **errp)
     bool is_bridge = IS_PCI_BRIDGE(pci);
     DPRINTF("%s: is_bridge == %u\n", __func__, is_bridge);
 
-#if 0
+#if 1
     // sizes: 0x50 for the bridges and qualcomm baseband,
     // 0x3c for broadcom wifi, 0x48 for nvme
     // versions: 1 for broadcom wifi, 2 for the rest
-    ////pcie_aer_init(pci_dev, 1, 0x100, PCI_ERR_SIZEOF, &error_fatal);
-    // pcie_aer_init(pci_dev, PCI_ERR_VER, 0x100, 0x50, &error_fatal);
+    //
+    // Not optional: IOPCIFamily only designates an IOPP as fIsAERRoot when
+    // the bridge has an AER capability, and
+    // IOPCI2PCIBridge::createEventSource returns nullptr without one, which
+    // makes AppleBCMWLANBusInterfacePCIe's attach bail out via a
+    // logCrit-suppressed path with no config-space traffic at all.
+    pcie_aer_init(pci, PCI_ERR_VER, 0x100, 0x50, &error_fatal);
 #endif
 
 #if 0
