@@ -255,15 +255,6 @@ static void apple_wlan_realize(DeviceState *dev, Error **errp)
 
     qdev_realize(DEVICE(s->device), BUS(s->pci_bus), &error_fatal);
 
-    /*
-     * The port is created before this device, so its initial power-off pass
-     * for manual-enable ports already ran, and pci_qdev_realize forces the
-     * device on: start powered off, as the combo chip is until the guest
-     * driver brings the port up.
-     */
-    if (s->device->port->manual_enable) {
-        pci_set_power(PCI_DEVICE(s->device), false);
-    }
 }
 
 static const VMStateDescription vmstate_apple_wlan = {
