@@ -26,6 +26,7 @@ typedef hv_vcpuid_t hvf_vcpuid;
 
 /* hvf_slot flags */
 #define HVF_SLOT_LOG (1 << 0)
+#define HVF_SLOT_SPRR_EXEC (1 << 1)
 
 typedef struct hvf_slot {
     uint64_t start;
@@ -33,6 +34,9 @@ typedef struct hvf_slot {
     uint8_t *mem;
     int slot_id;
     uint32_t flags;
+    hv_memory_flags_t memory_flags;
+    uint8_t *exec_bitmap;
+    size_t exec_page_count;
     MemoryRegion *region;
 } hvf_slot;
 
@@ -53,6 +57,7 @@ struct HVFState {
 
     hvf_vcpu_caps *hvf_caps;
     uint64_t vtimer_offset;
+    bool sprr_compat;
     QTAILQ_HEAD(, hvf_sw_breakpoint) hvf_sw_breakpoints;
 };
 extern HVFState *hvf_state;
@@ -74,6 +79,7 @@ const char *hvf_return_string(hv_return_t ret);
 int hvf_arch_init(void);
 hv_return_t hvf_arch_vm_create(MachineState *ms, uint32_t pa_range);
 hvf_slot *hvf_find_overlap_slot(uint64_t, uint64_t);
+bool hvf_sprr_exec_fault(hwaddr physical_address, bool patch_sprr);
 void hvf_kick_vcpu_thread(CPUState *cpu);
 
 /* Must be called by the owning thread */

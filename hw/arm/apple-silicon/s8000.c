@@ -49,6 +49,7 @@
 #include "qemu/log.h"
 #include "qemu/units.h"
 #include "system/address-spaces.h"
+#include "system/hvf.h"
 #include "system/memory.h"
 #include "system/reset.h"
 #include "system/runstate.h"
@@ -1444,6 +1445,10 @@ static void s8000_init(MachineState *machine)
     uint32_t build_version;
     vaddr kc_base;
     vaddr kc_end;
+
+    if (hvf_enabled()) {
+        hvf_enable_sprr_compat();
+    }
 
     s8000->sys_mem = get_system_memory();
     allocate_ram(s8000->sys_mem, "SROM", SROM_BASE, SROM_SIZE, 0);

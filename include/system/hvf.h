@@ -26,8 +26,12 @@
 #ifdef CONFIG_HVF_IS_POSSIBLE
 extern bool hvf_allowed;
 #define hvf_enabled() (hvf_allowed)
+void hvf_enable_sprr_compat(void);
 #else /* !CONFIG_HVF_IS_POSSIBLE */
 #define hvf_enabled() 0
+static inline void hvf_enable_sprr_compat(void)
+{
+}
 #endif /* !CONFIG_HVF_IS_POSSIBLE */
 
 #define TYPE_HVF_ACCEL ACCEL_CLASS_NAME("hvf")

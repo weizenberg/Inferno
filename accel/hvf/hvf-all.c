@@ -17,6 +17,7 @@
 #include "system/hvf_int.h"
 #include "hw/core/cpu.h"
 #include "hw/boards.h"
+#include "qemu/cacheflush.h"
 #include "trace.h"
 
 bool hvf_allowed;
@@ -29,6 +30,17 @@ struct mac_slot {
 };
 
 struct mac_slot mac_slots[32];
+
+void hvf_enable_sprr_compat(void)
+{
+    /*
+     * Hypervisor.framework does not expose Apple private SPRR accesses as
+     * system-register exits. Run executable pages through a one-time
+     * compatibility pass so target/arm can replace the EL0 permission write
+     * that HVF cannot execute. This only changes transient guest RAM.
+     */
+    hvf_state->sprr_compat = true;
+}
 
 const char *hvf_return_string(hv_return_t ret)
 {
@@ -75,7 +87,22 @@ static int do_hvf_set_memory(hvf_slot *slot, hv_memory_flags_t flags)
     }
 
     if (!slot->size) {
+        g_clear_pointer(&slot->exec_bitmap, g_free);
+        slot->exec_page_count = 0;
+        slot->flags &= ~HVF_SLOT_SPRR_EXEC;
         return 0;
+    }
+
+    slot->memory_flags = flags;
+    if (hvf_state->sprr_compat && (flags & HV_MEMORY_EXEC)) {
+        size_t page_size = qemu_real_host_page_size();
+
+        slot->exec_page_count = slot->size / page_size;
+        slot->exec_bitmap = g_new0(uint8_t, slot->exec_page_count);
+        slot->flags |= HVF_SLOT_SPRR_EXEC;
+        flags &= ~HV_MEMORY_EXEC;
+    } else {
+        slot->flags &= ~HVF_SLOT_SPRR_EXEC;
     }
 
     macslot->present = 1;
@@ -88,6 +115,89 @@ static int do_hvf_set_memory(hvf_slot *slot, hv_memory_flags_t flags)
     ret = hv_vm_map(slot->mem, slot->start, slot->size, flags);
     assert_hvf_ok(ret);
     return 0;
+}
+
+bool hvf_sprr_exec_fault(hwaddr physical_address, bool patch_sprr)
+{
+    const uint32_t sprr_el0br0_write = 0xd51ef1a0;
+    const uint32_t sysreg_write_mask = 0xffffffe0;
+    const uint32_t nop = 0xd503201f;
+    size_t page_size = qemu_real_host_page_size();
+    hwaddr page = QEMU_ALIGN_DOWN(physical_address, page_size);
+    hvf_slot *slot = hvf_find_overlap_slot(page, page_size);
+    size_t page_index;
+    uint8_t *host_page;
+    unsigned int patched = 0;
+    hv_return_t ret;
+
+    if (!slot || !(slot->flags & HVF_SLOT_SPRR_EXEC) ||
+        page < slot->start || page + page_size > slot->start + slot->size) {
+        return false;
+    }
+
+    page_index = (page - slot->start) / page_size;
+    if (page_index >= slot->exec_page_count ||
+        slot->exec_bitmap[page_index]) {
+        return false;
+    }
+
+    host_page = slot->mem + page - slot->start;
+    if (patch_sprr) {
+        for (size_t offset = 0; offset < page_size; offset += sizeof(uint32_t)) {
+            uint32_t *insn = (uint32_t *)(host_page + offset);
+
+            if ((ldl_le_p(insn) & sysreg_write_mask) ==
+                sprr_el0br0_write) {
+                stl_le_p(insn, nop);
+                patched++;
+            }
+        }
+        if (patched) {
+            flush_idcache_range((uintptr_t)host_page,
+                                (uintptr_t)host_page, page_size);
+            info_report("HVF: replaced %u unsupported SPRR write%s in "
+                        "executable guest page 0x%" HWADDR_PRIx,
+                        patched, patched == 1 ? "" : "s", page);
+        }
+    }
+
+    ret = hv_vm_protect(page, page_size, slot->memory_flags);
+    assert_hvf_ok(ret);
+    slot->exec_bitmap[page_index] = 1;
+    return true;
+}
+
+static void hvf_protect_slot(hvf_slot *slot, hv_memory_flags_t flags)
+{
+    size_t page_size = qemu_real_host_page_size();
+    size_t first = 0;
+
+    slot->memory_flags = flags;
+    if (!(slot->flags & HVF_SLOT_SPRR_EXEC)) {
+        hv_return_t ret = hv_vm_protect(slot->start, slot->size, flags);
+
+        assert_hvf_ok(ret);
+        return;
+    }
+
+    while (first < slot->exec_page_count) {
+        bool executable = slot->exec_bitmap[first];
+        size_t last = first + 1;
+        hv_memory_flags_t range_flags = flags;
+        hv_return_t ret;
+
+        while (last < slot->exec_page_count &&
+               !!slot->exec_bitmap[last] == executable) {
+            last++;
+        }
+        if (!executable) {
+            range_flags &= ~HV_MEMORY_EXEC;
+        }
+        ret = hv_vm_protect(slot->start + first * page_size,
+                            (last - first) * page_size, range_flags);
+        assert_hvf_ok(ret);
+        first = last;
+    }
 }
 
 static void hvf_set_phys_mem(MemoryRegionSection *section, bool add)
@@ -186,13 +296,12 @@ static void hvf_set_dirty_tracking(MemoryRegionSection *section, bool on)
     /* protect region against writes; begin tracking it */
     if (on) {
         slot->flags |= HVF_SLOT_LOG;
-        hv_vm_protect((uintptr_t)slot->start, (size_t)slot->size,
-                      HV_MEMORY_READ | HV_MEMORY_EXEC);
+        hvf_protect_slot(slot, HV_MEMORY_READ | HV_MEMORY_EXEC);
     /* stop tracking region*/
     } else {
         slot->flags &= ~HVF_SLOT_LOG;
-        hv_vm_protect((uintptr_t)slot->start, (size_t)slot->size,
-                      HV_MEMORY_READ | HV_MEMORY_WRITE | HV_MEMORY_EXEC);
+        hvf_protect_slot(slot, HV_MEMORY_READ | HV_MEMORY_WRITE |
+                        HV_MEMORY_EXEC);
     }
 }
 

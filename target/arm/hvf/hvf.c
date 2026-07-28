@@ -2316,6 +2316,7 @@ static int hvf_handle_exception(CPUState *cpu, hv_vcpu_exit_exception_t *excp)
         }
         break;
     case EC_INSNABORT: {
+        uint64_t cpsr;
         uint32_t set = (syndrome >> 12) & 3;
         bool fnv = (syndrome >> 10) & 1;
         bool ea = (syndrome >> 9) & 1;
@@ -2323,6 +2324,25 @@ static int hvf_handle_exception(CPUState *cpu, hv_vcpu_exit_exception_t *excp)
         uint32_t ifsc = (syndrome >> 0) & 0x3f;
 
         trace_hvf_insn_abort(env->pc, set, fnv, ea, s1ptw, ifsc);
+
+        /*
+         * Apple guests execute SPRR_EL0BR0_EL1 from libsystem_pthread to
+         * switch JIT mappings between writable and executable. HVF neither
+         * implements the register nor exits for it, so the guest otherwise
+         * receives UNDEFINED and terminates JavaScriptCore.
+         *
+         * Apple machines initially map executable RAM without stage-2 execute
+         * permission. On the first fetch from each page, scan EL0 pages for
+         * the exact unsupported write and replace it with a NOP before making
+         * that transient RAM page executable. HVF does not enforce SPRR
+         * permissions, so a NOP accurately preserves its effective behavior.
+         */
+        r = hv_vcpu_get_reg(cpu->accel->fd, HV_REG_CPSR, &cpsr);
+        assert_hvf_ok(r);
+        if (hvf_sprr_exec_fault(excp->physical_address,
+                                (cpsr & 0xc) == 0)) {
+            break;
+        }
 
         /*
          * A stage-1 instruction abort belongs to the guest: inject it into

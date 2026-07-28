@@ -69,6 +69,7 @@
 #include "qemu/guest-random.h"
 #include "qemu/log.h"
 #include "qemu/units.h"
+#include "system/hvf.h"
 #include "system/reset.h"
 #include "system/runstate.h"
 #include "system/system.h"
@@ -2759,6 +2760,10 @@ static void t8030_init(MachineState *machine)
     AppleDTNode *child;
     AppleDTProp *prop;
     hwaddr *ranges;
+
+    if (hvf_enabled()) {
+        hvf_enable_sprr_compat();
+    }
 
     t8030 = APPLE_T8030(machine);
 
