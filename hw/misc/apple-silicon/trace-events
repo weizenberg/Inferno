@@ -9,3 +9,5 @@ apple_wlan_bar0_read(uint64_t offset, unsigned size, uint64_t val) "offset 0x%05
 apple_wlan_bar0_write(uint64_t offset, unsigned size, uint64_t val) "offset 0x%05" PRIx64 " size %u val 0x%" PRIx64
 apple_wlan_bar2_read(uint64_t offset, unsigned size, uint64_t val) "offset 0x%05" PRIx64 " size %u val 0x%" PRIx64
 apple_wlan_bar2_write(uint64_t offset, unsigned size, uint64_t val) "offset 0x%05" PRIx64 " size %u val 0x%" PRIx64
+apple_wlan_gp11_read(uint32_t val) "val 0x%08x"
+apple_wlan_gp11_write(uint32_t val) "val 0x%08x"

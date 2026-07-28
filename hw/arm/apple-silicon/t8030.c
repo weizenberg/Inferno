@@ -3110,9 +3110,6 @@ static void t8030_init(MachineState *machine)
     t8030_create_dart(t8030, "dart-rsm", false);
     t8030_create_dart(t8030, "dart-scaler", false);
     t8030_create_pcie(t8030);
-    if (t8030->enable_wlan) {
-        t8030_create_wlan(t8030);
-    }
     t8030_create_ans(t8030);
     t8030_create_usb(t8030);
     t8030_create_wdt(t8030);
@@ -3122,6 +3119,10 @@ static void t8030_init(MachineState *machine)
     t8030_create_spmi(t8030, "spmi2");
     t8030_create_pmu(t8030, "spmi0", "spmi-pmu");
     t8030_create_smc(t8030);
+    if (t8030->enable_wlan) {
+        // after SMC: apple_wlan_create registers the gP11 key handler
+        t8030_create_wlan(t8030);
+    }
 #ifdef ENABLE_BASEBAND
     t8030_create_baseband_spmi(t8030, "spmi1", "baseband-spmi");
     t8030_create_baseband(t8030);

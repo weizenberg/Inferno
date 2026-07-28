@@ -20,6 +20,7 @@
 #include "qemu/osdep.h"
 #include "hw/arm/apple-silicon/dt.h"
 #include "hw/irq.h"
+#include "hw/misc/apple-silicon/smc.h"
 #include "hw/misc/apple-silicon/wlan.h"
 #include "hw/pci/msi.h"
 #include "hw/pci/pci_device.h"
@@ -67,7 +68,34 @@ struct AppleWLANState {
 
     PCIBus *pci_bus;
     AppleWLANDeviceState *device;
+    uint32_t gp11;
 };
+
+// The /amfm node's function-reg_on points at SMC key gP11: the combo-chip
+// power gate the AppleBCMWLANBusInterfacePCIe driver toggles through the
+// AMFM platform function before it touches the PCIe function.
+static SMCResult apple_wlan_smc_gp11_read(SMCKey *key, SMCKeyData *data,
+                                          const void *in, uint8_t in_length)
+{
+    AppleWLANState *s = key->opaque;
+
+    trace_apple_wlan_gp11_read(s->gp11);
+    stl_le_p(data->data, s->gp11);
+    return SMC_RESULT_SUCCESS;
+}
+
+static SMCResult apple_wlan_smc_gp11_write(SMCKey *key, SMCKeyData *data,
+                                           const void *in, uint8_t in_length)
+{
+    AppleWLANState *s = key->opaque;
+
+    if (in == NULL || in_length != key->info.size) {
+        return SMC_RESULT_BAD_ARGUMENT_ERROR;
+    }
+    s->gp11 = ldl_le_p(in);
+    trace_apple_wlan_gp11_write(s->gp11);
+    return SMC_RESULT_SUCCESS;
+}
 
 static uint64_t apple_wlan_bar0_ops_read(void *opaque, hwaddr offset,
                                          unsigned size)
@@ -233,6 +261,12 @@ SysBusDevice *apple_wlan_create(AppleDTNode *node, PCIBus *pci_bus,
     s->device->dma_as = &port->dma_as;
 
     object_property_add_child(OBJECT(s), "device", OBJECT(s->device));
+
+    AppleSMCState *smc = APPLE_SMC_IOP(object_property_get_link(
+        OBJECT(qdev_get_machine()), "smc", &error_fatal));
+    apple_smc_add_key_func(smc, 'gP11', 4, SMC_KEY_TYPE_UINT32,
+                           SMC_ATTR_LE | SMC_ATTR_UNK_0x20, s,
+                           apple_wlan_smc_gp11_read, apple_wlan_smc_gp11_write);
 
     return SYS_BUS_DEVICE(dev);
 }
