@@ -1539,9 +1539,9 @@ static void s8000_init(MachineState *machine)
      * the wrong model (that is an iPhone 11; this machine is an iPhone 6s Plus).
      */
     apple_dt_set_prop_strn(s8000->device_tree, "serial-number", 32,
-                           "INFERNO08000");
+                           "0FVJZXLKRDEZ");
     apple_dt_set_prop_strn(s8000->device_tree, "mlb-serial-number", 32,
-                           "INFERNOMLB0080000");
+                           "1H7C4AYQ349KQ66RG");
     apple_dt_set_prop_strn(s8000->device_tree, "regulatory-model-number", 32,
                            "INFERN8000");
 
@@ -1693,7 +1693,9 @@ static void s8000_class_init(ObjectClass *klass, const void *data)
     object_class_property_set_description(klass, "kaslr-off", "Disable KASLR");
     oprop = object_class_property_add(klass, "ecid", "uint64", s8000_get_ecid,
                                       s8000_set_ecid, NULL, NULL);
-    object_property_set_default_uint(oprop, 0x1122334455667788);
+    // Structurally-valid synthetic ECID (see the t8030 note): high bits zero,
+    // not the full-width 0x1122334455667788 placeholder.
+    object_property_set_default_uint(oprop, 0x0000005D4D8E8D78);
     object_class_property_set_description(klass, "ecid", "Device ECID");
     object_class_property_add_bool(klass, "force-dfu", s8000_get_force_dfu,
                                    s8000_set_force_dfu);

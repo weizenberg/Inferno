@@ -3252,7 +3252,12 @@ static void t8030_class_init(ObjectClass *klass, const void *data)
     object_class_property_set_description(klass, "boot-mode", "Boot Mode");
     oprop = object_class_property_add(klass, "ecid", "uint64", t8030_get_ecid,
                                       t8030_set_ecid, NULL, NULL);
-    object_property_set_default_uint(oprop, 0x1122334455667788);
+    // Synthetic but structurally-valid ECID: a real ECID is a 64-bit value that
+    // fits in ~40 bits with the high bits zero (i.e. left-padded to 16 hex
+    // digits), not a full-width value. The old 0x1122334455667788 placeholder
+    // used all 64 bits with an obvious repeating pattern, which is not a valid
+    // ECID shape and breaks the on-device activation-identity/UDID generation.
+    object_property_set_default_uint(oprop, 0x0000005D4D8E8D78);
     object_class_property_set_description(klass, "ecid", "Device ECID");
     object_class_property_add_bool(klass, "kaslr-off", t8030_get_kaslr_off,
                                    t8030_set_kaslr_off);
@@ -3301,12 +3306,12 @@ static void t8030_class_init(ObjectClass *klass, const void *data)
     oprop = object_class_property_add_str(klass, "serial-number",
                                           t8030_get_serial_number,
                                           t8030_set_serial_number);
-    object_property_set_default_str(oprop, "INFERNO01122");
+    object_property_set_default_str(oprop, "DW14ZN7Y1F81");
     object_class_property_set_description(klass, "serial-number",
                                           "Serial Number");
     oprop = object_class_property_add_str(
         klass, "mlb", t8030_get_mlb_serial_number, t8030_set_mlb_serial_number);
-    object_property_set_default_str(oprop, "INFERNOMLB0011220");
+    object_property_set_default_str(oprop, "BDBVW72XA2HWK579J");
     object_class_property_set_description(klass, "mlb", "MLB Serial Number");
     oprop = object_class_property_add_str(klass, "regulatory-model",
                                           t8030_get_regulatory_model,
