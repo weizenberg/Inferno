@@ -328,3 +328,5 @@ loongarch_msi_set_irq(int irq_num) "set msi irq %d"
 loongarch_extioi_setirq(int irq, int level) "set extirq irq %d level %d"
 loongarch_extioi_readw(uint64_t addr, uint64_t val) "addr: 0x%"PRIx64 "val: 0x%" PRIx64
 loongarch_extioi_writew(uint64_t addr, uint64_t val) "addr: 0x%"PRIx64 "val: 0x%" PRIx64
+apple_aic_mmio_rd(uint64_t addr, unsigned size) "addr 0x%04"PRIx64" size %u"
+apple_aic_mmio_wr(uint64_t addr, unsigned size, uint64_t data) "addr 0x%04"PRIx64" size %u data 0x%"PRIx64

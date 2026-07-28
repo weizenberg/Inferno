@@ -61,6 +61,14 @@ struct AppleWLANDeviceState {
 
     MemoryRegion bar0;
     MemoryRegion bar2;
+
+    /*
+     * Until the backplane is modelled, the windows are flat RAM so that
+     * write-then-verify sequences (backplane window register, OTP block,
+     * mailbox indices) behave sanely instead of reading back zero.
+     */
+    uint8_t bar0_backing[APPLE_WLAN_DEVICE_BAR0_SIZE];
+    uint8_t bar2_backing[APPLE_WLAN_DEVICE_BAR2_SIZE];
 };
 
 struct AppleWLANState {
@@ -100,26 +108,48 @@ static SMCResult apple_wlan_smc_gp11_write(SMCKey *key, SMCKeyData *data,
 static uint64_t apple_wlan_bar0_ops_read(void *opaque, hwaddr offset,
                                          unsigned size)
 {
-    trace_apple_wlan_bar0_read(offset, size, 0);
-    return 0;
+    AppleWLANDeviceState *s = opaque;
+    uint64_t value = 0;
+
+    if (offset + size <= sizeof(s->bar0_backing)) {
+        memcpy(&value, s->bar0_backing + offset, size);
+    }
+    trace_apple_wlan_bar0_read(offset, size, value);
+    return value;
 }
 
 static void apple_wlan_bar0_ops_write(void *opaque, hwaddr offset,
                                       uint64_t value, unsigned size)
 {
+    AppleWLANDeviceState *s = opaque;
+
+    if (offset + size <= sizeof(s->bar0_backing)) {
+        memcpy(s->bar0_backing + offset, &value, size);
+    }
     trace_apple_wlan_bar0_write(offset, size, value);
 }
 
 static uint64_t apple_wlan_bar2_ops_read(void *opaque, hwaddr offset,
                                          unsigned size)
 {
-    trace_apple_wlan_bar2_read(offset, size, 0);
-    return 0;
+    AppleWLANDeviceState *s = opaque;
+    uint64_t value = 0;
+
+    if (offset + size <= sizeof(s->bar2_backing)) {
+        memcpy(&value, s->bar2_backing + offset, size);
+    }
+    trace_apple_wlan_bar2_read(offset, size, value);
+    return value;
 }
 
 static void apple_wlan_bar2_ops_write(void *opaque, hwaddr offset,
                                       uint64_t value, unsigned size)
 {
+    AppleWLANDeviceState *s = opaque;
+
+    if (offset + size <= sizeof(s->bar2_backing)) {
+        memcpy(s->bar2_backing + offset, &value, size);
+    }
     trace_apple_wlan_bar2_write(offset, size, value);
 }
 
@@ -166,6 +196,10 @@ static void apple_wlan_device_pci_realize(PCIDevice *dev, Error **errp)
         pcie_cap_fill_link_ep_usp(dev, QEMU_PCI_EXP_LNK_X1,
                                   QEMU_PCI_EXP_LNK_5GT);
     }
+
+    // The link is always up in this model; report Data Link Layer Active.
+    pci_word_test_and_set_mask(dev->config + dev->exp.exp_cap + PCI_EXP_LNKSTA,
+                               PCI_EXP_LNKSTA_DLLLA);
 
     // Broadcom WiFi uses a 0x3c-sized version-1 AER capability.
     pcie_aer_init(dev, 1, 0x100, 0x3c, &error_fatal);
@@ -220,6 +254,16 @@ static void apple_wlan_realize(DeviceState *dev, Error **errp)
     AppleWLANState *s = APPLE_WLAN(dev);
 
     qdev_realize(DEVICE(s->device), BUS(s->pci_bus), &error_fatal);
+
+    /*
+     * The port is created before this device, so its initial power-off pass
+     * for manual-enable ports already ran, and pci_qdev_realize forces the
+     * device on: start powered off, as the combo chip is until the guest
+     * driver brings the port up.
+     */
+    if (s->device->port->manual_enable) {
+        pci_set_power(PCI_DEVICE(s->device), false);
+    }
 }
 
 static const VMStateDescription vmstate_apple_wlan = {

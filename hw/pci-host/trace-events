@@ -33,3 +33,4 @@ apple_pcie_port_phy_ip_rd(uint32_t bus, uint64_t addr, unsigned size) "port %u a
 apple_pcie_port_phy_ip_wr(uint32_t bus, uint64_t addr, unsigned size, uint64_t data) "port %u addr 0x%03"PRIx64" size %u data 0x%"PRIx64
 apple_pcie_root_conf_rd(uint8_t bus, uint8_t dev, uint8_t fn, uint64_t addr, unsigned size, uint64_t ret) "%02u:%02u.%u addr 0x%03"PRIx64" size %u -> 0x%"PRIx64
 apple_pcie_root_conf_wr(uint8_t bus, uint8_t dev, uint8_t fn, uint64_t addr, unsigned size, uint64_t data) "%02u:%02u.%u addr 0x%03"PRIx64" size %u <- 0x%"PRIx64
+apple_pcie_port_perst(uint32_t bus, uint32_t val) "port %u perst %u"

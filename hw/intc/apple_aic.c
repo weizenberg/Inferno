@@ -237,6 +237,7 @@ static void apple_aic_write(void *opaque, hwaddr addr, uint64_t data,
     AppleAICState *s = o->aic;
     uint32_t val = (uint32_t)data;
 
+    trace_apple_aic_mmio_wr(addr, size, data);
     QEMU_LOCK_GUARD(&s->mutex);
 
     switch (addr) {
@@ -381,6 +382,9 @@ static uint64_t apple_aic_read(void *opaque, hwaddr addr, unsigned size)
     AppleAICCPU *o = opaque;
     AppleAICState *s = o->aic;
 
+    if (addr != REG_AIC_IACK) {
+        trace_apple_aic_mmio_rd(addr, size);
+    }
     QEMU_LOCK_GUARD(&s->mutex);
 
     switch (addr) {

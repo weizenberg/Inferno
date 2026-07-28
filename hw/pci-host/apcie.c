@@ -98,6 +98,7 @@ static void apcie_port_gpio_perst(void *opaque, int n, int level)
     ApplePCIEPort *port = opaque;
     bool val = !!level;
     assert(n == 0);
+    trace_apple_pcie_port_perst(port->bus_nr, val);
     DPRINTF("%s: old: %d ; new %d\n", __func__, port->gpio_perst_val, val);
     if (port->gpio_perst_val != val) {
         // val != EP PERST
@@ -368,6 +369,30 @@ static uint64_t apple_pcie_root_conf_access(void *opaque, hwaddr addr,
     devfn = PCI_DEVFN(device, function);
     PCIHostState *pci = PCI_HOST_BRIDGE(host);
     PCIDevice *pcidev = pci_find_device(pci->bus, busnum, devfn);
+
+    /*
+     * An endpoint whose port holds it in reset or unpowered is invisible on
+     * the bus, as on real hardware: otherwise the guest enumerates it at
+     * boot instead of after the driver-driven port power-up, which reorders
+     * the whole attach flow.
+     */
+    if (pcidev && !pcidev->enabled) {
+        pcidev = NULL;
+    }
+    if (pcidev) {
+        PCIBus *pcidev_bus = pci_get_bus(pcidev);
+
+        if (pcidev_bus->parent_dev != NULL &&
+            object_dynamic_cast(OBJECT(pcidev_bus->parent_dev),
+                                TYPE_APPLE_PCIE_PORT) != NULL) {
+            ApplePCIEPort *parent_port =
+                APPLE_PCIE_PORT(pcidev_bus->parent_dev);
+
+            if (!parent_port->gpio_perst_val) {
+                pcidev = NULL;
+            }
+        }
+    }
 
     if (pcidev) {
         addr &= pci_config_size(pcidev) - 1;
