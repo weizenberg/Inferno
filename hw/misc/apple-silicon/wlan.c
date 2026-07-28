@@ -189,6 +189,13 @@ struct AppleWLANDeviceState {
 // C-4378__s-B1 and the NVRAM file there is P-moana_M-GODF_V-m__m-4.3.txt, i.e.
 // platform "moana", module "GODF", vendor "m". These are model identity, not any
 // real device's calibration or MAC.
+/*
+ * P-moana_M-GODF_V-m__m-4.3.txt decodes as platform "moana", module "GODF",
+ * vendor "m". Three strings is the maximum this tuple can carry: the PCIe
+ * parseVersion1Tuple() loop is bounded by `cmp w21, #3`, and it fills exactly
+ * this->+0xC8/+0xD0/+0xD8. Measured: a fourth string changes nothing, because
+ * this->+0xE0 -- the remaining gate -- is filled from somewhere else.
+ */
 static const char apple_wlan_otp_identity[] = "moana\0GODF\0m";
 
 static void apple_wlan_build_otp(AppleWLANDeviceState *s, const uint8_t *table)
