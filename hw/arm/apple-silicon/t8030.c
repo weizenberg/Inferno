@@ -57,6 +57,7 @@
 #include "hw/misc/apple-silicon/spmi-baseband.h"
 #include "hw/misc/apple-silicon/spmi-pmu.h"
 #include "hw/misc/apple-silicon/tempsensor.h"
+#include "hw/misc/apple-silicon/wlan.h"
 #include "hw/misc/unimp.h"
 #include "hw/nvram/apple_nvram.h"
 #include "hw/pci-host/apcie.h"
@@ -657,7 +658,8 @@ static void t8030_memory_setup(AppleT8030MachineState *t8030)
 
     apple_boot_allocate_segment_records(memory_map, hdr);
 
-    apple_boot_populate_dt(t8030->device_tree, info, auto_boot);
+    apple_boot_populate_dt(t8030->device_tree, info, auto_boot,
+                           t8030->enable_wlan);
 
     switch (hdr->file_type) {
     case MH_EXECUTE:
@@ -2027,6 +2029,28 @@ static void t8030_create_pcie(AppleT8030MachineState *t8030)
     sysbus_realize_and_unref(pcie, &error_fatal);
 }
 
+static void t8030_create_wlan(AppleT8030MachineState *t8030)
+{
+    SysBusDevice *wlan;
+    AppleDTNode *child = apple_dt_get_node(t8030->device_tree, "arm-io");
+
+    assert_nonnull(child);
+    child = apple_dt_get_node(child, "apcie");
+    assert_nonnull(child);
+    child = apple_dt_get_node(child, "pci-bridge2");
+    assert_nonnull(child);
+    child = apple_dt_get_node(child, "wlan");
+    assert_nonnull(child);
+
+    ApplePCIEPort *port = APPLE_PCIE_PORT(
+        object_property_get_link(OBJECT(t8030), "pcie.bridge2", &error_fatal));
+    PCIBus *sec_bus = pci_bridge_get_sec_bus(PCI_BRIDGE(PCI_DEVICE(port)));
+    wlan = apple_wlan_create(child, sec_bus, port);
+    assert_nonnull(wlan);
+    object_property_add_child(OBJECT(t8030), "wlan", OBJECT(wlan));
+    sysbus_realize_and_unref(wlan, &error_fatal);
+}
+
 static void t8030_create_lm_backlight(AppleT8030MachineState *t8030)
 {
     AppleDTNode *child;
@@ -2793,15 +2817,15 @@ static bool t8030_preflight_firmware(AppleT8030MachineState *t8030,
     sep_required = !securerom;
 #endif
 
-#define REQUIRE(path, label)                                                 \
-    do {                                                                     \
-        if ((path) == NULL) {                                                \
-            g_string_append_printf(errs, "\n  - %s: not specified", label);  \
-        } else if (!g_file_test((path), G_FILE_TEST_IS_REGULAR)) {           \
-            g_string_append_printf(                                          \
-                errs, "\n  - %s: `%s` not found or not a regular file",      \
-                label, (path));                                              \
-        }                                                                    \
+#define REQUIRE(path, label)                                                   \
+    do {                                                                       \
+        if ((path) == NULL) {                                                  \
+            g_string_append_printf(errs, "\n  - %s: not specified", label);    \
+        } else if (!g_file_test((path), G_FILE_TEST_IS_REGULAR)) {             \
+            g_string_append_printf(                                            \
+                errs, "\n  - %s: `%s` not found or not a regular file", label, \
+                (path));                                                       \
+        }                                                                      \
     } while (0)
 
     if (securerom) {
@@ -2810,10 +2834,12 @@ static bool t8030_preflight_firmware(AppleT8030MachineState *t8030,
         REQUIRE(machine->kernel_filename, "-kernel (kernelcache)");
         REQUIRE(machine->dtb, "-dtb (device tree)");
         REQUIRE(t8030->trustcache_filename, "trustcache=");
-        /* The ticket is consumed only if present; recommend rather than require. */
+        /* The ticket is consumed only if present; recommend rather than
+         * require. */
         if (t8030->ticket_filename == NULL) {
             g_string_append(warns, " ticket=");
-        } else if (!g_file_test(t8030->ticket_filename, G_FILE_TEST_IS_REGULAR)) {
+        } else if (!g_file_test(t8030->ticket_filename,
+                                G_FILE_TEST_IS_REGULAR)) {
             g_string_append_printf(
                 errs, "\n  - ticket=: `%s` not found or not a regular file",
                 t8030->ticket_filename);
@@ -3084,6 +3110,9 @@ static void t8030_init(MachineState *machine)
     t8030_create_dart(t8030, "dart-rsm", false);
     t8030_create_dart(t8030, "dart-scaler", false);
     t8030_create_pcie(t8030);
+    if (t8030->enable_wlan) {
+        t8030_create_wlan(t8030);
+    }
     t8030_create_ans(t8030);
     t8030_create_usb(t8030);
     t8030_create_wdt(t8030);
@@ -3193,6 +3222,7 @@ PROP_VISIT_GETTER_SETTER(uint64, ecid);
 PROP_GETTER_SETTER(bool, kaslr_off);
 PROP_GETTER_SETTER(bool, force_dfu);
 PROP_GETTER_SETTER(bool, sep_dma_mirror);
+PROP_GETTER_SETTER(bool, enable_wlan);
 PROP_GETTER_SETTER(int, usb_conn_type);
 PROP_STR_GETTER_SETTER(trustcache_filename);
 PROP_STR_GETTER_SETTER(ticket_filename);
@@ -3268,6 +3298,13 @@ static void t8030_class_init(ObjectClass *klass, const void *data)
         klass, "sep-dma-mirror",
         "Publish the SEP's resolved DART mapping as RAM under HVF "
         "(faster; no effect under TCG)");
+    oprop = object_class_property_add_bool(
+        klass, "enable-wlan", t8030_get_enable_wlan, t8030_set_enable_wlan);
+    object_property_set_default_bool(oprop, false);
+    object_class_property_set_description(
+        klass, "enable-wlan",
+        "Expose the Broadcom WiFi PCIe endpoint and keep its DeviceTree "
+        "nodes (experimental)");
     object_class_property_add_enum(
         klass, "usb-conn-type", "USBTCPRemoteConnType",
         &USBTCPRemoteConnType_lookup, t8030_get_usb_conn_type,

@@ -492,7 +492,7 @@ static void s8000_memory_setup(MachineState *machine)
 
     apple_boot_allocate_segment_records(memory_map, header);
 
-    apple_boot_populate_dt(s8000->device_tree, info, auto_boot);
+    apple_boot_populate_dt(s8000->device_tree, info, auto_boot, false);
 
     switch (header->file_type) {
     case MH_EXECUTE:
@@ -932,7 +932,7 @@ static void s8000_create_nvme(AppleS8000MachineState *s8000)
         MEMORY_REGION(apple_dart_iommu_mr(dart, *(uint32_t *)prop->data));
     assert_nonnull(s->dma_mr);
     assert_nonnull(object_property_add_const_link(OBJECT(nvme), "dma_mr",
-                                                    OBJECT(s->dma_mr)));
+                                                  OBJECT(s->dma_mr)));
     address_space_init(&s->dma_as, s->dma_mr, "apcie0.dma");
 
     sysbus_realize_and_unref(nvme, &error_fatal);
@@ -1259,8 +1259,8 @@ static void s8000_create_sep(AppleS8000MachineState *s8000)
                            qdev_get_gpio_in(DEVICE(s8000->aic), ints[i]));
     }
 
-    assert_nonnull(object_property_add_const_link(
-        OBJECT(s8000->sep), "dma-mr", OBJECT(s8000->sys_mem)));
+    assert_nonnull(object_property_add_const_link(OBJECT(s8000->sep), "dma-mr",
+                                                  OBJECT(s8000->sys_mem)));
 
     sysbus_realize_and_unref(SYS_BUS_DEVICE(s8000->sep), &error_fatal);
 }
@@ -1535,8 +1535,9 @@ static void s8000_init(MachineState *machine)
      * these -- a serial containing e.g. an underscore is not a harmless
      * placeholder, it made every Apple media-services request fail with 401
      * until t8030's equivalent default was corrected. They are deliberately not
-     * a real device's identifiers, and "A2111" previously here was both real and
-     * the wrong model (that is an iPhone 11; this machine is an iPhone 6s Plus).
+     * a real device's identifiers, and "A2111" previously here was both real
+     * and the wrong model (that is an iPhone 11; this machine is an iPhone 6s
+     * Plus).
      */
     apple_dt_set_prop_strn(s8000->device_tree, "serial-number", 32,
                            "INFERNO08000");
