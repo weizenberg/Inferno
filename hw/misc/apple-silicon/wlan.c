@@ -685,6 +685,8 @@ static const struct {
 #define APPLE_WLAN_WLC_E_STATUS_SUCCESS (0)
 // handleSetSSID names this one: "the Association Scan (FW) did not find SSID".
 #define APPLE_WLAN_WLC_E_STATUS_NO_NETWORKS (3)
+// "scan results are incomplete": this event carries entries, more may follow.
+#define APPLE_WLAN_WLC_E_STATUS_PARTIAL (8)
 // wl_event_msg_t flags. Bit 0 on a LINK event is the link coming up.
 #define APPLE_WLAN_WLC_EVENT_MSG_LINK (0x01)
 
@@ -2051,12 +2053,24 @@ static void apple_wlan_handle_ioctl(AppleWLANDeviceState *s,
     apple_wlan_d2h_post(s, cmplt);
 
     /*
-     * A scan request is answered with an event, not with the ioctl completion:
+     * A scan request is answered with events, not with the ioctl completion:
      * the driver takes that as an acknowledgement and then waits 20 seconds for
-     * results before logging "Scan Timeout". There is no radio, so the honest
-     * answer is that the scan finished and found nothing -- an ESCAN_RESULT
-     * with success status and no payload, which is how real firmware terminates
-     * a scan once it has sent whatever it found.
+     * results before logging "Scan Timeout".
+     *
+     * Results and completion are *different events*, distinguished only by
+     * status. The driver's own status table -- the switch table behind
+     * stringFromStatusInEvent, 17 entries -- spells it out: 0 is success,
+     * 8 is "scan results are incomplete", and 3 is "failed due to no matching
+     * network found" (which is what handleSetSSID reports as not finding the
+     * SSID, and 6 is "AUTH or ASSOC packet was unsolicited", the value
+     * handleAuth ignores -- so the table lines up with the two values already
+     * known good).
+     *
+     * So an entry has to arrive with status 8 and the scan then be terminated
+     * with status 0. Sending the entry *with* status 0 gets the sync_id matched
+     * and the scan closed without the payload ever being looked at: no
+     * timeout, no rejection logged, and no network in the UI. The Wi-Fi pane
+     * showed only "Other..." while 35 escans had each reported "Inferno".
      */
     if (cmd == APPLE_WLAN_WLC_SET_VAR && strcmp(name, "escan") == 0) {
         uint8_t res[APPLE_WLAN_EVENT_DATA_MAX] = { 0 };
@@ -2098,8 +2112,17 @@ static void apple_wlan_handle_ioctl(AppleWLANDeviceState *s,
         stl_le_p(bss + APPLE_WLAN_BSS_IE_LENGTH_OFF, 0);
         trace_apple_wlan_escan_result(sync_id, APPLE_WLAN_SSID);
         apple_wlan_post_event(s, APPLE_WLAN_WLC_E_ESCAN_RESULT,
-                              APPLE_WLAN_WLC_E_STATUS_SUCCESS, 0,
+                              APPLE_WLAN_WLC_E_STATUS_PARTIAL, 0,
                               apple_wlan_event_mac, item[1], res, sizeof(res));
+
+        // Then close the scan. Same header, no entries; the sync_id still has
+        // to be there because that is what eventScanComplete matches on.
+        stl_le_p(res + APPLE_WLAN_ESCAN_RES_BUFLEN_OFF,
+                 APPLE_WLAN_ESCAN_RES_LEN);
+        stw_le_p(res + APPLE_WLAN_ESCAN_RES_BSS_COUNT_OFF, 0);
+        apple_wlan_post_event(
+            s, APPLE_WLAN_WLC_E_ESCAN_RESULT, APPLE_WLAN_WLC_E_STATUS_SUCCESS,
+            0, apple_wlan_event_mac, item[1], res, APPLE_WLAN_ESCAN_RES_LEN);
     }
 
     if (cmd == APPLE_WLAN_WLC_SET_SSID) {
