@@ -318,6 +318,44 @@ static const struct {
  * same free-space region.
  */
 #define APPLE_WLAN_FW_RING_MEM_BACKOFF (0x200)
+/*
+ * ring_info's ring counts. The layout is pinned by what the driver itself writes
+ * rather than by trusting the public struct: it fills four 64-bit host index
+ * addresses at ring_info+0x14, +0x1c, +0x24 and +0x2c (v236[5..12] in
+ * createFirmwarePCIeIPC), which runs to exactly 0x34 -- and brcmfmac's
+ * ring_info_t has max_tx_flowrings at 0x34 and max_submission_queues at 0x36
+ * immediately after those same four fields. Traced, the driver reads both as
+ * 16-bit quantities and they are the LAST device accesses it ever makes:
+ *
+ *     fw shared+0x134 size 2 -> 0x0
+ *     fw shared+0x136 size 2 -> 0x0
+ *     (no further MMIO for the remaining ~250 s of a 300 s run)
+ *
+ * Both must be non-zero, and there is an ordering constraint between them that is
+ * the opposite of what the arithmetic reads like. The driver asserts, and the
+ * panic prints the *violated* condition:
+ *
+ *   panic(cpu 1 caller 0xfffffff0095cbfa4):
+ *     "AppleBCMWLANBusInterfacePCIe::createFirmwarePCIeIPC(): "
+ *     "maxNbrOfDynamicSubmissionRings %u <= maxNbrOfTxFlowRings %u"
+ *
+ * Measured across three boots, which also pins which field is which:
+ *
+ *   published +0x34 / +0x36     panic text
+ *   0 / 0                       "0 <= 0"
+ *   8 / 2                       "2 <= 8"      <- values consumed exactly
+ *
+ * so +0x34 is maxNbrOfTxFlowRings and +0x36 is maxNbrOfDynamicSubmissionRings,
+ * and since "2 <= 8" is arithmetically true yet still panics, the requirement is
+ * the strict inequality the other way round: the dynamic submission ring count
+ * must be GREATER than the TX flowring count. Sensible in hindsight -- every TX
+ * flowring is drawn from the dynamic submission ring pool, so the pool has to be
+ * larger than the flowrings carved out of it.
+ */
+#define APPLE_WLAN_FW_RING_INFO_MAX_FLOWRINGS_OFF (0x34)
+#define APPLE_WLAN_FW_RING_INFO_MAX_SUBMIT_OFF (0x36)
+#define APPLE_WLAN_FW_RING_MAX_FLOWRINGS (8)
+#define APPLE_WLAN_FW_RING_MAX_DYN_SUBMIT (16)
 #define APPLE_WLAN_FW_SHARED_NO_OOB_DW (0x20000000)
 #define APPLE_WLAN_FW_SHARED_INBAND_DS (0x40000000)
 /*
@@ -763,6 +801,14 @@ static uint64_t apple_wlan_bar2_ops_read(void *opaque, hwaddr offset,
             stl_le_p(s->bar2_backing + shared +
                          APPLE_WLAN_FW_RING_INFO_BACKOFF,
                      shared + APPLE_WLAN_FW_RING_MEM_BACKOFF);
+            stw_le_p(s->bar2_backing + shared +
+                         APPLE_WLAN_FW_RING_INFO_BACKOFF +
+                         APPLE_WLAN_FW_RING_INFO_MAX_FLOWRINGS_OFF,
+                     APPLE_WLAN_FW_RING_MAX_FLOWRINGS);
+            stw_le_p(s->bar2_backing + shared +
+                         APPLE_WLAN_FW_RING_INFO_BACKOFF +
+                         APPLE_WLAN_FW_RING_INFO_MAX_SUBMIT_OFF,
+                     APPLE_WLAN_FW_RING_MAX_DYN_SUBMIT);
             trace_apple_wlan_fw_alive_marker((uint32_t)offset, shared,
                                              s->tcm_written_bytes);
         }
