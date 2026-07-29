@@ -686,13 +686,64 @@ static const struct {
 #define APPLE_WLAN_ESCAN_RES_BSS_COUNT_OFF (10)
 #define APPLE_WLAN_ESCAN_RES_LEN (12)
 #define APPLE_WLAN_ESCAN_VERSION (1)
+#define APPLE_WLAN_MAC_LEN (6)
+
+/*
+ * One synthetic access point, reported in the escan result so the driver has
+ * something to associate with. Offsets come from dumpScanResult and
+ * processScanResults, which between them name every field this needs:
+ *
+ *   +4    length     u32, total entry length, and the buffer must hold it
+ *   +8    BSSID      6
+ *   +14   beacon_period u16      +16  capability u16
+ *   +18   SSID_len   u8          +19  SSID, up to 32
+ *   +72   chanspec   u16
+ *   +78   RSSI       s16
+ *   +96   flags      u8
+ *   +116  ie_offset  u16, must be at least the struct size
+ *   +120  ie_length  u32
+ *
+ * processScanResults refuses anything at or below 0x7B bytes ("Not enough space
+ * in the data buffer for bss_ino"), so the struct is 124 bytes.
+ *
+ * The BSSID is locally administered (bit 1 of the first octet) and the SSID says
+ * what this is. Both are invented for the emulator -- there is no radio and
+ * nothing here was read off any real network.
+ */
+#define APPLE_WLAN_BSS_LEN (124)
+#define APPLE_WLAN_BSS_VERSION_OFF (0)
+#define APPLE_WLAN_BSS_LENGTH_OFF (4)
+#define APPLE_WLAN_BSS_BSSID_OFF (8)
+#define APPLE_WLAN_BSS_BEACON_OFF (14)
+#define APPLE_WLAN_BSS_CAPABILITY_OFF (16)
+#define APPLE_WLAN_BSS_SSID_LEN_OFF (18)
+#define APPLE_WLAN_BSS_SSID_OFF (19)
+#define APPLE_WLAN_BSS_CHANSPEC_OFF (72)
+#define APPLE_WLAN_BSS_RSSI_OFF (78)
+#define APPLE_WLAN_BSS_FLAGS_OFF (96)
+#define APPLE_WLAN_BSS_IE_OFFSET_OFF (116)
+#define APPLE_WLAN_BSS_IE_LENGTH_OFF (120)
+
+// brcmfmac's BRCMF_BSS_INFO_VERSION.
+#define APPLE_WLAN_BSS_VERSION (109)
+#define APPLE_WLAN_BSS_BEACON_PERIOD (100)
+// ESS, and no privacy bit: an open network, so no supplicant handshake is owed.
+#define APPLE_WLAN_BSS_CAPABILITY (0x0001)
+#define APPLE_WLAN_BSS_RSSI (-50)
+#define APPLE_WLAN_SSID "Inferno"
+static const uint8_t apple_wlan_bssid[APPLE_WLAN_MAC_LEN] = {
+    0x02, 0x00, 0x5E, 0x10, 0x00, 0x01
+};
+
+// Room for the escan result header plus one entry.
+#define APPLE_WLAN_EVENT_DATA_MAX \
+    (APPLE_WLAN_ESCAN_RES_LEN + APPLE_WLAN_BSS_LEN)
 
 /*
  * The MAC the event headers carry. It matches the local-mac-address t8030.c
  * publishes on arm-io/wlan -- locally administered (bit 1 of the first octet),
  * synthetic, and not read off any real device.
  */
-#define APPLE_WLAN_MAC_LEN (6)
 static const uint8_t apple_wlan_event_mac[APPLE_WLAN_MAC_LEN] = {
     0x02, 0x1B, 0x63, 0x84, 0x45, 0xE6
 };
@@ -1709,7 +1760,7 @@ static bool apple_wlan_post_event(AppleWLANDeviceState *s, uint32_t event_type,
                                   uint32_t status, uint8_t ifidx,
                                   const uint8_t *data, uint16_t datalen)
 {
-    uint8_t pkt[APPLE_WLAN_EV_TOTAL + APPLE_WLAN_ESCAN_RES_LEN] = { 0 };
+    uint8_t pkt[APPLE_WLAN_EV_TOTAL + APPLE_WLAN_EVENT_DATA_MAX] = { 0 };
     size_t pktlen = APPLE_WLAN_EV_TOTAL + datalen;
     uint8_t *eth = pkt + APPLE_WLAN_EV_ETHER_OFF;
     uint8_t *bcmeth = pkt + APPLE_WLAN_EV_BCMETH_OFF;
@@ -1726,7 +1777,7 @@ static bool apple_wlan_post_event(AppleWLANDeviceState *s, uint32_t event_type,
     addr = s->event_buf[s->event_buf_head].addr;
     len = s->event_buf[s->event_buf_head].len;
     request_id = s->event_buf[s->event_buf_head].request_id;
-    if (datalen > APPLE_WLAN_ESCAN_RES_LEN || len < pktlen) {
+    if (datalen > APPLE_WLAN_EVENT_DATA_MAX || len < pktlen) {
         trace_apple_wlan_event_no_buf(event_type);
         return false;
     }
@@ -1864,7 +1915,8 @@ static void apple_wlan_handle_ioctl(AppleWLANDeviceState *s,
      * scan once it has sent whatever it found.
      */
     if (cmd == APPLE_WLAN_WLC_SET_VAR && strcmp(name, "escan") == 0) {
-        uint8_t res[APPLE_WLAN_ESCAN_RES_LEN] = { 0 };
+        uint8_t res[APPLE_WLAN_EVENT_DATA_MAX] = { 0 };
+        uint8_t *bss = res + APPLE_WLAN_ESCAN_RES_LEN;
         uint64_t params = in_addr + strlen(name) + 1;
         uint16_t sync_id = 0;
 
@@ -1881,8 +1933,27 @@ static void apple_wlan_handle_ioctl(AppleWLANDeviceState *s,
         stl_le_p(res + APPLE_WLAN_ESCAN_RES_VERSION_OFF,
                  APPLE_WLAN_ESCAN_VERSION);
         stw_le_p(res + APPLE_WLAN_ESCAN_RES_SYNC_ID_OFF, sync_id);
-        stw_le_p(res + APPLE_WLAN_ESCAN_RES_BSS_COUNT_OFF, 0);
-        trace_apple_wlan_escan_complete(sync_id);
+        stw_le_p(res + APPLE_WLAN_ESCAN_RES_BSS_COUNT_OFF, 1);
+
+        stl_le_p(bss + APPLE_WLAN_BSS_VERSION_OFF, APPLE_WLAN_BSS_VERSION);
+        stl_le_p(bss + APPLE_WLAN_BSS_LENGTH_OFF, APPLE_WLAN_BSS_LEN);
+        memcpy(bss + APPLE_WLAN_BSS_BSSID_OFF, apple_wlan_bssid,
+               APPLE_WLAN_MAC_LEN);
+        stw_le_p(bss + APPLE_WLAN_BSS_BEACON_OFF,
+                 APPLE_WLAN_BSS_BEACON_PERIOD);
+        stw_le_p(bss + APPLE_WLAN_BSS_CAPABILITY_OFF,
+                 APPLE_WLAN_BSS_CAPABILITY);
+        bss[APPLE_WLAN_BSS_SSID_LEN_OFF] = strlen(APPLE_WLAN_SSID);
+        memcpy(bss + APPLE_WLAN_BSS_SSID_OFF, APPLE_WLAN_SSID,
+               strlen(APPLE_WLAN_SSID));
+        stw_le_p(bss + APPLE_WLAN_BSS_CHANSPEC_OFF,
+                 APPLE_WLAN_CHANSPEC_BW_20 + APPLE_WLAN_CHANNEL_FIRST);
+        stw_le_p(bss + APPLE_WLAN_BSS_RSSI_OFF, (uint16_t)APPLE_WLAN_BSS_RSSI);
+        bss[APPLE_WLAN_BSS_FLAGS_OFF] = 0;
+        // No information elements, so they begin past the end of the struct.
+        stw_le_p(bss + APPLE_WLAN_BSS_IE_OFFSET_OFF, APPLE_WLAN_BSS_LEN);
+        stl_le_p(bss + APPLE_WLAN_BSS_IE_LENGTH_OFF, 0);
+        trace_apple_wlan_escan_result(sync_id, APPLE_WLAN_SSID);
         apple_wlan_post_event(s, APPLE_WLAN_WLC_E_ESCAN_RESULT,
                               APPLE_WLAN_WLC_E_STATUS_SUCCESS, item[1], res,
                               sizeof(res));

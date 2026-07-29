@@ -47,4 +47,4 @@ apple_wlan_dyn_ring_rejected(bool h2d, uint16_t ring_id, uint64_t base, uint16_t
 apple_wlan_event_buf_post(uint64_t addr, uint16_t len, unsigned count) "event buf 0x%" PRIx64 " len %u (%u held)"
 apple_wlan_event_no_buf(uint32_t event_type) "cannot deliver event %u: no posted buffer big enough"
 apple_wlan_post_event(uint32_t event_type, uint32_t status, uint64_t addr, uint16_t len) "event %u status %u -> buf 0x%" PRIx64 " len %u"
-apple_wlan_escan_complete(uint16_t sync_id) "escan complete, sync id %u, no results"
+apple_wlan_escan_result(uint16_t sync_id, const char *ssid) "escan complete, sync id %u, reporting \"%s\""
