@@ -78,6 +78,15 @@ OBJECT_DECLARE_SIMPLE_TYPE(AppleWLANState, APPLE_WLAN)
  */
 #define APPLE_WLAN_BAR0_WINDOW_SIZE (4 * KiB)
 #define APPLE_WLAN_BAR0_PAGES (APPLE_WLAN_DEVICE_BAR0_SIZE / APPLE_WLAN_BAR0_WINDOW_SIZE)
+/*
+ * Broadcom's own config-space registers, 0x70..0xa7: the four window bases
+ * (0x70, 0x74, 0x78, 0x80) plus 0x88, 0xa0 and 0xa4. The PCI Express capability
+ * is pushed clear of them; a version-2 capability is 0x3c bytes, so 0xc0 keeps it
+ * below the 0x100 start of extended config space where AER lives.
+ */
+#define APPLE_WLAN_BCM_CFG_BASE (0x70)
+#define APPLE_WLAN_BCM_CFG_SIZE (0x38)
+#define APPLE_WLAN_EXP_CAP_OFFSET (0xC0)
 // The reset value the driver expects to find in the core-2 window register.
 #define APPLE_WLAN_BAR0_CORE2_WINDOW_RESET (0x18002000)
 
@@ -603,9 +612,32 @@ static void apple_wlan_device_pci_realize(PCIDevice *dev, Error **errp)
                           APPLE_WLAN_DEVICE_BAR2_SIZE);
 
     assert_true(pci_is_express(dev));
-    pcie_endpoint_cap_init(dev, 0x70);
+    /*
+     * The PCI Express capability must NOT be placed at 0x70. Broadcom's own
+     * config registers live at 0x70, 0x74, 0x78, 0x80, 0x88, 0xa0 and 0xa4 --
+     * the first four are the BAR0 backplane window bases -- and a version-2
+     * express capability at 0x70 spans 0x70..0xab, swallowing all of them.
+     *
+     * That matters because the driver reads its window bases back:
+     * AppleBCMWLANChipBackplane::validateWindow() does
+     *
+     *     readReg32(configSpace, window->cfg_offset, &v) == 0 && v == expected
+     *
+     * and validateCores()/validateWrappers() call it for every mapped core, so a
+     * window register that does not read back what was written fails the whole
+     * bring-up -- which is how loadChipImage() came to return kIOReturnIOError.
+     * pci_default_write_config() honours wmask, and capability-owned bytes are
+     * read-only or write-1-to-clear, so the bases were being dropped.
+     */
+    pcie_endpoint_cap_init(dev, APPLE_WLAN_EXP_CAP_OFFSET);
     msi_init(dev, 0x50, 1, true, false, &error_fatal);
     pci_pm_init(dev, 0x40, &error_fatal);
+
+    // Make Broadcom's config registers plain read/write storage.
+    for (uint32_t off = APPLE_WLAN_BCM_CFG_BASE;
+         off < APPLE_WLAN_BCM_CFG_BASE + APPLE_WLAN_BCM_CFG_SIZE; off += 4) {
+        pci_set_long(dev->wmask + off, 0xFFFFFFFFU);
+    }
 
     if (s->port->maximum_link_speed == 2) {
         pcie_cap_fill_link_ep_usp(dev, QEMU_PCI_EXP_LNK_X1,
@@ -645,10 +677,11 @@ static void apple_wlan_device_qdev_reset_hold(Object *obj, ResetType type)
 
 /*
  * Track every BAR0 window base register so BAR0 accesses can be resolved to
- * backplane addresses. Three of the four (0x70, 0x74, 0x78) overlap the PCI
- * Express capability, so pci_default_write_config() treats them as read-only and
- * drops the value; capture them here regardless, since the guest's window writes
- * are what give the BAR0 offsets meaning.
+ * backplane addresses. The value itself is stored by pci_default_write_config()
+ * now that the Broadcom range is writable and the express capability has been
+ * moved clear of it, which is what lets the driver read its own window bases back
+ * (see validateWindow() in the realize path); this hook only mirrors them into
+ * the resolver's array.
  */
 static void apple_wlan_device_config_write(PCIDevice *dev, uint32_t addr,
                                            uint32_t val, int len)
