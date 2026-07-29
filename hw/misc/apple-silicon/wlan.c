@@ -438,11 +438,63 @@ static const struct {
 #define APPLE_WLAN_MSGBUF_REQUEST_ID_OFF (0x04)
 #define APPLE_WLAN_MSGBUF_STATUS_OFF (0x08)
 #define APPLE_WLAN_MSGBUF_RING_ID_OFF (0x0A)
+/*
+ * The phase bit in the common header flags. The driver walks a completion ring
+ * checking this rather than trusting an index alone, so it has to flip every
+ * time the ring wraps: it expects 1 on the first pass through a fresh ring,
+ * then 0, and complains "Unexpected phaseBit ... got=N expect=M" otherwise.
+ * It happened to be right for a while only because the requests being answered
+ * carry flags 0x81, which already has this bit set.
+ */
+#define APPLE_WLAN_MSGBUF_PHASE_BIT (0x80)
 
 #define APPLE_WLAN_BCME_OK (0)
 #define APPLE_WLAN_BCME_UNSUPPORTED (-23)
 
 #define APPLE_WLAN_WLC_GET_VAR (262)
+#define APPLE_WLAN_WLC_SET_VAR (263)
+/*
+ * A plain WLC command rather than an iovar, so it arrives with no name at all.
+ * This is what updateFWAPIVerFromHW reads; refusing it fails setupFirmware with
+ * "Unable to get FW API version". 2 is the current ioctl interface version --
+ * brcmfmac accepts only 1 or 2.
+ */
+#define APPLE_WLAN_WLC_GET_VERSION (1)
+#define APPLE_WLAN_IOCTL_VERSION (2)
+/*
+ * The regulatory table version, read straight after the blob is loaded. Same
+ * shape a real CLM reports, with a synthetic build stamp. Refusing this fails
+ * the whole download from setupFirmware's point of view, even though the
+ * transfer itself succeeded.
+ */
+#define APPLE_WLAN_CLM_VERSION_STRING                          \
+    "API: 12.2 Data: 9.10.39 Compiler: 1.29.4 ClmImport: 1.36.3 " \
+    "Creation: 2020-01-01 00:00:00"
+
+// Likewise for the TX capability table; the driver only logs this one.
+#define APPLE_WLAN_TXCAP_VERSION_STRING \
+    "TxCap: 1.0 Creation: 2020-01-01 00:00:00"
+
+/*
+ * Blob downloads. Each is a set carrying the file in chunks, followed by a get
+ * of a matching status. There is nothing here to load them into, so the
+ * transfer is accepted and the status reported clean -- a zeroed status is
+ * BCME_OK. Refusing either half fails setupFirmware outright ("Download clmb
+ * failed", "Download txcap failed"), even though the transfer succeeded. The
+ * status lengths are the out_len the driver asks for, as observed.
+ */
+static const struct {
+    const char *load;
+    const char *status;
+    uint16_t status_len;
+    const char *version_iovar;
+    const char *version;
+} apple_wlan_blob_loads[] = {
+    { "clmload", "clmload_status", 20, "clmver",
+      APPLE_WLAN_CLM_VERSION_STRING },
+    { "txcapload", "txcapload_status", 24, "txcapver",
+      APPLE_WLAN_TXCAP_VERSION_STRING },
+};
 
 /*
  * How many posted ioctl response buffers to remember. The driver posts one at a
@@ -471,12 +523,23 @@ static const struct {
 #define APPLE_WLAN_IOVAR_PAYLOAD_MAX (512)
 
 /*
+ * wlc_ver is deliberately left refused. Answering it with brcmfmac's
+ * brcmf_wlc_version_le layout made things worse, not better: the driver reads
+ * its interface version out of that structure and reported 0, where refusing
+ * the iovar leaves it at its own default of 3. The real layout is not known, and
+ * a confidently wrong structure is harder to notice than a refusal.
+ */
+// How many event-log sets the firmware claims. Read as a plain integer.
+#define APPLE_WLAN_EVENT_LOG_MAX_SETS (8)
+
+/*
  * The version banner an ioctl "ver" get answers with. This is the shape real
  * firmware emits, with a deliberately synthetic build stamp and FWID -- it
  * identifies the stand-in, not any real device.
  */
 #define APPLE_WLAN_FW_VERSION_STRING \
     "wl0: Jan  1 2020 00:00:00 version 18.20.309.0.0.0.0 FWID 01-00000000"
+
 #define APPLE_WLAN_FW_SHARED_NO_OOB_DW (0x20000000)
 #define APPLE_WLAN_FW_SHARED_INBAND_DS (0x40000000)
 /*
@@ -539,10 +602,19 @@ struct AppleWLANDeviceState {
      * what stops a stale read index from walking the whole ring as garbage.
      */
     uint64_t ring_base_seen[APPLE_WLAN_RING_COUNT];
+    // Current phase for each ring, flipped on wrap. See the phase bit above.
+    bool ring_phase[APPLE_WLAN_RING_COUNT];
     // Host buffers posted for ioctl responses, consumed oldest first.
     struct {
         uint64_t addr;
         uint16_t len;
+        /*
+         * The id the buffer was posted under. A completion has to name the
+         * buffer it wrote into, not the request it answers -- the driver looks
+         * the response up by it and otherwise reports "Rx IO not found for
+         * resourceID N, bad IPC message ID".
+         */
+        uint32_t request_id;
     } ioctl_resp_buf[APPLE_WLAN_IOCTL_RESP_BUFS];
     unsigned ioctl_resp_head;
     unsigned ioctl_resp_count;
@@ -1039,6 +1111,36 @@ static void apple_wlan_lower_int_if_quiesced(AppleWLANDeviceState *s)
     apple_wlan_int_deassert(s);
 }
 
+/*
+ * A rebuilt ring starts over: fresh host memory, zeroed, indices back to 0 and
+ * phase back to its first-pass value. The driver tears every ring down and
+ * rebuilds it on retry, so this has to be checked for each ring that is used,
+ * not just the one a doorbell arrives on -- a write index carried over from the
+ * previous attempt points into a zeroed ring, which the driver reports as
+ * "Unexpected phaseBit ... At {0 31}".
+ */
+static void apple_wlan_ring_check_rebuilt(AppleWLANDeviceState *s, unsigned id,
+                                          const AppleWLANRing *ring)
+{
+    if (s->ring_base_seen[id] == ring->base) {
+        return;
+    }
+    trace_apple_wlan_ring_rebuilt(id, s->ring_base_seen[id], ring->base);
+    s->ring_base_seen[id] = ring->base;
+    s->ring_r_idx[id] = 0;
+    s->ring_w_idx[id] = 0;
+    s->ring_phase[id] = true;
+    if (id == APPLE_WLAN_RING_H2D_CONTROL_SUBMIT) {
+        /*
+         * The submission ring being rebuilt is the attempt boundary. Buffers
+         * posted before it belong to the epoch that was just torn down, and
+         * handing one back afterwards is a resource the driver no longer knows.
+         */
+        s->ioctl_resp_head = 0;
+        s->ioctl_resp_count = 0;
+    }
+}
+
 // Post one control completion. The device owns this ring's write index.
 static bool apple_wlan_d2h_post(AppleWLANDeviceState *s, const uint8_t *item)
 {
@@ -1047,11 +1149,15 @@ static bool apple_wlan_d2h_post(AppleWLANDeviceState *s, const uint8_t *item)
     uint16_t w_idx;
     uint16_t next;
     uint16_t host_r_idx;
+    uint8_t stamped[APPLE_WLAN_MSGBUF_CMPLT_SIZE];
+
+    memcpy(stamped, item, sizeof(stamped));
 
     if (!apple_wlan_get_ring(s, id, &ring)) {
         trace_apple_wlan_d2h_no_ring(id);
         return false;
     }
+    apple_wlan_ring_check_rebuilt(s, id, &ring);
     w_idx = s->ring_w_idx[id];
     next = (w_idx + 1) % ring.max_item;
     /*
@@ -1064,20 +1170,29 @@ static bool apple_wlan_d2h_post(AppleWLANDeviceState *s, const uint8_t *item)
         trace_apple_wlan_d2h_full(id, w_idx, host_r_idx);
         return false;
     }
-    if (pci_dma_write(PCI_DEVICE(s), ring.base + w_idx * ring.item_size, item,
+    stamped[2] = s->ring_phase[id] ?
+                     (uint8_t)(stamped[2] | APPLE_WLAN_MSGBUF_PHASE_BIT) :
+                     (uint8_t)(stamped[2] & ~APPLE_WLAN_MSGBUF_PHASE_BIT);
+    if (pci_dma_write(PCI_DEVICE(s), ring.base + w_idx * ring.item_size,
+                      stamped,
                       MIN(ring.item_size, APPLE_WLAN_MSGBUF_CMPLT_SIZE)) !=
         MEMTX_OK) {
         trace_apple_wlan_ring_dma_fail(ring.base + w_idx * ring.item_size);
         return false;
     }
     s->ring_w_idx[id] = next;
+    if (next == 0) {
+        // Wrapped: the next pass through the ring carries the other phase.
+        s->ring_phase[id] = !s->ring_phase[id];
+    }
     if (!apple_wlan_write_ring_index(s, APPLE_WLAN_RING_INFO_D2H_W_IDX_OFF, id,
                                      next)) {
         return false;
     }
-    trace_apple_wlan_d2h_post(item[0], ldl_le_p(item +
-                                                APPLE_WLAN_MSGBUF_REQUEST_ID_OFF),
-                              w_idx, next);
+    trace_apple_wlan_d2h_post(stamped[0],
+                              ldl_le_p(stamped +
+                                       APPLE_WLAN_MSGBUF_REQUEST_ID_OFF),
+                              w_idx, next, stamped[2]);
     return true;
 }
 
@@ -1135,6 +1250,8 @@ static void apple_wlan_handle_resp_buf_post(AppleWLANDeviceState *s,
            APPLE_WLAN_IOCTL_RESP_BUFS;
     s->ioctl_resp_buf[slot].addr = addr;
     s->ioctl_resp_buf[slot].len = len;
+    s->ioctl_resp_buf[slot].request_id =
+        ldl_le_p(item + APPLE_WLAN_MSGBUF_REQUEST_ID_OFF);
     s->ioctl_resp_count++;
     trace_apple_wlan_resp_buf_post(addr, len, s->ioctl_resp_count);
 }
@@ -1150,7 +1267,41 @@ static uint16_t apple_wlan_ioctl_response(uint32_t cmd, const char *name,
 {
     *status = APPLE_WLAN_BCME_OK;
 
-    if (cmd == APPLE_WLAN_WLC_GET_VAR && strcmp(name, "ver") == 0) {
+    if (cmd == APPLE_WLAN_WLC_GET_VERSION) {
+        if (cap < sizeof(uint32_t)) {
+            *status = APPLE_WLAN_BCME_UNSUPPORTED;
+            return 0;
+        }
+        stl_le_p(buf, APPLE_WLAN_IOCTL_VERSION);
+        return sizeof(uint32_t);
+    }
+    if (cmd == APPLE_WLAN_WLC_SET_VAR) {
+        // A set carries its payload in the input buffer; nothing comes back.
+        for (size_t i = 0; i < ARRAY_SIZE(apple_wlan_blob_loads); i++) {
+            if (strcmp(name, apple_wlan_blob_loads[i].load) == 0) {
+                return 0;
+            }
+        }
+        // A timestamp push. There is no firmware clock to sync, so just take it.
+        if (strcmp(name, "rte_timesync") == 0) {
+            return 0;
+        }
+        *status = APPLE_WLAN_BCME_UNSUPPORTED;
+        return 0;
+    }
+    if (cmd != APPLE_WLAN_WLC_GET_VAR) {
+        *status = APPLE_WLAN_BCME_UNSUPPORTED;
+        return 0;
+    }
+    if (strcmp(name, "event_log_max_sets") == 0) {
+        if (cap < sizeof(uint32_t)) {
+            *status = APPLE_WLAN_BCME_UNSUPPORTED;
+            return 0;
+        }
+        stl_le_p(buf, APPLE_WLAN_EVENT_LOG_MAX_SETS);
+        return sizeof(uint32_t);
+    }
+    if (strcmp(name, "ver") == 0) {
         size_t len = strlen(APPLE_WLAN_FW_VERSION_STRING) + 1;
 
         if (len > cap) {
@@ -1159,6 +1310,26 @@ static uint16_t apple_wlan_ioctl_response(uint32_t cmd, const char *name,
         }
         memcpy(buf, APPLE_WLAN_FW_VERSION_STRING, len);
         return (uint16_t)len;
+    }
+    for (size_t i = 0; i < ARRAY_SIZE(apple_wlan_blob_loads); i++) {
+        if (strcmp(name, apple_wlan_blob_loads[i].status) == 0) {
+            if (cap < apple_wlan_blob_loads[i].status_len) {
+                *status = APPLE_WLAN_BCME_UNSUPPORTED;
+                return 0;
+            }
+            // Already zeroed by the caller; zero is a clean load.
+            return apple_wlan_blob_loads[i].status_len;
+        }
+        if (strcmp(name, apple_wlan_blob_loads[i].version_iovar) == 0) {
+            size_t len = strlen(apple_wlan_blob_loads[i].version) + 1;
+
+            if (len > cap) {
+                *status = APPLE_WLAN_BCME_UNSUPPORTED;
+                return 0;
+            }
+            memcpy(buf, apple_wlan_blob_loads[i].version, len);
+            return (uint16_t)len;
+        }
     }
     *status = APPLE_WLAN_BCME_UNSUPPORTED;
     return 0;
@@ -1178,6 +1349,8 @@ static void apple_wlan_handle_ioctl(AppleWLANDeviceState *s,
     int16_t status = APPLE_WLAN_BCME_OK;
     uint16_t resp_len;
     uint16_t cap;
+    bool have_buf_request_id = false;
+    uint32_t buf_request_id = 0;
 
     if (in_len != 0 && in_addr != 0) {
         pci_dma_read(PCI_DEVICE(s), in_addr, name,
@@ -1197,6 +1370,9 @@ static void apple_wlan_handle_ioctl(AppleWLANDeviceState *s,
         uint64_t addr = s->ioctl_resp_buf[s->ioctl_resp_head].addr;
         uint16_t len = MIN(resp_len, s->ioctl_resp_buf[s->ioctl_resp_head].len);
 
+        buf_request_id = s->ioctl_resp_buf[s->ioctl_resp_head].request_id;
+        have_buf_request_id = true;
+
         if (pci_dma_write(PCI_DEVICE(s), addr, payload, len) != MEMTX_OK) {
             trace_apple_wlan_ring_dma_fail(addr);
             status = APPLE_WLAN_BCME_UNSUPPORTED;
@@ -1215,6 +1391,9 @@ static void apple_wlan_handle_ioctl(AppleWLANDeviceState *s,
 
     apple_wlan_cmplt_init(cmplt, item, APPLE_WLAN_MSGBUF_IOCTL_CMPLT, status,
                           0);
+    if (have_buf_request_id) {
+        stl_le_p(cmplt + APPLE_WLAN_MSGBUF_REQUEST_ID_OFF, buf_request_id);
+    }
     stw_le_p(cmplt + 12, resp_len);
     stw_le_p(cmplt + 14, trans_id);
     stl_le_p(cmplt + 16, cmd);
@@ -1239,16 +1418,7 @@ static void apple_wlan_h2d_doorbell(AppleWLANDeviceState *s)
         trace_apple_wlan_doorbell_no_ring(s->fw_shared_offset);
         return;
     }
-    /*
-     * A rebuilt ring starts its indices over. Without this the stale read index
-     * walks the ring's untouched tail and reports a long run of zero items.
-     */
-    if (s->ring_base_seen[id] != ring.base) {
-        trace_apple_wlan_ring_rebuilt(id, s->ring_base_seen[id], ring.base);
-        s->ring_base_seen[id] = ring.base;
-        s->ring_r_idx[id] = 0;
-        s->ring_w_idx[id] = 0;
-    }
+    apple_wlan_ring_check_rebuilt(s, id, &ring);
     if (!apple_wlan_read_ring_index(s, APPLE_WLAN_RING_INFO_H2D_W_IDX_OFF, id,
                                     &w_idx)) {
         trace_apple_wlan_doorbell_no_index(ring.base);

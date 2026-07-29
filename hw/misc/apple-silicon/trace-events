@@ -30,7 +30,7 @@ apple_wlan_ring_item(unsigned id, uint16_t idx, uint8_t msgtype, uint8_t ifidx, 
 apple_wlan_raise_int(uint32_t status, uint32_t mask, bool msi) "raise int: MAILBOXINT 0x%08x mask 0x%08x msi %d"
 apple_wlan_d2h_no_ring(unsigned id) "cannot post completion: ring %u not set up"
 apple_wlan_d2h_full(unsigned id, uint16_t w_idx, uint16_t r_idx) "completion ring %u full: w=%u r=%u"
-apple_wlan_d2h_post(uint8_t msgtype, uint32_t request_id, uint16_t w_idx, uint16_t next) "posted completion 0x%02x req 0x%08x at %u -> w=%u"
+apple_wlan_d2h_post(uint8_t msgtype, uint32_t request_id, uint16_t w_idx, uint16_t next, uint8_t flags) "posted completion 0x%02x req 0x%08x at %u -> w=%u flags 0x%02x"
 apple_wlan_ring_create(uint8_t msgtype, uint16_t ring_id, uint16_t ring_type, uint64_t ptr, uint16_t max_items, uint16_t item_size) "ring create 0x%02x id %u type %u ptr 0x%" PRIx64 " %u x %u"
 apple_wlan_resp_buf_post(uint64_t addr, uint16_t len, unsigned count) "ioctl resp buf 0x%" PRIx64 " len %u (%u held)"
 apple_wlan_ioctl(uint32_t cmd, uint16_t trans_id, uint16_t in_len, uint16_t out_len, const char *name) "ioctl cmd %u trans %u in %u out %u name \"%s\""
