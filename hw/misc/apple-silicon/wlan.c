@@ -760,11 +760,46 @@ static const struct {
 #define APPLE_WLAN_BSS_CAPABILITY_OFF (16)
 #define APPLE_WLAN_BSS_SSID_LEN_OFF (18)
 #define APPLE_WLAN_BSS_SSID_OFF (19)
+/*
+ * The rateset and the information elements are not decoration. AppleBCMWLAN-
+ * BSSBeacon::toScanResult builds the apple80211_scan_result userspace sees, and
+ * takes both straight from the beacon: it walks the rateset to fill asr_nrates
+ * (asr_rates[i] = (rate >> 1) & 0x3F), and sets asr_ie_len from the stored IE
+ * length -- leaving asr_ie_data NULL when that length is zero. A beacon with no
+ * rates and no IEs reaches wifid as a network with neither, which no real AP
+ * ever looks like.
+ *
+ * rateset sits between the SSID and chanspec: SSID[32] ends at 50, one pad
+ * byte, then count as a u32 at 52 (4-byte aligned) and rates[16] at 56..71,
+ * which lands chanspec exactly on the 72 the driver reads it from.
+ */
+#define APPLE_WLAN_BSS_RATESET_COUNT_OFF (52)
+#define APPLE_WLAN_BSS_RATESET_OFF (56)
 #define APPLE_WLAN_BSS_CHANSPEC_OFF (72)
+#define APPLE_WLAN_BSS_DTIM_OFF (76)
 #define APPLE_WLAN_BSS_RSSI_OFF (78)
+#define APPLE_WLAN_BSS_CTL_CH_OFF (88)
 #define APPLE_WLAN_BSS_FLAGS_OFF (96)
 #define APPLE_WLAN_BSS_IE_OFFSET_OFF (116)
 #define APPLE_WLAN_BSS_IE_LENGTH_OFF (120)
+
+/*
+ * The basic 802.11b rateset, in 500 kbps units with the basic-rate bit set:
+ * 1, 2, 5.5 and 11 Mbps. toScanResult's (rate >> 1) & 0x3F recovers exactly
+ * those numbers.
+ */
+static const uint8_t apple_wlan_bss_rates[] = { 0x82, 0x84, 0x8B, 0x96 };
+
+/*
+ * The information elements, appended after the struct at ie_offset. The minimum
+ * a real beacon carries: SSID, supported rates, and the DS parameter set naming
+ * the channel.
+ */
+#define APPLE_WLAN_IE_SSID (0)
+#define APPLE_WLAN_IE_RATES (1)
+#define APPLE_WLAN_IE_DS_PARAMS (3)
+#define APPLE_WLAN_BSS_IE_LEN \
+    (2 + sizeof(APPLE_WLAN_SSID) - 1 + 2 + sizeof(apple_wlan_bss_rates) + 2 + 1)
 
 // brcmfmac's BRCMF_BSS_INFO_VERSION.
 #define APPLE_WLAN_BSS_VERSION (109)
@@ -777,9 +812,11 @@ static const uint8_t apple_wlan_bssid[APPLE_WLAN_MAC_LEN] = {
     0x02, 0x00, 0x5E, 0x10, 0x00, 0x01
 };
 
-// Room for the escan result header plus one entry.
+// Room for the escan result header plus one entry and its IEs.
 #define APPLE_WLAN_EVENT_DATA_MAX \
-    (APPLE_WLAN_ESCAN_RES_LEN + APPLE_WLAN_BSS_LEN)
+    (APPLE_WLAN_ESCAN_RES_LEN + APPLE_WLAN_BSS_LEN + APPLE_WLAN_BSS_IE_LEN)
+// What buflen and the entry's own length field must cover.
+#define APPLE_WLAN_BSS_TOTAL (APPLE_WLAN_BSS_LEN + APPLE_WLAN_BSS_IE_LEN)
 
 /*
  * The MAC the event headers carry. It matches the local-mac-address t8030.c
@@ -2096,6 +2133,7 @@ static void apple_wlan_handle_ioctl(AppleWLANDeviceState *s,
     if (cmd == APPLE_WLAN_WLC_SET_VAR && strcmp(name, "escan") == 0) {
         uint8_t res[APPLE_WLAN_EVENT_DATA_MAX] = { 0 };
         uint8_t *bss = res + APPLE_WLAN_ESCAN_RES_LEN;
+        uint8_t *ie;
         uint64_t params = in_addr + strlen(name) + 1;
         uint16_t sync_id = 0;
 
@@ -2114,14 +2152,14 @@ static void apple_wlan_handle_ioctl(AppleWLANDeviceState *s,
          * processScanResults as that buffer's size, alongside a pointer to
          * header + 12.
          */
-        stl_le_p(res + APPLE_WLAN_ESCAN_RES_BUFLEN_OFF, APPLE_WLAN_BSS_LEN);
+        stl_le_p(res + APPLE_WLAN_ESCAN_RES_BUFLEN_OFF, APPLE_WLAN_BSS_TOTAL);
         stl_le_p(res + APPLE_WLAN_ESCAN_RES_VERSION_OFF,
                  APPLE_WLAN_ESCAN_VERSION);
         stw_le_p(res + APPLE_WLAN_ESCAN_RES_SYNC_ID_OFF, sync_id);
         stw_le_p(res + APPLE_WLAN_ESCAN_RES_BSS_COUNT_OFF, 1);
 
         stl_le_p(bss + APPLE_WLAN_BSS_VERSION_OFF, APPLE_WLAN_BSS_VERSION);
-        stl_le_p(bss + APPLE_WLAN_BSS_LENGTH_OFF, APPLE_WLAN_BSS_LEN);
+        stl_le_p(bss + APPLE_WLAN_BSS_LENGTH_OFF, APPLE_WLAN_BSS_TOTAL);
         memcpy(bss + APPLE_WLAN_BSS_BSSID_OFF, apple_wlan_bssid,
                APPLE_WLAN_MAC_LEN);
         stw_le_p(bss + APPLE_WLAN_BSS_BEACON_OFF, APPLE_WLAN_BSS_BEACON_PERIOD);
@@ -2130,13 +2168,31 @@ static void apple_wlan_handle_ioctl(AppleWLANDeviceState *s,
         bss[APPLE_WLAN_BSS_SSID_LEN_OFF] = strlen(APPLE_WLAN_SSID);
         memcpy(bss + APPLE_WLAN_BSS_SSID_OFF, APPLE_WLAN_SSID,
                strlen(APPLE_WLAN_SSID));
+        stl_le_p(bss + APPLE_WLAN_BSS_RATESET_COUNT_OFF,
+                 sizeof(apple_wlan_bss_rates));
+        memcpy(bss + APPLE_WLAN_BSS_RATESET_OFF, apple_wlan_bss_rates,
+               sizeof(apple_wlan_bss_rates));
         stw_le_p(bss + APPLE_WLAN_BSS_CHANSPEC_OFF,
                  APPLE_WLAN_CHANSPEC_BW_20 + APPLE_WLAN_CHANNEL_FIRST);
+        bss[APPLE_WLAN_BSS_DTIM_OFF] = 1;
         stw_le_p(bss + APPLE_WLAN_BSS_RSSI_OFF, (uint16_t)APPLE_WLAN_BSS_RSSI);
+        bss[APPLE_WLAN_BSS_CTL_CH_OFF] = APPLE_WLAN_CHANNEL_FIRST;
         bss[APPLE_WLAN_BSS_FLAGS_OFF] = 0;
-        // No information elements, so they begin past the end of the struct.
+        // The IEs follow the struct, so they start where it ends.
         stw_le_p(bss + APPLE_WLAN_BSS_IE_OFFSET_OFF, APPLE_WLAN_BSS_LEN);
-        stl_le_p(bss + APPLE_WLAN_BSS_IE_LENGTH_OFF, 0);
+        stl_le_p(bss + APPLE_WLAN_BSS_IE_LENGTH_OFF, APPLE_WLAN_BSS_IE_LEN);
+        ie = bss + APPLE_WLAN_BSS_LEN;
+        *ie++ = APPLE_WLAN_IE_SSID;
+        *ie++ = strlen(APPLE_WLAN_SSID);
+        memcpy(ie, APPLE_WLAN_SSID, strlen(APPLE_WLAN_SSID));
+        ie += strlen(APPLE_WLAN_SSID);
+        *ie++ = APPLE_WLAN_IE_RATES;
+        *ie++ = sizeof(apple_wlan_bss_rates);
+        memcpy(ie, apple_wlan_bss_rates, sizeof(apple_wlan_bss_rates));
+        ie += sizeof(apple_wlan_bss_rates);
+        *ie++ = APPLE_WLAN_IE_DS_PARAMS;
+        *ie++ = 1;
+        *ie++ = APPLE_WLAN_CHANNEL_FIRST;
         trace_apple_wlan_escan_result(sync_id, APPLE_WLAN_SSID);
         apple_wlan_post_event(s, APPLE_WLAN_WLC_E_ESCAN_RESULT,
                               APPLE_WLAN_WLC_E_STATUS_PARTIAL, 0,
