@@ -180,6 +180,7 @@ static void apple_pcie_port_msi_write(void *opaque, hwaddr addr, uint64_t data,
     ////int msi_intr_index = 1;
     // int msi_intr_index = data;
     int msi_intr_index = data % 8;
+    trace_apple_pcie_msi_doorbell(bus_nr, addr, data, msi_intr_index);
     assert_cmpuint(msi_intr_index, <, APPLE_PCIE_NUM_MSI_BANKS);
 
 #if 0
@@ -245,6 +246,7 @@ static void apple_pcie_port_update_msi_mapping(ApplePCIEPort *port)
     const bool enable = port->msi.intr[msi_intr_index].enable;
 
     // return;
+    trace_apple_pcie_msi_mapping(port->bus_nr, base, enable);
     memory_region_set_address(mem, base);
     memory_region_set_enabled(mem, enable);
     // dma_mr
