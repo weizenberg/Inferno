@@ -458,6 +458,7 @@ static const struct {
 #define APPLE_WLAN_MSGBUF_IOCTLRESP_BUF_POST (0x0B)
 #define APPLE_WLAN_MSGBUF_IOCTL_CMPLT (0x0C)
 #define APPLE_WLAN_MSGBUF_EVENT_BUF_POST (0x0D)
+#define APPLE_WLAN_MSGBUF_WL_EVENT (0x0E)
 #define APPLE_WLAN_MSGBUF_H2D_RING_CREATE (0x1B)
 #define APPLE_WLAN_MSGBUF_D2H_RING_CREATE (0x1C)
 #define APPLE_WLAN_MSGBUF_H2D_RING_CREATE_CMPLT (0x1D)
@@ -615,6 +616,90 @@ static const struct {
 #define APPLE_WLAN_INT_HOLD_NS (200 * 1000)
 #define APPLE_WLAN_INT_RETRY_NS (10 * 1000 * 1000)
 
+/*
+ * A WLC event packet, as handleEventPacket parses it. Layout anchored on two
+ * facts from that function: it memcmps the OUI at frame+23 against 00:10:18,
+ * and requires the u16 at frame+26 to read as 256, i.e. big-endian 1.
+ *
+ *   +0   bdc_header, 4 bytes -- the DRIVER writes these itself from the
+ *        completion (byte 0 = 0x20, byte 2 low nibble = ifidx, byte 3 =
+ *        dataOffset in 4-byte words, which must be 0)
+ *   +4   ether_header, 14
+ *   +18  bcmeth_hdr, 10: subtype, length, version, oui (+23), usr_subtype (+26)
+ *   +28  wl_event_msg_t, 48 -- every multi-byte field BIG-ENDIAN
+ *   +76  event data, datalen bytes
+ *
+ * handleEventPacket rejects anything shorter than 28 bytes ("shorter than
+ * wl_event_msg_t start") and anything whose datalen overruns the buffer.
+ */
+/*
+ * Offsets are into OUR packet, which begins at the ether_header -- not at the
+ * bdc_header. submitControlBufferMsg prepares an event buffer's DMA region at
+ * mbuf offset 4 (its length argument is 4 * (msgtype == 13)), so the address the
+ * driver hands us already skips the four bytes it writes itself. Getting this
+ * wrong shifts everything and shows up as
+ * "Got a BRCM packet but an OUI/SUBTYPE mismatch (OUI=01 00 36, subtype=2)",
+ * which is the subtype, length and version fields read as an OUI.
+ */
+#define APPLE_WLAN_EV_DMA_OFF (4)
+#define APPLE_WLAN_EV_ETHER_OFF (0)
+#define APPLE_WLAN_EV_BCMETH_OFF (14)
+#define APPLE_WLAN_EV_MSG_OFF (24)
+#define APPLE_WLAN_EV_MSG_LEN (48)
+#define APPLE_WLAN_EV_TOTAL (APPLE_WLAN_EV_MSG_OFF + APPLE_WLAN_EV_MSG_LEN)
+// The driver sets the mbuf length to this field plus 12.
+#define APPLE_WLAN_EV_LEN_BIAS (12)
+
+#define APPLE_WLAN_ETHER_TYPE_BRCM (0x886C)
+#define APPLE_WLAN_BCMETH_SUBTYPE_VENDOR_LONG (0x8001)
+#define APPLE_WLAN_BCMETH_VERSION (2)
+#define APPLE_WLAN_BCMETH_USR_SUBTYPE_EVENT (1)
+#define APPLE_WLAN_EVENT_MSG_VERSION (2)
+
+// wl_event_msg_t field offsets, from its start.
+#define APPLE_WLAN_EVM_VERSION (0)
+#define APPLE_WLAN_EVM_FLAGS (2)
+#define APPLE_WLAN_EVM_EVENT_TYPE (4)
+#define APPLE_WLAN_EVM_STATUS (8)
+#define APPLE_WLAN_EVM_REASON (12)
+#define APPLE_WLAN_EVM_AUTH_TYPE (16)
+#define APPLE_WLAN_EVM_DATALEN (20)
+#define APPLE_WLAN_EVM_IFNAME (30)
+
+#define APPLE_WLAN_WLC_E_ESCAN_RESULT (69)
+#define APPLE_WLAN_WLC_E_STATUS_SUCCESS (0)
+
+/*
+ * The escan request and its result. eventScanComplete matches the sync_id it
+ * issued against the one the result carries and refuses a mismatch:
+ * "Error, syncId mismatch. Expecting(6), got(0)".
+ *
+ * wl_escan_params_t is version(4) action(2) sync_id(2) then the scan params, and
+ * it follows the NUL-terminated iovar name in a set's input buffer.
+ * wl_escan_result_t is buflen(4) version(4) sync_id(2) bss_count(2) then any
+ * bss_info entries -- none here, so bss_count is zero.
+ */
+#define APPLE_WLAN_ESCAN_REQ_SYNC_ID_OFF (6)
+#define APPLE_WLAN_ESCAN_RES_BUFLEN_OFF (0)
+#define APPLE_WLAN_ESCAN_RES_VERSION_OFF (4)
+#define APPLE_WLAN_ESCAN_RES_SYNC_ID_OFF (8)
+#define APPLE_WLAN_ESCAN_RES_BSS_COUNT_OFF (10)
+#define APPLE_WLAN_ESCAN_RES_LEN (12)
+#define APPLE_WLAN_ESCAN_VERSION (1)
+
+/*
+ * The MAC the event headers carry. It matches the local-mac-address t8030.c
+ * publishes on arm-io/wlan -- locally administered (bit 1 of the first octet),
+ * synthetic, and not read off any real device.
+ */
+#define APPLE_WLAN_MAC_LEN (6)
+static const uint8_t apple_wlan_event_mac[APPLE_WLAN_MAC_LEN] = {
+    0x02, 0x1B, 0x63, 0x84, 0x45, 0xE6
+};
+
+// How many posted event buffers to remember.
+#define APPLE_WLAN_EVENT_BUFS (40)
+
 #define APPLE_WLAN_IOVAR_NAME_MAX (64)
 #define APPLE_WLAN_IOVAR_PAYLOAD_MAX (512)
 
@@ -741,6 +826,19 @@ struct AppleWLANDeviceState {
     } ioctl_resp_buf[APPLE_WLAN_IOCTL_RESP_BUFS];
     unsigned ioctl_resp_head;
     unsigned ioctl_resp_count;
+    /*
+     * Buffers posted for events. Kept separately from the ioctl response ones
+     * because an event completion has to name a buffer from this pool -- they
+     * are registered in the same Rx table but the driver posts them for
+     * different purposes.
+     */
+    struct {
+        uint64_t addr;
+        uint16_t len;
+        uint32_t request_id;
+    } event_buf[APPLE_WLAN_EVENT_BUFS];
+    unsigned event_buf_head;
+    unsigned event_buf_count;
     // Interrupt moderation; see APPLE_WLAN_INT_HOLD_NS.
     QEMUTimer *int_timer;
     bool int_asserted;
@@ -1578,6 +1676,111 @@ static uint16_t apple_wlan_ioctl_response(uint32_t cmd, const char *name,
     return 0;
 }
 
+static void apple_wlan_handle_event_buf_post(AppleWLANDeviceState *s,
+                                            const uint8_t *item)
+{
+    uint16_t len = lduw_le_p(item + 8);
+    uint64_t addr = ldq_le_p(item + 16);
+    unsigned slot;
+
+    if (addr == 0 || len == 0) {
+        return;
+    }
+    if (s->event_buf_count == APPLE_WLAN_EVENT_BUFS) {
+        s->event_buf_head = (s->event_buf_head + 1) % APPLE_WLAN_EVENT_BUFS;
+        s->event_buf_count--;
+    }
+    slot = (s->event_buf_head + s->event_buf_count) % APPLE_WLAN_EVENT_BUFS;
+    s->event_buf[slot].addr = addr;
+    s->event_buf[slot].len = len;
+    s->event_buf[slot].request_id =
+        ldl_le_p(item + APPLE_WLAN_MSGBUF_REQUEST_ID_OFF);
+    s->event_buf_count++;
+    trace_apple_wlan_event_buf_post(addr, len, s->event_buf_count);
+}
+
+/*
+ * Deliver one WLC event into a buffer the driver posted for the purpose, and
+ * complete it on the control ring. Only the header is built -- datalen 0 -- which
+ * is the truthful thing to send for a scan that found nothing: it says the scan
+ * finished rather than leaving the driver to time out after 20 seconds.
+ */
+static bool apple_wlan_post_event(AppleWLANDeviceState *s, uint32_t event_type,
+                                  uint32_t status, uint8_t ifidx,
+                                  const uint8_t *data, uint16_t datalen)
+{
+    uint8_t pkt[APPLE_WLAN_EV_TOTAL + APPLE_WLAN_ESCAN_RES_LEN] = { 0 };
+    size_t pktlen = APPLE_WLAN_EV_TOTAL + datalen;
+    uint8_t *eth = pkt + APPLE_WLAN_EV_ETHER_OFF;
+    uint8_t *bcmeth = pkt + APPLE_WLAN_EV_BCMETH_OFF;
+    uint8_t *evm = pkt + APPLE_WLAN_EV_MSG_OFF;
+    uint8_t cmplt[APPLE_WLAN_MSGBUF_CMPLT_SIZE];
+    uint64_t addr;
+    uint32_t request_id;
+    uint16_t len;
+
+    if (s->event_buf_count == 0) {
+        trace_apple_wlan_event_no_buf(event_type);
+        return false;
+    }
+    addr = s->event_buf[s->event_buf_head].addr;
+    len = s->event_buf[s->event_buf_head].len;
+    request_id = s->event_buf[s->event_buf_head].request_id;
+    if (datalen > APPLE_WLAN_ESCAN_RES_LEN || len < pktlen) {
+        trace_apple_wlan_event_no_buf(event_type);
+        return false;
+    }
+
+    // The driver overwrites the bdc_header itself; the ether_header is ours.
+    memcpy(eth, apple_wlan_event_mac, APPLE_WLAN_MAC_LEN);
+    memcpy(eth + APPLE_WLAN_MAC_LEN, apple_wlan_event_mac,
+           APPLE_WLAN_MAC_LEN);
+    stw_be_p(eth + 2 * APPLE_WLAN_MAC_LEN, APPLE_WLAN_ETHER_TYPE_BRCM);
+
+    stw_be_p(bcmeth + 0, APPLE_WLAN_BCMETH_SUBTYPE_VENDOR_LONG);
+    stw_be_p(bcmeth + 2, sizeof(pkt) - APPLE_WLAN_EV_BCMETH_OFF - 4);
+    bcmeth[4] = APPLE_WLAN_BCMETH_VERSION;
+    bcmeth[5] = 0x00;
+    bcmeth[6] = 0x10;
+    bcmeth[7] = 0x18;
+    stw_be_p(bcmeth + 8, APPLE_WLAN_BCMETH_USR_SUBTYPE_EVENT);
+
+    // Every multi-byte field here is big-endian; the driver byte-swaps them.
+    stw_be_p(evm + APPLE_WLAN_EVM_VERSION, APPLE_WLAN_EVENT_MSG_VERSION);
+    stw_be_p(evm + APPLE_WLAN_EVM_FLAGS, 0);
+    stl_be_p(evm + APPLE_WLAN_EVM_EVENT_TYPE, event_type);
+    stl_be_p(evm + APPLE_WLAN_EVM_STATUS, status);
+    stl_be_p(evm + APPLE_WLAN_EVM_REASON, 0);
+    stl_be_p(evm + APPLE_WLAN_EVM_AUTH_TYPE, 0);
+    stl_be_p(evm + APPLE_WLAN_EVM_DATALEN, datalen);
+    memcpy(evm + 24, apple_wlan_event_mac, APPLE_WLAN_MAC_LEN);
+    // ifname, NUL-padded within its 16 bytes (pkt is already zeroed).
+    memcpy(evm + APPLE_WLAN_EVM_IFNAME, "wl0", sizeof("wl0"));
+    evm[46] = ifidx;
+    evm[47] = 0;
+    if (datalen != 0) {
+        memcpy(pkt + APPLE_WLAN_EV_TOTAL, data, datalen);
+    }
+
+    if (pci_dma_write(PCI_DEVICE(s), addr, pkt, pktlen) != MEMTX_OK) {
+        trace_apple_wlan_ring_dma_fail(addr);
+        return false;
+    }
+    s->event_buf_head = (s->event_buf_head + 1) % APPLE_WLAN_EVENT_BUFS;
+    s->event_buf_count--;
+
+    memset(cmplt, 0, sizeof(cmplt));
+    cmplt[0] = APPLE_WLAN_MSGBUF_WL_EVENT;
+    cmplt[1] = ifidx;
+    stl_le_p(cmplt + APPLE_WLAN_MSGBUF_REQUEST_ID_OFF, request_id);
+    stw_le_p(cmplt + 12,
+             APPLE_WLAN_EV_DMA_OFF + pktlen - APPLE_WLAN_EV_LEN_BIAS);
+    trace_apple_wlan_post_event(event_type, status, addr,
+                                APPLE_WLAN_EV_DMA_OFF + pktlen -
+                                    APPLE_WLAN_EV_LEN_BIAS);
+    return apple_wlan_d2h_post(s, cmplt);
+}
+
 static void apple_wlan_handle_ioctl(AppleWLANDeviceState *s,
                                     const uint8_t *item)
 {
@@ -1651,6 +1854,39 @@ static void apple_wlan_handle_ioctl(AppleWLANDeviceState *s,
     stl_le_p(cmplt + 16, cmd);
     trace_apple_wlan_ioctl_cmplt(cmd, status, resp_len, trans_id);
     apple_wlan_d2h_post(s, cmplt);
+
+    /*
+     * A scan request is answered with an event, not with the ioctl completion:
+     * the driver takes that as an acknowledgement and then waits 20 seconds for
+     * results before logging "Scan Timeout". There is no radio, so the honest
+     * answer is that the scan finished and found nothing -- an ESCAN_RESULT with
+     * success status and no payload, which is how real firmware terminates a
+     * scan once it has sent whatever it found.
+     */
+    if (cmd == APPLE_WLAN_WLC_SET_VAR && strcmp(name, "escan") == 0) {
+        uint8_t res[APPLE_WLAN_ESCAN_RES_LEN] = { 0 };
+        uint64_t params = in_addr + strlen(name) + 1;
+        uint16_t sync_id = 0;
+
+        if (in_addr != 0) {
+            uint16_t raw = 0;
+
+            if (pci_dma_read(PCI_DEVICE(s),
+                             params + APPLE_WLAN_ESCAN_REQ_SYNC_ID_OFF, &raw,
+                             sizeof(raw)) == MEMTX_OK) {
+                sync_id = le16_to_cpu(raw);
+            }
+        }
+        stl_le_p(res + APPLE_WLAN_ESCAN_RES_BUFLEN_OFF, sizeof(res));
+        stl_le_p(res + APPLE_WLAN_ESCAN_RES_VERSION_OFF,
+                 APPLE_WLAN_ESCAN_VERSION);
+        stw_le_p(res + APPLE_WLAN_ESCAN_RES_SYNC_ID_OFF, sync_id);
+        stw_le_p(res + APPLE_WLAN_ESCAN_RES_BSS_COUNT_OFF, 0);
+        trace_apple_wlan_escan_complete(sync_id);
+        apple_wlan_post_event(s, APPLE_WLAN_WLC_E_ESCAN_RESULT,
+                              APPLE_WLAN_WLC_E_STATUS_SUCCESS, item[1], res,
+                              sizeof(res));
+    }
 }
 
 /*
@@ -1700,7 +1936,7 @@ static bool apple_wlan_drain_h2d_ring(AppleWLANDeviceState *s, unsigned id,
             apple_wlan_handle_resp_buf_post(s, item);
             break;
         case APPLE_WLAN_MSGBUF_EVENT_BUF_POST:
-            // Nothing to complete; there are no events to deliver yet.
+            apple_wlan_handle_event_buf_post(s, item);
             break;
         case APPLE_WLAN_MSGBUF_IOCTLPTR_REQ:
             apple_wlan_handle_ioctl(s, item);

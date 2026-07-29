@@ -44,3 +44,7 @@ apple_wlan_ioctl_set_accepted(const char *name, uint16_t in_len) "accepted iovar
 apple_wlan_ioctl_action_accepted(uint32_t cmd) "accepted action command %u"
 apple_wlan_dyn_ring_added(unsigned entry, bool h2d, uint16_t ring_id, uint64_t base, uint16_t max_item, uint16_t item_size) "dynamic ring %u: h2d %d slot %u base 0x%" PRIx64 " %u x %u"
 apple_wlan_dyn_ring_rejected(bool h2d, uint16_t ring_id, uint64_t base, uint16_t max_item, uint16_t item_size) "dynamic ring rejected: h2d %d slot %u base 0x%" PRIx64 " %u x %u"
+apple_wlan_event_buf_post(uint64_t addr, uint16_t len, unsigned count) "event buf 0x%" PRIx64 " len %u (%u held)"
+apple_wlan_event_no_buf(uint32_t event_type) "cannot deliver event %u: no posted buffer big enough"
+apple_wlan_post_event(uint32_t event_type, uint32_t status, uint64_t addr, uint16_t len) "event %u status %u -> buf 0x%" PRIx64 " len %u"
+apple_wlan_escan_complete(uint16_t sync_id) "escan complete, sync id %u, no results"
