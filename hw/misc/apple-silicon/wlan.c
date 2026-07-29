@@ -517,6 +517,29 @@ static const struct {
  */
 #define APPLE_WLAN_CHIP_CAPS_STRING "802.11d 802.11h"
 
+/*
+ * The channel list. handleGetChanSpecs reads a wl_uint32_list_t -- a count
+ * followed by that many u32 entries, each stored back as a u16:
+ *
+ *   v10 = v5 + 1;                                   // entries follow the count
+ *   *(_WORD *)(result + 7262 + 2 * v9) = v10[v9];
+ *   *(_WORD *)(result + 7260) = v6;                 // count
+ *
+ * A chanspec is band | bandwidth | channel. Band 2G is zero and 0x1000 is the
+ * 20 MHz bandwidth field (brcmfmac's BRCMU_CHSPEC_D11AC_BND_2G and
+ * _BW_20), so channel N at 20 MHz is 0x1000 | N.
+ *
+ * Channels 1-11 are the 2.4 GHz set the "US" regulatory default allows, which
+ * is what the country list reports. With no radio behind this, the list says
+ * what the stand-in claims to support and nothing more -- but refusing it stops
+ * getSupportedChannelsMatching, and the driver cannot scan without it.
+ */
+#define APPLE_WLAN_CHANSPEC_BW_20 (0x1000)
+#define APPLE_WLAN_CHANNEL_FIRST (1)
+#define APPLE_WLAN_CHANNEL_COUNT (11)
+#define APPLE_WLAN_CHANSPEC_DEFAULT \
+    (APPLE_WLAN_CHANSPEC_BW_20 | APPLE_WLAN_CHANNEL_FIRST)
+
 // Likewise for the TX capability table; the driver only logs this one.
 #define APPLE_WLAN_TXCAP_VERSION_STRING \
     "TxCap: 1.0 Creation: 2020-01-01 00:00:00"
@@ -592,6 +615,8 @@ static const struct {
      * fails setupDriver ("Failure to get default Home Away Time").
      */
     { "scan_home_away_time", 100 },
+    // The channel currently sat on, read by getCHANNEL.
+    { "chanspec", APPLE_WLAN_CHANSPEC_DEFAULT },
 };
 
 /*
@@ -1456,6 +1481,20 @@ static uint16_t apple_wlan_ioctl_response(uint32_t cmd, const char *name,
     if (cmd != APPLE_WLAN_WLC_GET_VAR) {
         *status = APPLE_WLAN_BCME_UNSUPPORTED;
         return 0;
+    }
+    if (strcmp(name, "chanspecs") == 0) {
+        uint16_t len = sizeof(uint32_t) * (1 + APPLE_WLAN_CHANNEL_COUNT);
+
+        if (len > cap) {
+            *status = APPLE_WLAN_BCME_UNSUPPORTED;
+            return 0;
+        }
+        stl_le_p(buf, APPLE_WLAN_CHANNEL_COUNT);
+        for (unsigned i = 0; i < APPLE_WLAN_CHANNEL_COUNT; i++) {
+            stl_le_p(buf + sizeof(uint32_t) * (1 + i),
+                     APPLE_WLAN_CHANSPEC_BW_20 + APPLE_WLAN_CHANNEL_FIRST + i);
+        }
+        return len;
     }
     if (strcmp(name, "cap") == 0) {
         size_t len = strlen(APPLE_WLAN_CHIP_CAPS_STRING) + 1;
