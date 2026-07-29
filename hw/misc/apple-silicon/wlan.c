@@ -1642,7 +1642,15 @@ static bool apple_wlan_drain_h2d_ring(AppleWLANDeviceState *s, unsigned id,
     }
     apple_wlan_write_ring_index(s, APPLE_WLAN_RING_INFO_H2D_R_IDX_OFF,
                                 ring->slot, s->ring_r_idx[id]);
-    return posted;
+    /*
+     * Consuming submissions is itself something to signal, not just answering
+     * them. The read index moving is how the driver learns its Tx commands were
+     * taken and its ring space freed -- reportCompletedTxCommands is that path,
+     * and it is what releases a command waiting in the pending queue. Returning
+     * false here when a drain posted no completion left the driver with work
+     * queued and nothing to wake it.
+     */
+    return true;
 }
 
 /*
