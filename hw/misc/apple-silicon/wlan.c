@@ -48,41 +48,44 @@ OBJECT_DECLARE_SIMPLE_TYPE(AppleWLANState, APPLE_WLAN)
 #define APPLE_WLAN_SUBDEVICE_ID (0x4378)
 
 /*
- * On Broadcom PCIe parts BAR0 is a set of 4 KiB pages, and several of those pages
- * are independently moveable windows onto the chip's backplane. Each such page
- * has its own base register in PCI config space. Counted over one boot of the
- * iOS 14 driver, four are used:
+ * On Broadcom PCIe parts BAR0 is a set of 4 KiB pages, and several of those
+ * pages are independently moveable windows onto the chip's backplane. Each such
+ * page has its own base register in PCI config space. Counted over one boot of
+ * the iOS 14 driver, four are used:
  *
  *   BAR0 + 0x0000  <-  config 0x80   (332 writes)   "BAR0_WINDOW"
  *   BAR0 + 0x1000  <-  config 0x70   ( 60 writes)
  *   BAR0 + 0x4000  <-  config 0x74   ( 93 writes)   the "core 2" window
  *   BAR0 + 0x5000  <-  config 0x78   ( 61 writes)
  *
- * All of them must be modelled. The driver keeps track of which core each window
- * currently maps and reaches for whichever one is not already pointing at a core
- * it still needs, so which window a given access arrives through varies from boot
- * to boot for identical driver code. A window that is not modelled silently loses
- * every access made through it: the access either lands beyond the end of a
- * too-small BAR0 and is absorbed by whatever the guest mapped next, or falls
- * through to the flat register array, and in both cases reads back as zero. That
- * is what made the OTP read — and hence the whole hardware-identity publish —
- * fail on some boots and succeed on others with no change in the binary.
+ * All of them must be modelled. The driver keeps track of which core each
+ * window currently maps and reaches for whichever one is not already pointing
+ * at a core it still needs, so which window a given access arrives through
+ * varies from boot to boot for identical driver code. A window that is not
+ * modelled silently loses every access made through it: the access either lands
+ * beyond the end of a too-small BAR0 and is absorbed by whatever the guest
+ * mapped next, or falls through to the flat register array, and in both cases
+ * reads back as zero. That is what made the OTP read — and hence the whole
+ * hardware-identity publish — fail on some boots and succeed on others with no
+ * change in the binary.
  *
  * Pages 2 and 3 also see traffic (424 and 60 accesses) but no config write was
- * observed selecting a base for them, so they are presumed to be fixed apertures
- * rather than windows — the `bar0 + 0x21e8` write looks like a PCIe2 core
- * register block. They are left falling through to bar0_regs until identified.
+ * observed selecting a base for them, so they are presumed to be fixed
+ * apertures rather than windows — the `bar0 + 0x21e8` write looks like a PCIe2
+ * core register block. They are left falling through to bar0_regs until
+ * identified.
  *
  * The chip identity is the ChipCommon `chipid` register at backplane 0x18000000
  * offset 0, encoded as id | rev << 16 | package << 20 | type << 28.
  */
 #define APPLE_WLAN_BAR0_WINDOW_SIZE (4 * KiB)
-#define APPLE_WLAN_BAR0_PAGES (APPLE_WLAN_DEVICE_BAR0_SIZE / APPLE_WLAN_BAR0_WINDOW_SIZE)
+#define APPLE_WLAN_BAR0_PAGES \
+    (APPLE_WLAN_DEVICE_BAR0_SIZE / APPLE_WLAN_BAR0_WINDOW_SIZE)
 /*
  * Broadcom's own config-space registers, 0x70..0xa7: the four window bases
  * (0x70, 0x74, 0x78, 0x80) plus 0x88, 0xa0 and 0xa4. The PCI Express capability
- * is pushed clear of them; a version-2 capability is 0x3c bytes, so 0xc0 keeps it
- * below the 0x100 start of extended config space where AER lives.
+ * is pushed clear of them; a version-2 capability is 0x3c bytes, so 0xc0 keeps
+ * it below the 0x100 start of extended config space where AER lives.
  */
 #define APPLE_WLAN_BCM_CFG_BASE (0x70)
 #define APPLE_WLAN_BCM_CFG_SIZE (0x38)
@@ -206,9 +209,9 @@ static const struct {
  *       | 1883344< nvram{8998} >1892342 | ... ] 1892352
  *
  * i.e. 1,892,352 bytes of content. Sizing the BAR to just fit that (2 MiB) is
- * NOT enough: the driver maps the whole TCM aperture up front, and if the map is
- * larger than the BAR it fails, leaving a null base. AppleBCMWLANChipMemory::write
- * then stores straight through it —
+ * NOT enough: the driver maps the whole TCM aperture up front, and if the map
+ * is larger than the BAR it fails, leaving a null base.
+ * AppleBCMWLANChipMemory::write then stores straight through it —
  *
  *     v17 = (_QWORD *)(a1 + 24LL * a2 + 48);        // region descriptor
  *     *(_QWORD *)(*v17 + 8 * v20) = ...;            // no null check
@@ -217,8 +220,8 @@ static const struct {
  * what a too-small BAR2 looks like from outside: a panic in ChipMemory::write,
  * not a short write.
  *
- * The size is set by where in the aperture the driver actually writes, not by the
- * size of the content. Measured, the firmware write region begins at
+ * The size is set by where in the aperture the driver actually writes, not by
+ * the size of the content. Measured, the firmware write region begins at
  * bar2+0x351fdc (3.48 MiB), so with the 1,892,352-byte layout on top it reaches
  * 0x51ffdc, i.e. 5.12 MiB. 2 MiB paniced on the first store and 4 MiB paniced
  * after 524,288 bytes with the last write at bar2+0x3d1fdc, both at this same
@@ -233,10 +236,10 @@ static const struct {
  *
  * Measured cost of getting this wrong: the driver reads all 1892352 bytes of
  * chip RAM whenever it collects a SoCRAM dump for a fault report, and as MMIO
- * that is ~472000 trapping four-byte accesses -- 11.0 seconds of wall clock with
- * its workloop blocked. Its command-queue watchdog gives up after 10, so the
- * stall was reported 0.04 s after each dump finished ("Pending queue stall after
- * 10935 ms"), which reset the Commander and left the chip stuck in its
+ * that is ~472000 trapping four-byte accesses -- 11.0 seconds of wall clock
+ * with its workloop blocked. Its command-queue watchdog gives up after 10, so
+ * the stall was reported 0.04 s after each dump finished ("Pending queue stall
+ * after 10935 ms"), which reset the Commander and left the chip stuck in its
  * initializing state. Nothing about that was a protocol problem.
  *
  * The window has to cover the firmware-alive marker and the shared structure
@@ -258,10 +261,11 @@ static const struct {
  * raw BAR0 offsets. Names follow brcmfmac's BRCMF_PCIE_64_PCIE2REG_*.
  *
  * MAILBOXINT is status and is cleared by writing ones, so it must not be plain
- * storage: the driver writes 0xffffffff to clear and would read 0xffffffff back,
- * i.e. see every D2H doorbell and mailbox event asserted at once. Measured, the
- * driver unmasks 0x10100 -- D2H doorbell 0 (0x10000) and FN0 mailbox data
- * (0x0100) -- so those are the two bits the device has to be able to raise.
+ * storage: the driver writes 0xffffffff to clear and would read 0xffffffff
+ * back, i.e. see every D2H doorbell and mailbox event asserted at once.
+ * Measured, the driver unmasks 0x10100 -- D2H doorbell 0 (0x10000) and FN0
+ * mailbox data (0x0100) -- so those are the two bits the device has to be able
+ * to raise.
  */
 #define APPLE_WLAN_PCIE2_MAILBOXINT (0x2c30)
 #define APPLE_WLAN_PCIE2_MAILBOXMASK (0x2c34)
@@ -272,33 +276,35 @@ static const struct {
 #define APPLE_WLAN_AI_RESETCTRL (0x800)
 #define APPLE_WLAN_AI_RESETSTATUS (0x804)
 /*
- * The word at the end of chip RAM is not a liveness flag: createFirmwarePCIeIPC()
- * reads it as the *backplane address of the firmware's shared-memory structure*
- * and validates it against the chip RAM window --
+ * The word at the end of chip RAM is not a liveness flag:
+ * createFirmwarePCIeIPC() reads it as the *backplane address of the firmware's
+ * shared-memory structure* and validates it against the chip RAM window --
  *
  *     v114 = ramBase; v115 = addr - v114; v116 = ramSize;
- *     if (addr == -1)                       -> "Failed to read shared memory address"
- *     if (addr < v114 || v114 + v116 <= addr
+ *     if (addr == -1)                       -> "Failed to read shared memory
+ * address" if (addr < v114 || v114 + v116 <= addr
  *         || v116 <= v115 || v115 + 120 > v116
- *         || (v115 & 3) != 0)               -> bad address / "Failed to map shared memory"
+ *         || (v115 & 3) != 0)               -> bad address / "Failed to map
+ * shared memory"
  *
  * so it must sit inside RAM, be 4-byte aligned, and leave at least 120 bytes. A
  * plain 0 is below ramBase, which is what produced "BCMWLAN FW provide bad
  * address".
  *
  * For this aperture a BAR2 offset *is* the chip address: the chip table gives
- * ramBase 0x352000 / ramSize 0x1ce000, and the marker word (ramBase + ramSize - 4)
- * was observed at bar2+0x51fffc = 0x352000 + 0x1cdffc. So the address can be
+ * ramBase 0x352000 / ramSize 0x1ce000, and the marker word (ramBase + ramSize -
+ * 4) was observed at bar2+0x51fffc = 0x352000 + 0x1cdffc. So the address can be
  * derived from where the driver polls rather than by hardcoding that constant.
  *
  * Place the structure 16 KiB below the marker. The driver's own layout puts its
- * free region at 1317624..1883080 and NVRAM at 1883344..1892342 with the marker at
- * 1892348, so 16 KiB back lands in free space and clear of NVRAM.
+ * free region at 1317624..1883080 and NVRAM at 1883344..1892342 with the marker
+ * at 1892348, so 16 KiB back lands in free space and clear of NVRAM.
  */
 #define APPLE_WLAN_FW_SHARED_BACKOFF (16 * KiB)
 /*
- * First word of that structure is `flags`, whose low byte is the protocol version
- * (brcmfmac's BRCMF_PCIE_SHARED_VERSION_MASK). The driver checks it immediately:
+ * First word of that structure is `flags`, whose low byte is the protocol
+ * version (brcmfmac's BRCMF_PCIE_SHARED_VERSION_MASK). The driver checks it
+ * immediately:
  *
  *   createFirmwarePCIeIPC@7045: Host requires version 7, firmware supports 0
  */
@@ -313,15 +319,15 @@ static const struct {
  *     if ((flags & 0x40000000) == 0) -> needs a device-wake GPIO
  *
  * so 0x20000000 means *no* out-of-band device wake and 0x40000000 means inband
- * deep sleep is supported. Leaving both clear advertises OOB-only, and the driver
- * then bails with "device wake GPIO not available, and inband device wake not
- * supported by endpoint" because this platform has no such GPIO. Declaring no-OOB
- * plus inband takes the path that needs no GPIO.
+ * deep sleep is supported. Leaving both clear advertises OOB-only, and the
+ * driver then bails with "device wake GPIO not available, and inband device
+ * wake not supported by endpoint" because this platform has no such GPIO.
+ * Declaring no-OOB plus inband takes the path that needs no GPIO.
  */
 /*
  * How much of the structure to trace reads within, for layout discovery. Wide
- * enough to cover the pointer chain the driver walks: the structure itself, then
- * ring_info at +0x100, then the ring memory ring_info points at.
+ * enough to cover the pointer chain the driver walks: the structure itself,
+ * then ring_info at +0x100, then the ring memory ring_info points at.
  */
 #define APPLE_WLAN_FW_SHARED_WINDOW (4 * KiB)
 /*
@@ -349,8 +355,8 @@ static const struct {
 /*
  * ring_info's own first word is another address -- the ring memory holding the
  * ring descriptors -- and a zero there fails the same validation. Traced: the
- * driver reads ring_info+0x00 once and then fails. Give it a further slot in the
- * same free-space region.
+ * driver reads ring_info+0x00 once and then fails. Give it a further slot in
+ * the same free-space region.
  */
 #define APPLE_WLAN_FW_RING_MEM_BACKOFF (0x200)
 /*
@@ -364,9 +370,9 @@ static const struct {
 #define APPLE_WLAN_FW_DTOH_MB_DATA_BACKOFF (0x300)
 #define APPLE_WLAN_FW_HTOD_MB_DATA_BACKOFF (0x304)
 /*
- * ring_info's ring counts. The layout is pinned by what the driver itself writes
- * rather than by trusting the public struct: it fills four 64-bit host index
- * addresses at ring_info+0x14, +0x1c, +0x24 and +0x2c (v236[5..12] in
+ * ring_info's ring counts. The layout is pinned by what the driver itself
+ * writes rather than by trusting the public struct: it fills four 64-bit host
+ * index addresses at ring_info+0x14, +0x1c, +0x24 and +0x2c (v236[5..12] in
  * createFirmwarePCIeIPC), which runs to exactly 0x34 -- and brcmfmac's
  * ring_info_t has max_tx_flowrings at 0x34 and max_submission_queues at 0x36
  * immediately after those same four fields. Traced, the driver reads both as
@@ -376,9 +382,9 @@ static const struct {
  *     fw shared+0x136 size 2 -> 0x0
  *     (no further MMIO for the remaining ~250 s of a 300 s run)
  *
- * Both must be non-zero, and there is an ordering constraint between them that is
- * the opposite of what the arithmetic reads like. The driver asserts, and the
- * panic prints the *violated* condition:
+ * Both must be non-zero, and there is an ordering constraint between them that
+ * is the opposite of what the arithmetic reads like. The driver asserts, and
+ * the panic prints the *violated* condition:
  *
  *   panic(cpu 1 caller 0xfffffff0095cbfa4):
  *     "AppleBCMWLANBusInterfacePCIe::createFirmwarePCIeIPC(): "
@@ -391,11 +397,11 @@ static const struct {
  *   8 / 2                       "2 <= 8"      <- values consumed exactly
  *
  * so +0x34 is maxNbrOfTxFlowRings and +0x36 is maxNbrOfDynamicSubmissionRings,
- * and since "2 <= 8" is arithmetically true yet still panics, the requirement is
- * the strict inequality the other way round: the dynamic submission ring count
- * must be GREATER than the TX flowring count. Sensible in hindsight -- every TX
- * flowring is drawn from the dynamic submission ring pool, so the pool has to be
- * larger than the flowrings carved out of it.
+ * and since "2 <= 8" is arithmetically true yet still panics, the requirement
+ * is the strict inequality the other way round: the dynamic submission ring
+ * count must be GREATER than the TX flowring count. Sensible in hindsight --
+ * every TX flowring is drawn from the dynamic submission ring pool, so the pool
+ * has to be larger than the flowrings carved out of it.
  */
 #define APPLE_WLAN_FW_RING_INFO_MAX_FLOWRINGS_OFF (0x34)
 #define APPLE_WLAN_FW_RING_INFO_MAX_SUBMIT_OFF (0x36)
@@ -515,8 +521,8 @@ static const struct {
 #define APPLE_WLAN_COUNTRY_DEFAULT "US"
 /*
  * WLC_GET_COUNTRY. The driver asks for four bytes, not the twelve of a full
- * wl_country_t, so this is the abbreviation alone -- worth measuring rather than
- * assuming, since the struct would have been the obvious guess.
+ * wl_country_t, so this is the abbreviation alone -- worth measuring rather
+ * than assuming, since the struct would have been the obvious guess.
  */
 #define APPLE_WLAN_WLC_GET_COUNTRY (83)
 /*
@@ -525,7 +531,7 @@ static const struct {
  * the whole download from setupFirmware's point of view, even though the
  * transfer itself succeeded.
  */
-#define APPLE_WLAN_CLM_VERSION_STRING                          \
+#define APPLE_WLAN_CLM_VERSION_STRING                             \
     "API: 12.2 Data: 9.10.39 Compiler: 1.29.4 ClmImport: 1.36.3 " \
     "Creation: 2020-01-01 00:00:00"
 
@@ -635,11 +641,11 @@ static const struct {
 /*
  * Offsets are into OUR packet, which begins at the ether_header -- not at the
  * bdc_header. submitControlBufferMsg prepares an event buffer's DMA region at
- * mbuf offset 4 (its length argument is 4 * (msgtype == 13)), so the address the
- * driver hands us already skips the four bytes it writes itself. Getting this
- * wrong shifts everything and shows up as
- * "Got a BRCM packet but an OUI/SUBTYPE mismatch (OUI=01 00 36, subtype=2)",
- * which is the subtype, length and version fields read as an OUI.
+ * mbuf offset 4 (its length argument is 4 * (msgtype == 13)), so the address
+ * the driver hands us already skips the four bytes it writes itself. Getting
+ * this wrong shifts everything and shows up as "Got a BRCM packet but an
+ * OUI/SUBTYPE mismatch (OUI=01 00 36, subtype=2)", which is the subtype, length
+ * and version fields read as an OUI.
  */
 #define APPLE_WLAN_EV_DMA_OFF (4)
 #define APPLE_WLAN_EV_ETHER_OFF (0)
@@ -674,8 +680,8 @@ static const struct {
  * issued against the one the result carries and refuses a mismatch:
  * "Error, syncId mismatch. Expecting(6), got(0)".
  *
- * wl_escan_params_t is version(4) action(2) sync_id(2) then the scan params, and
- * it follows the NUL-terminated iovar name in a set's input buffer.
+ * wl_escan_params_t is version(4) action(2) sync_id(2) then the scan params,
+ * and it follows the NUL-terminated iovar name in a set's input buffer.
  * wl_escan_result_t is buflen(4) version(4) sync_id(2) bss_count(2) then any
  * bss_info entries -- none here, so bss_count is zero.
  */
@@ -706,9 +712,9 @@ static const struct {
  * processScanResults refuses anything at or below 0x7B bytes ("Not enough space
  * in the data buffer for bss_ino"), so the struct is 124 bytes.
  *
- * The BSSID is locally administered (bit 1 of the first octet) and the SSID says
- * what this is. Both are invented for the emulator -- there is no radio and
- * nothing here was read off any real network.
+ * The BSSID is locally administered (bit 1 of the first octet) and the SSID
+ * says what this is. Both are invented for the emulator -- there is no radio
+ * and nothing here was read off any real network.
  */
 #define APPLE_WLAN_BSS_LEN (124)
 #define APPLE_WLAN_BSS_VERSION_OFF (0)
@@ -744,9 +750,9 @@ static const uint8_t apple_wlan_bssid[APPLE_WLAN_MAC_LEN] = {
  * publishes on arm-io/wlan -- locally administered (bit 1 of the first octet),
  * synthetic, and not read off any real device.
  */
-static const uint8_t apple_wlan_event_mac[APPLE_WLAN_MAC_LEN] = {
-    0x02, 0x1B, 0x63, 0x84, 0x45, 0xE6
-};
+static const uint8_t apple_wlan_event_mac[APPLE_WLAN_MAC_LEN] = { 0x02, 0x1B,
+                                                                  0x63, 0x84,
+                                                                  0x45, 0xE6 };
 
 // How many posted event buffers to remember.
 #define APPLE_WLAN_EVENT_BUFS (40)
@@ -758,8 +764,8 @@ static const uint8_t apple_wlan_event_mac[APPLE_WLAN_MAC_LEN] = {
  * wlc_ver is deliberately left refused. Answering it with brcmfmac's
  * brcmf_wlc_version_le layout made things worse, not better: the driver reads
  * its interface version out of that structure and reported 0, where refusing
- * the iovar leaves it at its own default of 3. The real layout is not known, and
- * a confidently wrong structure is harder to notice than a refusal.
+ * the iovar leaves it at its own default of 3. The real layout is not known,
+ * and a confidently wrong structure is harder to notice than a refusal.
  */
 /*
  * Plain integer iovars. Each is read as a u32, and the driver sets some of them
@@ -796,12 +802,13 @@ static const struct {
  *
  *     if ( (**((_DWORD **)this + 154) & 0x10000) == 0 ) {
  *         v11 = 3758097095LL;              // kIOReturnUnsupported
- *         logAlert("Driver only supports FW with bi-directional ring index DMA.");
+ *         logAlert("Driver only supports FW with bi-directional ring index
+ * DMA.");
  *     }
  *
- * (brcmfmac calls this bit BRCMF_PCIE_SHARED_DMA_INDEX.) Past it the driver fills
- * the host-side index array addresses into ring_info itself, so those need not be
- * published here.
+ * (brcmfmac calls this bit BRCMF_PCIE_SHARED_DMA_INDEX.) Past it the driver
+ * fills the host-side index array addresses into ring_info itself, so those
+ * need not be published here.
  */
 #define APPLE_WLAN_FW_SHARED_DMA_INDEX (0x10000)
 #define APPLE_WLAN_FW_SHARED_FLAGS                                   \
@@ -831,8 +838,8 @@ struct AppleWLANDeviceState {
     uint8_t bar0_regs[APPLE_WLAN_DEVICE_BAR0_SIZE];
     uint8_t *bar2_backing;
     uint64_t tcm_written_bytes;
-    // See apple_wlan_bar2_ops_read(): identifying the firmware-alive marker from
-    // the driver's own poll of it, rather than guessing its address.
+    // See apple_wlan_bar2_ops_read(): identifying the firmware-alive marker
+    // from the driver's own poll of it, rather than guessing its address.
     bool arm_core_released;
     bool tcm_marker_done;
     uint32_t tcm_marker_offset;
@@ -894,16 +901,16 @@ struct AppleWLANDeviceState {
     QEMUTimer *int_timer;
     bool int_asserted;
 
-    // Backplane addresses currently mapped by each of BAR0's two windows, set by
-    // the guest through PCI config space. Tracking them turns the otherwise
+    // Backplane addresses currently mapped by each of BAR0's two windows, set
+    // by the guest through PCI config space. Tracking them turns the otherwise
     // opaque BAR0 offsets into real backplane addresses.
     uint32_t bar0_window_base[APPLE_WLAN_BAR0_PAGES];
     bool bar0_page_windowed[APPLE_WLAN_BAR0_PAGES];
 
     /*
      * Backplane storage, sparse and keyed by *backplane* address rather than by
-     * BAR offset. A flat BAR-indexed buffer is wrong here: the low 4 KiB of BAR0
-     * is a moveable window, so every window base would alias onto the same
+     * BAR offset. A flat BAR-indexed buffer is wrong here: the low 4 KiB of
+     * BAR0 is a moveable window, so every window base would alias onto the same
      * bytes, and the megabyte-scale firmware image the driver pushes through it
      * would collapse into 4 KiB of garbage.
      */
@@ -911,7 +918,8 @@ struct AppleWLANDeviceState {
     uint64_t written_bytes;
     uint32_t written_hash; // FNV-1a over everything written, for image identity
 
-    // ChipCommon indirect SROM interface state and its backing provisioning blob.
+    // ChipCommon indirect SROM interface state and its backing provisioning
+    // blob.
     uint32_t cc_srom_control;
     uint32_t cc_srom_address;
     uint8_t srom[APPLE_WLAN_SROM_BYTES];
@@ -920,11 +928,11 @@ struct AppleWLANDeviceState {
 
 // The identity strings the guest image expects: its firmware directory is
 // C-4378__s-B1 and the NVRAM file there is P-moana_M-GODF_V-m__m-4.3.txt, i.e.
-// platform "moana", module "GODF", vendor "m". These are model identity, not any
-// real device's calibration or MAC.
+// platform "moana", module "GODF", vendor "m". These are model identity, not
+// any real device's calibration or MAC.
 /*
- * Version-1 tuple payload, per AppleBCMWLANBusInterfacePCIe::parseVersion1Tuple()
- * as decompiled:
+ * Version-1 tuple payload, per
+ * AppleBCMWLANBusInterfacePCIe::parseVersion1Tuple() as decompiled:
  *
  *   v13 = len - 3;                            // effective payload length
  *   if (v13 == 0) { all four slots = "" }
@@ -948,11 +956,11 @@ struct AppleWLANDeviceState {
  * Two further rules, from AppleBCMWLANCore::{generateFileName,copyKeys}, decide
  * how these strings become firmware paths:
  *
- *   - A slot string holds *several* pairs separated by spaces; copyKeys() breaks
- *     on 0x20. So one slot carries a whole group, not a single key.
+ *   - A slot string holds *several* pairs separated by spaces; copyKeys()
+ * breaks on 0x20. So one slot carries a whole group, not a single key.
  *   - copyKeys() selects by the *case* of the key letter: it is called twice,
- *     first taking only UPPERCASE keys and then only lowercase ones, and the two
- *     results are joined with a literal "__". That is what produces Apple's
+ *     first taking only UPPERCASE keys and then only lowercase ones, and the
+ * two results are joined with a literal "__". That is what produces Apple's
  *     `C-4378__s-B1` (uppercase group `C=4378`, lowercase group `s=B1`) and
  *     `P-moana_M-GODF_V-m__m-4.3` (uppercase `P`/`M`/`V`, lowercase `m`).
  *
@@ -984,7 +992,8 @@ struct AppleWLANDeviceState {
  * vendor and revision keys belong here.
  */
 static const char apple_wlan_otp_identity[] =
-    "\x01\x00" "P=moana\0M=GODF\0s=B1\0M=GODF V=m m=4.3\0";
+    "\x01\x00"
+    "P=moana\0M=GODF\0s=B1\0M=GODF V=m m=4.3\0";
 
 static void apple_wlan_build_otp(AppleWLANDeviceState *s, const uint8_t *table)
 {
@@ -997,20 +1006,22 @@ static void apple_wlan_build_otp(AppleWLANDeviceState *s, const uint8_t *table)
     memcpy(&s->otp[n], apple_wlan_otp_identity,
            sizeof(apple_wlan_otp_identity) - 1);
     n += sizeof(apple_wlan_otp_identity) - 1;
-    s->otp[n++] = APPLE_WLAN_CIS_TYPE_END;
-    g_assert_cmpuint(n, <, sizeof(s->otp));
+    s->otp[n++] =
+APPLE_WLAN_CIS_TYPE_END
+;
+g_assert_cmpuint(n, <, sizeof(s->otp));
 
-    // Trailing byte chosen so getcrc8(otp, sizeof(otp), 0xFF) == CRC8_GOOD_VALUE.
-    for (i = 0; i < sizeof(s->otp) - 1; i++) {
-        crc = table[(s->otp[i] ^ crc) & 0xFF];
+// Trailing byte chosen so getcrc8(otp, sizeof(otp), 0xFF) == CRC8_GOOD_VALUE.
+for (i = 0; i < sizeof(s->otp) - 1; i++) {
+    crc = table[(s->otp[i] ^ crc) & 0xFF];
+}
+for (i = 0; i < 256; i++) {
+    if (table[(i ^ crc) & 0xFF] == APPLE_WLAN_CRC8_GOOD) {
+        s->otp[sizeof(s->otp) - 1] = (uint8_t)i;
+        return;
     }
-    for (i = 0; i < 256; i++) {
-        if (table[(i ^ crc) & 0xFF] == APPLE_WLAN_CRC8_GOOD) {
-            s->otp[sizeof(s->otp) - 1] = (uint8_t)i;
-            return;
-        }
-    }
-    g_assert_not_reached();
+}
+g_assert_not_reached();
 }
 
 static void apple_wlan_build_provisioning(AppleWLANDeviceState *s)
@@ -1029,7 +1040,8 @@ static void apple_wlan_build_provisioning(AppleWLANDeviceState *s)
         table[i] = (uint8_t)c;
     }
 
-    // Body stays zeroed; solve the last byte so getcrc8() yields CRC8_GOOD_VALUE.
+    // Body stays zeroed; solve the last byte so getcrc8() yields
+    // CRC8_GOOD_VALUE.
     for (i = 0; i < sizeof(s->srom) - 1; i++) {
         crc = table[(s->srom[i] ^ crc) & 0xFF];
     }
@@ -1090,11 +1102,12 @@ static SMCResult apple_wlan_smc_gp11_write(SMCKey *key, SMCKeyData *data,
 #define APPLE_WLAN_BACKPLANE_PAGE_SIZE (4 * KiB)
 #define APPLE_WLAN_FNV_OFFSET (2166136261u)
 #define APPLE_WLAN_FNV_PRIME (16777619u)
-// Log download progress this often, so a multi-MiB push is visible but not spammy.
+// Log download progress this often, so a multi-MiB push is visible but not
+// spammy.
 #define APPLE_WLAN_DL_LOG_STRIDE (256 * KiB)
 
-static uint8_t *apple_wlan_backplane_page(AppleWLANDeviceState *s, uint32_t addr,
-                                          bool allocate)
+static uint8_t *apple_wlan_backplane_page(AppleWLANDeviceState *s,
+                                          uint32_t addr, bool allocate)
 {
     uint32_t base = addr & ~(APPLE_WLAN_BACKPLANE_PAGE_SIZE - 1);
     uint8_t *page = g_hash_table_lookup(s->backplane, GUINT_TO_POINTER(base));
@@ -1143,7 +1156,7 @@ static uint64_t apple_wlan_bar0_ops_read(void *opaque, hwaddr offset,
         }
         trace_apple_wlan_otp_read(off, size, value);
     } else if (windowed && backplane == APPLE_WLAN_CHIPCOMMON_BASE +
-                                     APPLE_WLAN_CC_CAPABILITIES) {
+                                            APPLE_WLAN_CC_CAPABILITIES) {
         value = APPLE_WLAN_CC_CAP_SPROM_PRESENT;
     } else if (windowed && backplane == APPLE_WLAN_CHIPCOMMON_BASE +
                                             APPLE_WLAN_CC_SROM_CONTROL) {
@@ -1160,23 +1173,24 @@ static uint64_t apple_wlan_bar0_ops_read(void *opaque, hwaddr offset,
             }
         }
         trace_apple_wlan_srom_read(off, size, value);
-    } else if (windowed &&
-        backplane == APPLE_WLAN_CHIPCOMMON_BASE + APPLE_WLAN_CHIPID_OFFSET) {
+    } else if (windowed && backplane == APPLE_WLAN_CHIPCOMMON_BASE +
+                                            APPLE_WLAN_CHIPID_OFFSET) {
         value = APPLE_WLAN_CHIP_ID | (APPLE_WLAN_CHIP_REV << 16) |
                 (APPLE_WLAN_CHIP_PKG << 20) | (APPLE_WLAN_CHIP_TYPE << 28);
     } else if (windowed) {
         uint8_t *page = apple_wlan_backplane_page(s, backplane, false);
 
         if (page != NULL) {
-            memcpy(&value, page + (backplane & (APPLE_WLAN_BACKPLANE_PAGE_SIZE - 1)),
+            memcpy(&value,
+                   page + (backplane & (APPLE_WLAN_BACKPLANE_PAGE_SIZE - 1)),
                    size);
         }
     } else if (offset == APPLE_WLAN_PCIE2_MAILBOXINT) {
         /*
          * Status, not storage. The driver clears it by writing ones, so echoing
-         * the written value back makes every D2H event look permanently pending:
-         * it wrote 0xffffffff to clear and read 0xffffffff, i.e. all eight
-         * doorbells plus everything else asserted at once.
+         * the written value back makes every D2H event look permanently
+         * pending: it wrote 0xffffffff to clear and read 0xffffffff, i.e. all
+         * eight doorbells plus everything else asserted at once.
          */
         value = s->mailbox_int;
     } else {
@@ -1192,10 +1206,10 @@ static uint64_t apple_wlan_bar0_ops_read(void *opaque, hwaddr offset,
 }
 
 /*
- * The chip's ARM core is taken out of reset by clearing bit 0 of the AI wrapper's
- * RESETCTRL. There is no core here to run the downloaded firmware, so note the
- * release and let the read path stand in for the one thing the driver checks to
- * decide whether it booted — see apple_wlan_bar2_ops_read().
+ * The chip's ARM core is taken out of reset by clearing bit 0 of the AI
+ * wrapper's RESETCTRL. There is no core here to run the downloaded firmware, so
+ * note the release and let the read path stand in for the one thing the driver
+ * checks to decide whether it booted — see apple_wlan_bar2_ops_read().
  *
  * This is where the model stops being a passive device and starts impersonating
  * running firmware. Everything past it is protocol, not plumbing.
@@ -1273,8 +1287,7 @@ static bool apple_wlan_get_ring(AppleWLANDeviceState *s, unsigned id,
         lduw_le_p(s->bar2_backing + desc + APPLE_WLAN_RING_DESC_MAX_ITEM_OFF);
     ring->item_size =
         lduw_le_p(s->bar2_backing + desc + APPLE_WLAN_RING_DESC_ITEM_SIZE_OFF);
-    ring->base =
-        apple_wlan_tcm_addr64(s, desc + APPLE_WLAN_RING_DESC_BASE_OFF);
+    ring->base = apple_wlan_tcm_addr64(s, desc + APPLE_WLAN_RING_DESC_BASE_OFF);
     ring->h2d = id < APPLE_WLAN_RING_H2D_COUNT;
     ring->slot = ring->h2d ? id : id - APPLE_WLAN_RING_H2D_COUNT;
     return ring->base != 0 && ring->max_item != 0 && ring->item_size != 0 &&
@@ -1286,15 +1299,14 @@ static bool apple_wlan_read_ring_index(AppleWLANDeviceState *s,
                                        uint32_t ring_info_off, unsigned slot,
                                        uint16_t *out)
 {
-    uint64_t array = apple_wlan_tcm_addr64(s, apple_wlan_ring_info_off(s) +
-                                                  ring_info_off);
+    uint64_t array =
+        apple_wlan_tcm_addr64(s, apple_wlan_ring_info_off(s) + ring_info_off);
     uint16_t raw;
 
     if (array == 0) {
         return false;
     }
-    if (pci_dma_read(PCI_DEVICE(s),
-                     array + slot * sizeof(uint16_t), &raw,
+    if (pci_dma_read(PCI_DEVICE(s), array + slot * sizeof(uint16_t), &raw,
                      sizeof(raw)) != MEMTX_OK) {
         return false;
     }
@@ -1314,8 +1326,7 @@ static bool apple_wlan_write_ring_index(AppleWLANDeviceState *s,
     if (array == 0) {
         return false;
     }
-    return pci_dma_write(PCI_DEVICE(s),
-                         array + slot * sizeof(uint16_t), &raw,
+    return pci_dma_write(PCI_DEVICE(s), array + slot * sizeof(uint16_t), &raw,
                          sizeof(raw)) == MEMTX_OK;
 }
 
@@ -1348,9 +1359,8 @@ static void apple_wlan_int_assert(AppleWLANDeviceState *s)
     trace_apple_wlan_msi_notify(msg.address, msg.data);
     msi_notify(dev, 0);
     s->int_asserted = true;
-    timer_mod_ns(s->int_timer,
-                 qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
-                     APPLE_WLAN_INT_HOLD_NS);
+    timer_mod_ns(s->int_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                                   APPLE_WLAN_INT_HOLD_NS);
 }
 
 /*
@@ -1374,7 +1384,8 @@ static bool apple_wlan_d2h_outstanding(AppleWLANDeviceState *s)
     }
     if (!apple_wlan_read_ring_index(s, APPLE_WLAN_RING_INFO_D2H_R_IDX_OFF,
                                     ring.slot, &host_r_idx)) {
-        // Cannot tell; treat as outstanding so a real completion is not dropped.
+        // Cannot tell; treat as outstanding so a real completion is not
+        // dropped.
         return true;
     }
     return host_r_idx != s->ring_w_idx[id];
@@ -1394,9 +1405,8 @@ static void apple_wlan_int_timer(void *opaque)
     if (s->int_asserted) {
         apple_wlan_int_deassert(s);
         if (pending) {
-            timer_mod_ns(s->int_timer,
-                         qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
-                             APPLE_WLAN_INT_RETRY_NS);
+            timer_mod_ns(s->int_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                                           APPLE_WLAN_INT_RETRY_NS);
         }
         return;
     }
@@ -1489,10 +1499,9 @@ static bool apple_wlan_d2h_post(AppleWLANDeviceState *s, const uint8_t *item)
     stamped[2] = s->ring_phase[id] ?
                      (uint8_t)(stamped[2] | APPLE_WLAN_MSGBUF_PHASE_BIT) :
                      (uint8_t)(stamped[2] & ~APPLE_WLAN_MSGBUF_PHASE_BIT);
-    if (pci_dma_write(PCI_DEVICE(s), ring.base + w_idx * ring.item_size,
-                      stamped,
-                      MIN(ring.item_size, APPLE_WLAN_MSGBUF_CMPLT_SIZE)) !=
-        MEMTX_OK) {
+    if (pci_dma_write(
+            PCI_DEVICE(s), ring.base + w_idx * ring.item_size, stamped,
+            MIN(ring.item_size, APPLE_WLAN_MSGBUF_CMPLT_SIZE)) != MEMTX_OK) {
         trace_apple_wlan_ring_dma_fail(ring.base + w_idx * ring.item_size);
         return false;
     }
@@ -1505,10 +1514,9 @@ static bool apple_wlan_d2h_post(AppleWLANDeviceState *s, const uint8_t *item)
                                      ring.slot, next)) {
         return false;
     }
-    trace_apple_wlan_d2h_post(stamped[0],
-                              ldl_le_p(stamped +
-                                       APPLE_WLAN_MSGBUF_REQUEST_ID_OFF),
-                              w_idx, next, stamped[2]);
+    trace_apple_wlan_d2h_post(
+        stamped[0], ldl_le_p(stamped + APPLE_WLAN_MSGBUF_REQUEST_ID_OFF), w_idx,
+        next, stamped[2]);
     return true;
 }
 
@@ -1596,8 +1604,8 @@ static void apple_wlan_handle_resp_buf_post(AppleWLANDeviceState *s,
             (s->ioctl_resp_head + 1) % APPLE_WLAN_IOCTL_RESP_BUFS;
         s->ioctl_resp_count--;
     }
-    slot = (s->ioctl_resp_head + s->ioctl_resp_count) %
-           APPLE_WLAN_IOCTL_RESP_BUFS;
+    slot =
+        (s->ioctl_resp_head + s->ioctl_resp_count) % APPLE_WLAN_IOCTL_RESP_BUFS;
     s->ioctl_resp_buf[slot].addr = addr;
     s->ioctl_resp_buf[slot].len = len;
     s->ioctl_resp_buf[slot].request_id =
@@ -1628,8 +1636,8 @@ static uint16_t apple_wlan_ioctl_response(uint32_t cmd, const char *name,
         return APPLE_WLAN_COUNTRY_ABBREV_SIZE;
     }
     if (cmd == APPLE_WLAN_WLC_GET_COUNTRY_LIST) {
-        uint16_t len = APPLE_WLAN_COUNTRY_LIST_ENTRY_OFF +
-                       APPLE_WLAN_COUNTRY_ABBREV_SIZE;
+        uint16_t len =
+            APPLE_WLAN_COUNTRY_LIST_ENTRY_OFF + APPLE_WLAN_COUNTRY_ABBREV_SIZE;
 
         if (cap < len) {
             *status = APPLE_WLAN_BCME_UNSUPPORTED;
@@ -1670,10 +1678,10 @@ static uint16_t apple_wlan_ioctl_response(uint32_t cmd, const char *name,
         return 0;
     }
     /*
-     * Plain commands split by whether they carry input, not by whether they want
-     * output -- WLC_SET_RADIO passes four bytes in and echoes four back, so
-     * keying on the output length would have refused it. A command with input,
-     * or with no output at all, is an action: WLC_UP (in 0, out 0) and
+     * Plain commands split by whether they carry input, not by whether they
+     * want output -- WLC_SET_RADIO passes four bytes in and echoes four back,
+     * so keying on the output length would have refused it. A command with
+     * input, or with no output at all, is an action: WLC_UP (in 0, out 0) and
      * WLC_SET_RADIO (in 4, out 4) are the two setup insists on, and bringupBCM
      * gives up entirely if either is refused. As with sets, there is no state
      * here for one to change, so taking it cannot be wrong.
@@ -1761,7 +1769,7 @@ static uint16_t apple_wlan_ioctl_response(uint32_t cmd, const char *name,
 }
 
 static void apple_wlan_handle_event_buf_post(AppleWLANDeviceState *s,
-                                            const uint8_t *item)
+                                             const uint8_t *item)
 {
     uint16_t len = lduw_le_p(item + 8);
     uint64_t addr = ldq_le_p(item + 16);
@@ -1785,9 +1793,10 @@ static void apple_wlan_handle_event_buf_post(AppleWLANDeviceState *s,
 
 /*
  * Deliver one WLC event into a buffer the driver posted for the purpose, and
- * complete it on the control ring. Only the header is built -- datalen 0 -- which
- * is the truthful thing to send for a scan that found nothing: it says the scan
- * finished rather than leaving the driver to time out after 20 seconds.
+ * complete it on the control ring. Only the header is built -- datalen 0 --
+ * which is the truthful thing to send for a scan that found nothing: it says
+ * the scan finished rather than leaving the driver to time out after 20
+ * seconds.
  */
 static bool apple_wlan_post_event(AppleWLANDeviceState *s, uint32_t event_type,
                                   uint32_t status, uint8_t ifidx,
@@ -1817,8 +1826,7 @@ static bool apple_wlan_post_event(AppleWLANDeviceState *s, uint32_t event_type,
 
     // The driver overwrites the bdc_header itself; the ether_header is ours.
     memcpy(eth, apple_wlan_event_mac, APPLE_WLAN_MAC_LEN);
-    memcpy(eth + APPLE_WLAN_MAC_LEN, apple_wlan_event_mac,
-           APPLE_WLAN_MAC_LEN);
+    memcpy(eth + APPLE_WLAN_MAC_LEN, apple_wlan_event_mac, APPLE_WLAN_MAC_LEN);
     stw_be_p(eth + 2 * APPLE_WLAN_MAC_LEN, APPLE_WLAN_ETHER_TYPE_BRCM);
 
     stw_be_p(bcmeth + 0, APPLE_WLAN_BCMETH_SUBTYPE_VENDOR_LONG);
@@ -1894,16 +1902,15 @@ static void apple_wlan_handle_ioctl(AppleWLANDeviceState *s,
     apple_wlan_d2h_post(s, cmplt);
 
     cap = MIN(out_len, sizeof(payload));
-    resp_len =
-        apple_wlan_ioctl_response(cmd, name, in_len, out_len, payload, cap,
-                                  &status);
+    resp_len = apple_wlan_ioctl_response(cmd, name, in_len, out_len, payload,
+                                         cap, &status);
     /*
-     * Every completion consumes one posted response buffer, whatever the status.
-     * The driver looks the buffer up by its resource id and removes it from the
-     * table it was registered in, so a completion that names anything else --
-     * the request's own resource id, say, which belongs to the Tx table -- is
-     * rejected outright with "Rx IO not found for resourceID N". Refusing an
-     * iovar is still an answer, and it still has to give the buffer back.
+     * Every completion consumes one posted response buffer, whatever the
+     * status. The driver looks the buffer up by its resource id and removes it
+     * from the table it was registered in, so a completion that names anything
+     * else -- the request's own resource id, say, which belongs to the Tx table
+     * -- is rejected outright with "Rx IO not found for resourceID N". Refusing
+     * an iovar is still an answer, and it still has to give the buffer back.
      */
     if (s->ioctl_resp_count != 0) {
         uint64_t addr = s->ioctl_resp_buf[s->ioctl_resp_head].addr;
@@ -1943,9 +1950,9 @@ static void apple_wlan_handle_ioctl(AppleWLANDeviceState *s,
      * A scan request is answered with an event, not with the ioctl completion:
      * the driver takes that as an acknowledgement and then waits 20 seconds for
      * results before logging "Scan Timeout". There is no radio, so the honest
-     * answer is that the scan finished and found nothing -- an ESCAN_RESULT with
-     * success status and no payload, which is how real firmware terminates a
-     * scan once it has sent whatever it found.
+     * answer is that the scan finished and found nothing -- an ESCAN_RESULT
+     * with success status and no payload, which is how real firmware terminates
+     * a scan once it has sent whatever it found.
      */
     if (cmd == APPLE_WLAN_WLC_SET_VAR && strcmp(name, "escan") == 0) {
         uint8_t res[APPLE_WLAN_EVENT_DATA_MAX] = { 0 };
@@ -1972,8 +1979,7 @@ static void apple_wlan_handle_ioctl(AppleWLANDeviceState *s,
         stl_le_p(bss + APPLE_WLAN_BSS_LENGTH_OFF, APPLE_WLAN_BSS_LEN);
         memcpy(bss + APPLE_WLAN_BSS_BSSID_OFF, apple_wlan_bssid,
                APPLE_WLAN_MAC_LEN);
-        stw_le_p(bss + APPLE_WLAN_BSS_BEACON_OFF,
-                 APPLE_WLAN_BSS_BEACON_PERIOD);
+        stw_le_p(bss + APPLE_WLAN_BSS_BEACON_OFF, APPLE_WLAN_BSS_BEACON_PERIOD);
         stw_le_p(bss + APPLE_WLAN_BSS_CAPABILITY_OFF,
                  APPLE_WLAN_BSS_CAPABILITY);
         bss[APPLE_WLAN_BSS_SSID_LEN_OFF] = strlen(APPLE_WLAN_SSID);
@@ -2006,7 +2012,7 @@ static bool apple_wlan_drain_h2d_ring(AppleWLANDeviceState *s, unsigned id,
 
     apple_wlan_ring_check_rebuilt(s, id, ring);
     if (!apple_wlan_read_ring_index(s, APPLE_WLAN_RING_INFO_H2D_W_IDX_OFF,
-                                   ring->slot, &w_idx)) {
+                                    ring->slot, &w_idx)) {
         trace_apple_wlan_doorbell_no_index(ring->base);
         return false;
     }
@@ -2024,12 +2030,11 @@ static bool apple_wlan_drain_h2d_ring(AppleWLANDeviceState *s, unsigned id,
             trace_apple_wlan_ring_dma_fail(addr);
             return posted;
         }
-        trace_apple_wlan_ring_item(id, s->ring_r_idx[id], item[0], item[1],
-                                   item[2],
-                                   ldl_le_p(item +
-                                            APPLE_WLAN_MSGBUF_REQUEST_ID_OFF),
-                                   ldq_le_p(item + 8), ldq_le_p(item + 16),
-                                   ldq_le_p(item + 24), ldq_le_p(item + 32));
+        trace_apple_wlan_ring_item(
+            id, s->ring_r_idx[id], item[0], item[1], item[2],
+            ldl_le_p(item + APPLE_WLAN_MSGBUF_REQUEST_ID_OFF),
+            ldq_le_p(item + 8), ldq_le_p(item + 16), ldq_le_p(item + 24),
+            ldq_le_p(item + 32));
         switch (item[0]) {
         case APPLE_WLAN_MSGBUF_H2D_RING_CREATE:
         case APPLE_WLAN_MSGBUF_D2H_RING_CREATE:
@@ -2108,8 +2113,8 @@ static void apple_wlan_bar0_ops_write(void *opaque, hwaddr offset,
 
     if (apple_wlan_bar0_to_backplane(s, offset, &backplane)) {
         /*
-         * Wrapper space starts at 0x18100000; the cores the driver visits all sit
-         * below it. A RESETCTRL deassert there is the core coming up.
+         * Wrapper space starts at 0x18100000; the cores the driver visits all
+         * sit below it. A RESETCTRL deassert there is the core coming up.
          */
         if (backplane >= APPLE_WLAN_WRAPPER_BASE &&
             (backplane & (APPLE_WLAN_BACKPLANE_PAGE_SIZE - 1)) ==
@@ -2117,18 +2122,18 @@ static void apple_wlan_bar0_ops_write(void *opaque, hwaddr offset,
             (value & 1) == 0) {
             apple_wlan_release_arm_core(s);
         }
-        if (backplane == APPLE_WLAN_CHIPCOMMON_BASE +
-                             APPLE_WLAN_CC_SROM_CONTROL) {
+        if (backplane ==
+            APPLE_WLAN_CHIPCOMMON_BASE + APPLE_WLAN_CC_SROM_CONTROL) {
             s->cc_srom_control = (uint32_t)value;
-        } else if (backplane == APPLE_WLAN_CHIPCOMMON_BASE +
-                                    APPLE_WLAN_CC_SROM_ADDRESS) {
+        } else if (backplane ==
+                   APPLE_WLAN_CHIPCOMMON_BASE + APPLE_WLAN_CC_SROM_ADDRESS) {
             s->cc_srom_address = (uint32_t)value;
         }
         uint8_t *page = apple_wlan_backplane_page(s, backplane, true);
         uint64_t before = s->written_bytes;
 
-        memcpy(page + (backplane & (APPLE_WLAN_BACKPLANE_PAGE_SIZE - 1)), &value,
-               size);
+        memcpy(page + (backplane & (APPLE_WLAN_BACKPLANE_PAGE_SIZE - 1)),
+               &value, size);
         for (unsigned i = 0; i < size; i++) {
             s->written_hash ^= (uint8_t)(value >> (i * 8));
             s->written_hash *= APPLE_WLAN_FNV_PRIME;
@@ -2136,9 +2141,9 @@ static void apple_wlan_bar0_ops_write(void *opaque, hwaddr offset,
         s->written_bytes += size;
         if (before / APPLE_WLAN_DL_LOG_STRIDE !=
             s->written_bytes / APPLE_WLAN_DL_LOG_STRIDE) {
-            trace_apple_wlan_backplane_written(
-                s->written_bytes, g_hash_table_size(s->backplane),
-                s->written_hash);
+            trace_apple_wlan_backplane_written(s->written_bytes,
+                                               g_hash_table_size(s->backplane),
+                                               s->written_hash);
         }
         trace_apple_wlan_backplane_write(backplane, offset, size, value);
     } else if (offset == APPLE_WLAN_PCIE2_MAILBOXINT) {
@@ -2176,13 +2181,13 @@ static uint64_t apple_wlan_bar2_ops_read(void *opaque, hwaddr offset,
     /*
      * Stand in for firmware having booted. Once the ARM core has been released,
      * the driver polls the last word of chip RAM every 10 ms for ~4.8 s and
-     * requires it to become something that is neither the signature it wrote there
-     * nor 0xFFFFFFFF; otherwise it logs "last 4 bytes in WiFi chip RAM does not
-     * change after init!" and fails with "Chip Init failure".
+     * requires it to become something that is neither the signature it wrote
+     * there nor 0xFFFFFFFF; otherwise it logs "last 4 bytes in WiFi chip RAM
+     * does not change after init!" and fails with "Chip Init failure".
      *
      * The marker's address is not guessed: the poll identifies it. A repeated
-     * 32-bit read of one offset after the core came up is that poll, so the second
-     * such read is answered as a live firmware would have, once.
+     * 32-bit read of one offset after the core came up is that poll, so the
+     * second such read is answered as a live firmware would have, once.
      */
     if (s->arm_core_released && !s->tcm_marker_done && size == 4) {
         if (s->tcm_last_read_valid && s->tcm_last_read_offset == offset &&
@@ -2193,13 +2198,13 @@ static uint64_t apple_wlan_bar2_ops_read(void *opaque, hwaddr offset,
             s->tcm_marker_done = true;
             s->tcm_marker_offset = (uint32_t)offset;
             s->fw_shared_offset = shared;
-            // Publish the structure the address points at, starting with `flags`.
+            // Publish the structure the address points at, starting with
+            // `flags`.
             stl_le_p(s->bar2_backing + shared, APPLE_WLAN_FW_SHARED_FLAGS);
             stl_le_p(s->bar2_backing + shared +
                          APPLE_WLAN_FW_SHARED_RING_INFO_OFF,
                      shared + APPLE_WLAN_FW_RING_INFO_BACKOFF);
-            stl_le_p(s->bar2_backing + shared +
-                         APPLE_WLAN_FW_RING_INFO_BACKOFF,
+            stl_le_p(s->bar2_backing + shared + APPLE_WLAN_FW_RING_INFO_BACKOFF,
                      shared + APPLE_WLAN_FW_RING_MEM_BACKOFF);
             stw_le_p(s->bar2_backing + shared +
                          APPLE_WLAN_FW_RING_INFO_BACKOFF +
@@ -2234,15 +2239,15 @@ static uint64_t apple_wlan_bar2_ops_read(void *opaque, hwaddr offset,
     }
     memcpy(&value, s->bar2_backing + offset, size);
     /*
-     * Trace reads inside the published structure only. A per-access event across
-     * the whole 8 MiB TCM buries the log, but the driver's reads *here* are what
-     * tell us which fields of the structure it consults, and in what order --
-     * which is how its layout gets established instead of guessed.
+     * Trace reads inside the published structure only. A per-access event
+     * across the whole 8 MiB TCM buries the log, but the driver's reads *here*
+     * are what tell us which fields of the structure it consults, and in what
+     * order -- which is how its layout gets established instead of guessed.
      */
     if (s->fw_shared_offset != 0 && offset >= s->fw_shared_offset &&
         offset < s->fw_shared_offset + APPLE_WLAN_FW_SHARED_WINDOW) {
-        trace_apple_wlan_fw_shared_read((uint32_t)(offset - s->fw_shared_offset),
-                                        size, value);
+        trace_apple_wlan_fw_shared_read(
+            (uint32_t)(offset - s->fw_shared_offset), size, value);
     }
     return value;
 }
@@ -2261,9 +2266,9 @@ static void apple_wlan_bar2_ops_write(void *opaque, hwaddr offset,
     memcpy(s->bar2_backing + offset, &value, size);
     s->tcm_written_bytes += size;
     /*
-     * Trace writes inside the published structure. The msgbuf rings live in host
-     * memory, so the driver writes their DMA addresses and sizes in here -- this
-     * is how those get discovered rather than guessed.
+     * Trace writes inside the published structure. The msgbuf rings live in
+     * host memory, so the driver writes their DMA addresses and sizes in here
+     * -- this is how those get discovered rather than guessed.
      */
     if (s->fw_shared_offset != 0 && offset >= s->fw_shared_offset &&
         offset < s->fw_shared_offset + APPLE_WLAN_FW_SHARED_WINDOW) {
@@ -2272,15 +2277,16 @@ static void apple_wlan_bar2_ops_write(void *opaque, hwaddr offset,
     }
     /*
      * The driver retries the whole bring-up on failure, rewriting the signature
-     * and polling again, so the stand-in has to re-arm. A write covering the word
-     * it last answered means a fresh attempt is under way.
+     * and polling again, so the stand-in has to re-arm. A write covering the
+     * word it last answered means a fresh attempt is under way.
      *
      * Forget the last-read offset at the same time. Two reads of this word want
-     * opposite answers: loadImage() verifies it still holds the host's signature
-     * ("NVRAM Location Mismatch @ %u: host 0x%X, chip 0x%X" if not), and only the
-     * later poll in loadChipImage() wants it changed. Carrying a stale offset over
-     * from the previous pass made the very first verify read look like a repeat and
-     * answered it with the marker.
+     * opposite answers: loadImage() verifies it still holds the host's
+     * signature
+     * ("NVRAM Location Mismatch @ %u: host 0x%X, chip 0x%X" if not), and only
+     * the later poll in loadChipImage() wants it changed. Carrying a stale
+     * offset over from the previous pass made the very first verify read look
+     * like a repeat and answered it with the marker.
      */
     if (s->tcm_marker_done && offset <= s->tcm_marker_offset &&
         s->tcm_marker_offset < offset + size) {
@@ -2324,10 +2330,9 @@ static void apple_wlan_device_pci_realize(PCIDevice *dev, Error **errp)
     pci_set_word(pci_conf + PCI_SUBSYSTEM_VENDOR_ID, APPLE_WLAN_SUBVENDOR_ID);
     pci_set_word(pci_conf + PCI_SUBSYSTEM_ID, APPLE_WLAN_SUBDEVICE_ID);
 
-    s->int_timer =
-        timer_new_ns(QEMU_CLOCK_VIRTUAL, apple_wlan_int_timer, s);
-    s->backplane = g_hash_table_new_full(g_direct_hash, g_direct_equal, NULL,
-                                        g_free);
+    s->int_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, apple_wlan_int_timer, s);
+    s->backplane =
+        g_hash_table_new_full(g_direct_hash, g_direct_equal, NULL, g_free);
     s->written_hash = APPLE_WLAN_FNV_OFFSET;
     apple_wlan_build_provisioning(s);
 
@@ -2360,11 +2365,12 @@ static void apple_wlan_device_pci_realize(PCIDevice *dev, Error **errp)
      *
      *     readReg32(configSpace, window->cfg_offset, &v) == 0 && v == expected
      *
-     * and validateCores()/validateWrappers() call it for every mapped core, so a
-     * window register that does not read back what was written fails the whole
-     * bring-up -- which is how loadChipImage() came to return kIOReturnIOError.
-     * pci_default_write_config() honours wmask, and capability-owned bytes are
-     * read-only or write-1-to-clear, so the bases were being dropped.
+     * and validateCores()/validateWrappers() call it for every mapped core, so
+     * a window register that does not read back what was written fails the
+     * whole bring-up -- which is how loadChipImage() came to return
+     * kIOReturnIOError. pci_default_write_config() honours wmask, and
+     * capability-owned bytes are read-only or write-1-to-clear, so the bases
+     * were being dropped.
      */
     pcie_endpoint_cap_init(dev, APPLE_WLAN_EXP_CAP_OFFSET);
     msi_init(dev, 0x50, 1, true, false, &error_fatal);
@@ -2416,9 +2422,9 @@ static void apple_wlan_device_qdev_reset_hold(Object *obj, ResetType type)
  * Track every BAR0 window base register so BAR0 accesses can be resolved to
  * backplane addresses. The value itself is stored by pci_default_write_config()
  * now that the Broadcom range is writable and the express capability has been
- * moved clear of it, which is what lets the driver read its own window bases back
- * (see validateWindow() in the realize path); this hook only mirrors them into
- * the resolver's array.
+ * moved clear of it, which is what lets the driver read its own window bases
+ * back (see validateWindow() in the realize path); this hook only mirrors them
+ * into the resolver's array.
  */
 static void apple_wlan_device_config_write(PCIDevice *dev, uint32_t addr,
                                            uint32_t val, int len)
@@ -2483,7 +2489,6 @@ static void apple_wlan_realize(DeviceState *dev, Error **errp)
     AppleWLANState *s = APPLE_WLAN(dev);
 
     qdev_realize(DEVICE(s->device), BUS(s->pci_bus), &error_fatal);
-
 }
 
 static const VMStateDescription vmstate_apple_wlan = {
