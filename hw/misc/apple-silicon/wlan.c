@@ -461,6 +461,32 @@ static const struct {
  */
 #define APPLE_WLAN_WLC_GET_VERSION (1)
 #define APPLE_WLAN_IOCTL_VERSION (2)
+
+/*
+ * WLC_GET_COUNTRY_LIST, what populateCountryList reads. Its layout is taken
+ * from that function, which zeroes count before the call and then reads it
+ * back:
+ *
+ *   v10 = *(_DWORD *)(v4 + 12);                       // count, clamped to 256
+ *   ... = *(_DWORD *)(v4 + 16 + 4 * v11);             // 4-byte abbreviations
+ *
+ * so it is wl_country_list_t: buflen, band_set, band, count, then count
+ * four-byte country abbreviations. A count of zero is tolerated there, but a
+ * refusal is fatal -- the list has to exist even if it is short. One entry is
+ * published as the regulatory domain to operate under; it is a configuration
+ * default, not anything read off a device.
+ */
+#define APPLE_WLAN_WLC_GET_COUNTRY_LIST (261)
+#define APPLE_WLAN_COUNTRY_LIST_COUNT_OFF (12)
+#define APPLE_WLAN_COUNTRY_LIST_ENTRY_OFF (16)
+#define APPLE_WLAN_COUNTRY_ABBREV_SIZE (4)
+#define APPLE_WLAN_COUNTRY_DEFAULT "US"
+/*
+ * WLC_GET_COUNTRY. The driver asks for four bytes, not the twelve of a full
+ * wl_country_t, so this is the abbreviation alone -- worth measuring rather than
+ * assuming, since the struct would have been the obvious guess.
+ */
+#define APPLE_WLAN_WLC_GET_COUNTRY (83)
 /*
  * The regulatory table version, read straight after the blob is loaded. Same
  * shape a real CLM reports, with a synthetic build stamp. Refusing this fails
@@ -1282,11 +1308,35 @@ static void apple_wlan_handle_resp_buf_post(AppleWLANDeviceState *s,
  * one shows up as a refusal in the log instead of as plausible-looking zeroes.
  */
 static uint16_t apple_wlan_ioctl_response(uint32_t cmd, const char *name,
-                                          uint16_t in_len, uint8_t *buf,
-                                          uint16_t cap, int16_t *status)
+                                          uint16_t in_len, uint16_t out_len,
+                                          uint8_t *buf, uint16_t cap,
+                                          int16_t *status)
 {
     *status = APPLE_WLAN_BCME_OK;
 
+    if (cmd == APPLE_WLAN_WLC_GET_COUNTRY) {
+        if (cap < APPLE_WLAN_COUNTRY_ABBREV_SIZE) {
+            *status = APPLE_WLAN_BCME_UNSUPPORTED;
+            return 0;
+        }
+        memcpy(buf, APPLE_WLAN_COUNTRY_DEFAULT,
+               strlen(APPLE_WLAN_COUNTRY_DEFAULT));
+        return APPLE_WLAN_COUNTRY_ABBREV_SIZE;
+    }
+    if (cmd == APPLE_WLAN_WLC_GET_COUNTRY_LIST) {
+        uint16_t len = APPLE_WLAN_COUNTRY_LIST_ENTRY_OFF +
+                       APPLE_WLAN_COUNTRY_ABBREV_SIZE;
+
+        if (cap < len) {
+            *status = APPLE_WLAN_BCME_UNSUPPORTED;
+            return 0;
+        }
+        stl_le_p(buf + APPLE_WLAN_COUNTRY_LIST_COUNT_OFF, 1);
+        // Zero-padded within its four bytes; the caller already zeroed buf.
+        memcpy(buf + APPLE_WLAN_COUNTRY_LIST_ENTRY_OFF,
+               APPLE_WLAN_COUNTRY_DEFAULT, strlen(APPLE_WLAN_COUNTRY_DEFAULT));
+        return len;
+    }
     if (cmd == APPLE_WLAN_WLC_GET_VERSION) {
         if (cap < sizeof(uint32_t)) {
             *status = APPLE_WLAN_BCME_UNSUPPORTED;
@@ -1313,6 +1363,24 @@ static uint16_t apple_wlan_ioctl_response(uint32_t cmd, const char *name,
      */
     if (cmd == APPLE_WLAN_WLC_SET_VAR) {
         trace_apple_wlan_ioctl_set_accepted(name, in_len);
+        return 0;
+    }
+    /*
+     * Plain commands split by whether they carry input, not by whether they want
+     * output -- WLC_SET_RADIO passes four bytes in and echoes four back, so
+     * keying on the output length would have refused it. A command with input,
+     * or with no output at all, is an action: WLC_UP (in 0, out 0) and
+     * WLC_SET_RADIO (in 4, out 4) are the two setup insists on, and bringupBCM
+     * gives up entirely if either is refused. As with sets, there is no state
+     * here for one to change, so taking it cannot be wrong.
+     *
+     * A command with no input and an output buffer is a pure query, and falls
+     * through to be answered explicitly or refused -- WLC_GET_VERSION and
+     * WLC_GET_COUNTRY are answered that way, and cmd 39 is still refused, which
+     * is how it stays visible.
+     */
+    if (cmd != APPLE_WLAN_WLC_GET_VAR && (in_len != 0 || out_len == 0)) {
+        trace_apple_wlan_ioctl_action_accepted(cmd);
         return 0;
     }
     if (cmd != APPLE_WLAN_WLC_GET_VAR) {
@@ -1404,7 +1472,8 @@ static void apple_wlan_handle_ioctl(AppleWLANDeviceState *s,
 
     cap = MIN(out_len, sizeof(payload));
     resp_len =
-        apple_wlan_ioctl_response(cmd, name, in_len, payload, cap, &status);
+        apple_wlan_ioctl_response(cmd, name, in_len, out_len, payload, cap,
+                                  &status);
     /*
      * Every completion consumes one posted response buffer, whatever the status.
      * The driver looks the buffer up by its resource id and removes it from the
@@ -1473,6 +1542,24 @@ static void apple_wlan_h2d_doorbell(AppleWLANDeviceState *s)
     }
     trace_apple_wlan_doorbell(id, ring.base, ring.max_item, ring.item_size,
                               s->ring_r_idx[id], w_idx);
+    /*
+     * Diagnostic: which H2D slots the driver is actually writing to. The
+     * doorbell is one register for every submission ring, so a submission to
+     * anything other than the control ring would otherwise go unnoticed.
+     */
+    for (unsigned slot = 0; slot < 4; slot++) {
+        uint64_t array = apple_wlan_tcm_addr64(
+            s, apple_wlan_ring_info_off(s) + APPLE_WLAN_RING_INFO_H2D_W_IDX_OFF);
+        uint16_t raw = 0;
+
+        if (array == 0) {
+            break;
+        }
+        if (pci_dma_read(PCI_DEVICE(s), array + slot * sizeof(uint16_t), &raw,
+                         sizeof(raw)) == MEMTX_OK) {
+            trace_apple_wlan_h2d_slot(slot, le16_to_cpu(raw));
+        }
+    }
     if (w_idx >= ring.max_item) {
         return;
     }
