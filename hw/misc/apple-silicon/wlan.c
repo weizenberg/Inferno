@@ -48,13 +48,32 @@ OBJECT_DECLARE_SIMPLE_TYPE(AppleWLANState, APPLE_WLAN)
 #define APPLE_WLAN_SUBDEVICE_ID (0x4378)
 
 /*
- * On Broadcom PCIe parts the low 4 KiB of BAR0 is a moveable window into the
- * chip's backplane; the window base lives in PCI config space (BAR0_WINDOW).
+ * On Broadcom PCIe parts BAR0 carries *two* independently moveable 4 KiB windows
+ * onto the chip's backplane, each with its own base register in PCI config
+ * space:
+ *
+ *   BAR0 + 0x0000  <-  config 0x80 (BAR0_WINDOW)
+ *   BAR0 + 0x4000  <-  config 0x74 (the "core 2" window)
+ *
+ * Both must be modelled. The driver keeps track of which core each window
+ * currently maps and reaches for whichever one is not already pointing at a core
+ * it still needs, so which window a given access arrives through varies from
+ * boot to boot for identical driver code. Modelling only BAR0_WINDOW silently
+ * loses every access made through the other window: they land beyond the end of
+ * a too-small BAR0 and are absorbed by whatever the guest mapped next (here,
+ * BAR2), which reads back as zeroes. That is what made the OTP read — and hence
+ * the whole hardware-identity publish — fail on some boots and succeed on
+ * others with no change in the binary.
+ *
  * The chip identity is the ChipCommon `chipid` register at backplane 0x18000000
  * offset 0, encoded as id | rev << 16 | package << 20 | type << 28.
  */
 #define APPLE_WLAN_BAR0_WINDOW_CFG (0x80)
+#define APPLE_WLAN_BAR0_CORE2_WINDOW_CFG (0x74)
 #define APPLE_WLAN_BAR0_WINDOW_SIZE (4 * KiB)
+#define APPLE_WLAN_BAR0_CORE2_WINDOW_OFFSET (16 * KiB)
+// The reset value the driver expects to find in the core-2 window register.
+#define APPLE_WLAN_BAR0_CORE2_WINDOW_RESET (0x18002000)
 #define APPLE_WLAN_CHIPCOMMON_BASE (0x18000000)
 #define APPLE_WLAN_CHIPID_OFFSET (0x0)
 // n104 ships a BCM4378 stepping B1; the guest picks its firmware directory from
@@ -136,12 +155,23 @@ OBJECT_DECLARE_SIMPLE_TYPE(AppleWLANState, APPLE_WLAN)
  * Tested and ruled out as the cause of "publishHWIdentifiers: Bad argument":
  * a bare SROM signature, a synthesised CIS vendor tuple naming the module, and
  * the driver's own `wlan.debug.module-instance` boot-arg override all left that
- * failure unchanged -- and it also reproduces on boots where this region is
- * never read at all, so the failing check is upstream of the OTP contents.
+ * failure unchanged. What does satisfy it is a type-0x15 Version-1 tuple whose
+ * payload is a 2-byte version followed by NUL-separated `key=value` strings.
+ *
+ * The separate "publishHWIdentifiers: media error" (kIOReturnBadMedia) failure,
+ * which used to come and go across boots of an identical binary, was never an
+ * OTP-content problem at all: on those boots the driver reached this region
+ * through BAR0's *core-2* window, which the model did not implement, so every
+ * read returned zero and the tuple's CRC could not check out.
  */
 
-// BAR0 is the backplane window; BAR2 is the PCIe core register window.
-#define APPLE_WLAN_DEVICE_BAR0_SIZE (16 * KiB)
+/*
+ * BAR0 carries the backplane windows; BAR2 is the PCIe core register window.
+ * BAR0 is 32 KiB on real parts (brcmfmac's BRCMF_PCIE_REG_MAP_SIZE), which is
+ * what makes room for the core-2 window at +0x4000. Declaring it any smaller
+ * moves BAR2 on top of that window — see the comment on the window registers.
+ */
+#define APPLE_WLAN_DEVICE_BAR0_SIZE (32 * KiB)
 #define APPLE_WLAN_DEVICE_BAR2_SIZE (4 * KiB)
 
 struct AppleWLANDeviceState {
@@ -156,16 +186,19 @@ struct AppleWLANDeviceState {
     MemoryRegion bar2;
 
     /*
-     * BAR2 and the part of BAR0 above the window are flat RAM, so that
+     * BAR2 and the parts of BAR0 outside the two windows are flat RAM, so that
      * write-then-verify sequences behave sanely instead of reading back zero.
+     * bar0_regs is indexed by raw BAR0 offset — the windowed ranges are simply
+     * never routed here, which is cheaper than tracking the holes.
      */
-    uint8_t bar0_regs[APPLE_WLAN_DEVICE_BAR0_SIZE - APPLE_WLAN_BAR0_WINDOW_SIZE];
+    uint8_t bar0_regs[APPLE_WLAN_DEVICE_BAR0_SIZE];
     uint8_t bar2_backing[APPLE_WLAN_DEVICE_BAR2_SIZE];
 
-    // Backplane address currently mapped into the low 4 KiB of BAR0, set by
-    // the guest through PCI config space (BAR0_WINDOW). Tracking it turns the
-    // otherwise opaque BAR0 offsets into real backplane addresses.
+    // Backplane addresses currently mapped by each of BAR0's two windows, set by
+    // the guest through PCI config space. Tracking them turns the otherwise
+    // opaque BAR0 offsets into real backplane addresses.
     uint32_t bar0_window;
+    uint32_t bar0_core2_window;
 
     /*
      * Backplane storage, sparse and keyed by *backplane* address rather than by
@@ -335,13 +368,34 @@ static uint8_t *apple_wlan_backplane_page(AppleWLANDeviceState *s, uint32_t addr
     return page;
 }
 
+/*
+ * Resolve a BAR0 offset to a backplane address, through whichever of the two
+ * windows covers it. Returns false for the flat register parts of BAR0.
+ */
+static bool apple_wlan_bar0_to_backplane(AppleWLANDeviceState *s, hwaddr offset,
+                                         uint32_t *backplane)
+{
+    if (offset < APPLE_WLAN_BAR0_WINDOW_SIZE) {
+        *backplane = s->bar0_window + (uint32_t)offset;
+        return true;
+    }
+    if (offset >= APPLE_WLAN_BAR0_CORE2_WINDOW_OFFSET &&
+        offset < APPLE_WLAN_BAR0_CORE2_WINDOW_OFFSET +
+                     APPLE_WLAN_BAR0_WINDOW_SIZE) {
+        *backplane = s->bar0_core2_window +
+                     (uint32_t)(offset - APPLE_WLAN_BAR0_CORE2_WINDOW_OFFSET);
+        return true;
+    }
+    return false;
+}
+
 static uint64_t apple_wlan_bar0_ops_read(void *opaque, hwaddr offset,
                                          unsigned size)
 {
     AppleWLANDeviceState *s = opaque;
     uint64_t value = 0;
-    bool windowed = offset < APPLE_WLAN_BAR0_WINDOW_SIZE;
-    uint32_t backplane = s->bar0_window + (uint32_t)offset;
+    uint32_t backplane = 0;
+    bool windowed = apple_wlan_bar0_to_backplane(s, offset, &backplane);
 
     if (windowed &&
         backplane >= APPLE_WLAN_OTP_BASE + APPLE_WLAN_OTP_CIS_OFFSET &&
@@ -384,10 +438,8 @@ static uint64_t apple_wlan_bar0_ops_read(void *opaque, hwaddr offset,
                    size);
         }
     } else {
-        uint32_t reg_off = (uint32_t)offset - APPLE_WLAN_BAR0_WINDOW_SIZE;
-
-        if (reg_off + size <= sizeof(s->bar0_regs)) {
-            memcpy(&value, s->bar0_regs + reg_off, size);
+        if (offset + size <= sizeof(s->bar0_regs)) {
+            memcpy(&value, s->bar0_regs + offset, size);
         }
     }
     if (windowed) {
@@ -401,10 +453,9 @@ static void apple_wlan_bar0_ops_write(void *opaque, hwaddr offset,
                                       uint64_t value, unsigned size)
 {
     AppleWLANDeviceState *s = opaque;
+    uint32_t backplane = 0;
 
-    if (offset < APPLE_WLAN_BAR0_WINDOW_SIZE) {
-        uint32_t backplane = s->bar0_window + (uint32_t)offset;
-
+    if (apple_wlan_bar0_to_backplane(s, offset, &backplane)) {
         if (backplane == APPLE_WLAN_CHIPCOMMON_BASE +
                              APPLE_WLAN_CC_SROM_CONTROL) {
             s->cc_srom_control = (uint32_t)value;
@@ -430,10 +481,8 @@ static void apple_wlan_bar0_ops_write(void *opaque, hwaddr offset,
         }
         trace_apple_wlan_backplane_write(backplane, offset, size, value);
     } else {
-        uint32_t reg_off = (uint32_t)offset - APPLE_WLAN_BAR0_WINDOW_SIZE;
-
-        if (reg_off + size <= sizeof(s->bar0_regs)) {
-            memcpy(s->bar0_regs + reg_off, &value, size);
+        if (offset + size <= sizeof(s->bar0_regs)) {
+            memcpy(s->bar0_regs + offset, &value, size);
         }
     }
     trace_apple_wlan_bar0_write(offset, size, value);
@@ -530,12 +579,21 @@ static void apple_wlan_device_pci_realize(PCIDevice *dev, Error **errp)
 static void apple_wlan_device_qdev_reset_hold(Object *obj, ResetType type)
 {
     PCIDevice *dev = PCI_DEVICE(obj);
+    AppleWLANDeviceState *s = APPLE_WLAN_DEVICE(dev);
 
     pci_set_word(dev->config + PCI_COMMAND,
                  PCI_COMMAND_MEMORY | PCI_COMMAND_MASTER);
+    s->bar0_window = 0;
+    s->bar0_core2_window = APPLE_WLAN_BAR0_CORE2_WINDOW_RESET;
 }
 
-// Track BAR0_WINDOW so BAR0 accesses can be resolved to backplane addresses.
+/*
+ * Track both BAR0 window registers so BAR0 accesses can be resolved to backplane
+ * addresses. The core-2 window register overlaps the PCI Express capability, so
+ * pci_default_write_config() treats it as read-only and drops the value; capture
+ * it here regardless, since the guest's window writes are what give the BAR0
+ * offsets meaning.
+ */
 static void apple_wlan_device_config_write(PCIDevice *dev, uint32_t addr,
                                            uint32_t val, int len)
 {
@@ -543,9 +601,19 @@ static void apple_wlan_device_config_write(PCIDevice *dev, uint32_t addr,
 
     pci_default_write_config(dev, addr, val, len);
 
-    if (addr == APPLE_WLAN_BAR0_WINDOW_CFG && len == 4) {
-        s->bar0_window = val;
-        trace_apple_wlan_bar0_window(val);
+    if (len == 4) {
+        switch (addr) {
+        case APPLE_WLAN_BAR0_WINDOW_CFG:
+            s->bar0_window = val;
+            trace_apple_wlan_bar0_window(val);
+            break;
+        case APPLE_WLAN_BAR0_CORE2_WINDOW_CFG:
+            s->bar0_core2_window = val;
+            trace_apple_wlan_bar0_core2_window(val);
+            break;
+        default:
+            break;
+        }
     }
 }
 
