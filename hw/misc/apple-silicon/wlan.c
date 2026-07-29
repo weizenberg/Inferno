@@ -192,13 +192,26 @@ static const struct {
  */
 
 /*
- * BAR0 carries the backplane windows; BAR2 is the PCIe core register window.
+ * BAR0 carries the backplane windows; BAR2 is the chip's TCM (tightly-coupled
+ * memory) aperture, which is where the firmware image is actually written.
  * BAR0 is 32 KiB on real parts (brcmfmac's BRCMF_PCIE_REG_MAP_SIZE), which is
  * what makes room for the core-2 window at +0x4000. Declaring it any smaller
  * moves BAR2 on top of that window — see the comment on the window registers.
+ *
+ * BAR2 has to be big enough for the image the driver lays out. With the real
+ * n104 firmware it reports:
+ *
+ *   loadImage: Chip RAM: 0 [ 0< firmware{1317617} >1317617
+ *       | 1317624 ~ 1317624< free{565456} >1883080
+ *       | 1883344< nvram{8998} >1892342 | ... ] 1892352
+ *
+ * i.e. 1,892,352 bytes, so 2 MiB is the smallest power-of-two BAR that fits.
+ * At 4 KiB the firmware download had nowhere to go.
  */
 #define APPLE_WLAN_DEVICE_BAR0_SIZE (32 * KiB)
-#define APPLE_WLAN_DEVICE_BAR2_SIZE (4 * KiB)
+#define APPLE_WLAN_DEVICE_BAR2_SIZE (2 * MiB)
+// One trace line per this many bytes written to the TCM, instead of per access.
+#define APPLE_WLAN_TCM_LOG_STRIDE (256 * KiB)
 
 struct AppleWLANDeviceState {
     PCIDevice parent_obj;
@@ -212,13 +225,15 @@ struct AppleWLANDeviceState {
     MemoryRegion bar2;
 
     /*
-     * BAR2 and the parts of BAR0 outside the two windows are flat RAM, so that
+     * BAR2 and the parts of BAR0 outside the windows are flat RAM, so that
      * write-then-verify sequences behave sanely instead of reading back zero.
      * bar0_regs is indexed by raw BAR0 offset — the windowed ranges are simply
-     * never routed here, which is cheaper than tracking the holes.
+     * never routed here, which is cheaper than tracking the holes. bar2_backing
+     * is the TCM and is heap-allocated rather than inline, being megabytes.
      */
     uint8_t bar0_regs[APPLE_WLAN_DEVICE_BAR0_SIZE];
-    uint8_t bar2_backing[APPLE_WLAN_DEVICE_BAR2_SIZE];
+    uint8_t *bar2_backing;
+    uint64_t tcm_written_bytes;
 
     // Backplane addresses currently mapped by each of BAR0's two windows, set by
     // the guest through PCI config space. Tracking them turns the otherwise
@@ -554,10 +569,9 @@ static uint64_t apple_wlan_bar2_ops_read(void *opaque, hwaddr offset,
     AppleWLANDeviceState *s = opaque;
     uint64_t value = 0;
 
-    if (offset + size <= sizeof(s->bar2_backing)) {
+    if (offset + size <= APPLE_WLAN_DEVICE_BAR2_SIZE) {
         memcpy(&value, s->bar2_backing + offset, size);
     }
-    trace_apple_wlan_bar2_read(offset, size, value);
     return value;
 }
 
@@ -565,11 +579,21 @@ static void apple_wlan_bar2_ops_write(void *opaque, hwaddr offset,
                                       uint64_t value, unsigned size)
 {
     AppleWLANDeviceState *s = opaque;
+    uint64_t before = s->tcm_written_bytes;
 
-    if (offset + size <= sizeof(s->bar2_backing)) {
-        memcpy(s->bar2_backing + offset, &value, size);
+    if (offset + size > APPLE_WLAN_DEVICE_BAR2_SIZE) {
+        return;
     }
-    trace_apple_wlan_bar2_write(offset, size, value);
+    memcpy(s->bar2_backing + offset, &value, size);
+    s->tcm_written_bytes += size;
+    /*
+     * The firmware is over a megabyte, so trace progress rather than every
+     * access — a per-access event here buries everything else in the log.
+     */
+    if (before / APPLE_WLAN_TCM_LOG_STRIDE !=
+        s->tcm_written_bytes / APPLE_WLAN_TCM_LOG_STRIDE) {
+        trace_apple_wlan_tcm_written(s->tcm_written_bytes, offset);
+    }
 }
 
 #define APPLE_WLAN_BAR_OPS(_name) \
@@ -599,6 +623,7 @@ static void apple_wlan_device_pci_realize(PCIDevice *dev, Error **errp)
     pci_set_word(pci_conf + PCI_SUBSYSTEM_VENDOR_ID, APPLE_WLAN_SUBVENDOR_ID);
     pci_set_word(pci_conf + PCI_SUBSYSTEM_ID, APPLE_WLAN_SUBDEVICE_ID);
 
+    s->bar2_backing = g_malloc0(APPLE_WLAN_DEVICE_BAR2_SIZE);
     s->backplane = g_hash_table_new_full(g_direct_hash, g_direct_equal, NULL,
                                         g_free);
     s->written_hash = APPLE_WLAN_FNV_OFFSET;
@@ -708,6 +733,7 @@ static void apple_wlan_device_pci_uninit(PCIDevice *dev)
     AppleWLANDeviceState *s = APPLE_WLAN_DEVICE(dev);
 
     g_clear_pointer(&s->backplane, g_hash_table_unref);
+    g_clear_pointer(&s->bar2_backing, g_free);
     pcie_aer_exit(dev);
     pcie_cap_exit(dev);
     msi_uninit(dev);
