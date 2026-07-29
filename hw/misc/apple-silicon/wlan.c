@@ -205,11 +205,27 @@ static const struct {
  *       | 1317624 ~ 1317624< free{565456} >1883080
  *       | 1883344< nvram{8998} >1892342 | ... ] 1892352
  *
- * i.e. 1,892,352 bytes, so 2 MiB is the smallest power-of-two BAR that fits.
- * At 4 KiB the firmware download had nowhere to go.
+ * i.e. 1,892,352 bytes of content. Sizing the BAR to just fit that (2 MiB) is
+ * NOT enough: the driver maps the whole TCM aperture up front, and if the map is
+ * larger than the BAR it fails, leaving a null base. AppleBCMWLANChipMemory::write
+ * then stores straight through it —
+ *
+ *     v17 = (_QWORD *)(a1 + 24LL * a2 + 48);        // region descriptor
+ *     *(_QWORD *)(*v17 + 8 * v20) = ...;            // no null check
+ *
+ * — so the guest takes a kernel data abort on the first 64-bit store. That is
+ * what a too-small BAR2 looks like from outside: a panic in ChipMemory::write,
+ * not a short write.
+ *
+ * The size is set by where in the aperture the driver actually writes, not by the
+ * size of the content. Measured, the firmware write region begins at
+ * bar2+0x351fdc (3.48 MiB), so with the 1,892,352-byte layout on top it reaches
+ * 0x51ffdc, i.e. 5.12 MiB. 2 MiB paniced on the first store and 4 MiB paniced
+ * after 524,288 bytes with the last write at bar2+0x3d1fdc, both at this same
+ * instruction. 8 MiB is the next power of two that contains it.
  */
 #define APPLE_WLAN_DEVICE_BAR0_SIZE (32 * KiB)
-#define APPLE_WLAN_DEVICE_BAR2_SIZE (2 * MiB)
+#define APPLE_WLAN_DEVICE_BAR2_SIZE (8 * MiB)
 // One trace line per this many bytes written to the TCM, instead of per access.
 #define APPLE_WLAN_TCM_LOG_STRIDE (256 * KiB)
 
