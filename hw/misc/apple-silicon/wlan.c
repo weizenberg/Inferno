@@ -586,6 +586,12 @@ static const struct {
 } apple_wlan_int_iovars[] = {
     { "event_log_max_sets", 8 },
     { "mpc", 0 },
+    /*
+     * Scan home-away time in milliseconds. initDefaultScanParametersFromChip
+     * reads it into a plain int and only stores and logs it, but refusing it
+     * fails setupDriver ("Failure to get default Home Away Time").
+     */
+    { "scan_home_away_time", 100 },
 };
 
 /*
