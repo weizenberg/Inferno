@@ -244,9 +244,47 @@ struct AppleWLANDeviceState {
  * have to be "key=value" text. The guest image names the keys for us --
  * its NVRAM file is P-moana_M-GODF_V-m__m-4.3.txt, i.e. P=platform,
  * M=module, V=vendor. Model identity only; no calibration or MAC.
+ *
+ * Two further rules, from AppleBCMWLANCore::{generateFileName,copyKeys}, decide
+ * how these strings become firmware paths:
+ *
+ *   - A slot string holds *several* pairs separated by spaces; copyKeys() breaks
+ *     on 0x20. So one slot carries a whole group, not a single key.
+ *   - copyKeys() selects by the *case* of the key letter: it is called twice,
+ *     first taking only UPPERCASE keys and then only lowercase ones, and the two
+ *     results are joined with a literal "__". That is what produces Apple's
+ *     `C-4378__s-B1` (uppercase group `C=4378`, lowercase group `s=B1`) and
+ *     `P-moana_M-GODF_V-m__m-4.3` (uppercase `P`/`M`/`V`, lowercase `m`).
+ *
+ * Which slot is which is not guesswork -- getModuleInfo() publishes them by
+ * fixed offset:
+ *
+ *     setObject("ChipInfo",   *((_QWORD *)this + 25));   // 25*8 = 0xC8
+ *     setObject("ModuleInfo", *((_QWORD *)this + 26));   // 26*8 = 0xD0
+ *
+ * and against the slot order above that makes ChipInfo the *third* string and
+ * ModuleInfo the *fourth*. Confirmed: a tuple of "P=moana", "M=GODF", "V=m"
+ * put "V=m" third and generated the directory `C-4378_V-m__`, and moving `s=B1`
+ * into the third slot changed it to `C-4378__s-B1`, matching the image.
+ *
+ * Every slot is also parsed into the shared key/value dictionary, so a key may
+ * be repeated across slots and stay available to publishHWIdentifiers().
+ *
+ * ModuleInfo (the fourth slot) supplies the NVRAM leaf, as copyKeys() over it:
+ * uppercase group, "__", lowercase group. But it must **not** contain a `P=`
+ * pair, because generateFileName() gates on exactly that:
+ *
+ *     if ( strnstr(ModuleInfo, "P=", 0xFF) != nullptr )
+ *         goto LABEL_32;      // skips appending the module-instance
+ *
+ * and the skipped block is what appends the platform name to the *firmware*
+ * buffer (this+3192). Put `P=` in ModuleInfo and the NVRAM name comes out right
+ * while FW/CLM/Tx Cap lose their leaf entirely (`.trx`, `.clmb`, `.txcb`).
+ * So the platform belongs in the module-instance property and only the module,
+ * vendor and revision keys belong here.
  */
 static const char apple_wlan_otp_identity[] =
-    "\x01\x00" "P=moana\0M=GODF\0V=m\0";
+    "\x01\x00" "P=moana\0M=GODF\0s=B1\0M=GODF V=m m=4.3\0";
 
 static void apple_wlan_build_otp(AppleWLANDeviceState *s, const uint8_t *table)
 {
