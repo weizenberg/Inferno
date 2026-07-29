@@ -48,3 +48,6 @@ apple_wlan_event_buf_post(uint64_t addr, uint16_t len, unsigned count) "event bu
 apple_wlan_event_no_buf(uint32_t event_type) "cannot deliver event %u: no posted buffer big enough"
 apple_wlan_post_event(uint32_t event_type, uint32_t status, uint64_t addr, uint16_t len) "event %u status %u -> buf 0x%" PRIx64 " len %u"
 apple_wlan_escan_result(uint16_t sync_id, const char *ssid) "escan complete, sync id %u, reporting \"%s\""
+apple_wlan_join(const char *ssid, uint16_t bssid_cnt, uint32_t chanspec_num) "join \"%s\": %u candidate BSSIDs, %u chanspecs"
+apple_wlan_join_short(uint16_t in_len) "WLC_SET_SSID payload too short: %u bytes"
+apple_wlan_join_unknown(const char *ssid) "refusing join of unknown network \"%s\""

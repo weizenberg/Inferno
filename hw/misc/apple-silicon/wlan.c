@@ -672,8 +672,21 @@ static const struct {
 #define APPLE_WLAN_EVM_DATALEN (20)
 #define APPLE_WLAN_EVM_IFNAME (30)
 
+/*
+ * Event codes, from the driver's own WLC_E_* name table (a contiguous string
+ * block in the kernelcache starting at WLC_E_SET_SSID = 0). ESCAN_RESULT lands
+ * on 69 by that counting, which is what makes the rest trustworthy.
+ */
+#define APPLE_WLAN_WLC_E_SET_SSID (0)
+#define APPLE_WLAN_WLC_E_AUTH (3)
+#define APPLE_WLAN_WLC_E_ASSOC (7)
+#define APPLE_WLAN_WLC_E_LINK (16)
 #define APPLE_WLAN_WLC_E_ESCAN_RESULT (69)
 #define APPLE_WLAN_WLC_E_STATUS_SUCCESS (0)
+// handleSetSSID names this one: "the Association Scan (FW) did not find SSID".
+#define APPLE_WLAN_WLC_E_STATUS_NO_NETWORKS (3)
+// wl_event_msg_t flags. Bit 0 on a LINK event is the link coming up.
+#define APPLE_WLAN_WLC_EVENT_MSG_LINK (0x01)
 
 /*
  * The escan request and its result. eventScanComplete matches the sync_id it
@@ -1799,7 +1812,8 @@ static void apple_wlan_handle_event_buf_post(AppleWLANDeviceState *s,
  * seconds.
  */
 static bool apple_wlan_post_event(AppleWLANDeviceState *s, uint32_t event_type,
-                                  uint32_t status, uint8_t ifidx,
+                                  uint32_t status, uint16_t flags,
+                                  const uint8_t *event_addr, uint8_t ifidx,
                                   const uint8_t *data, uint16_t datalen)
 {
     uint8_t pkt[APPLE_WLAN_EV_TOTAL + APPLE_WLAN_EVENT_DATA_MAX] = { 0 };
@@ -1839,13 +1853,19 @@ static bool apple_wlan_post_event(AppleWLANDeviceState *s, uint32_t event_type,
 
     // Every multi-byte field here is big-endian; the driver byte-swaps them.
     stw_be_p(evm + APPLE_WLAN_EVM_VERSION, APPLE_WLAN_EVENT_MSG_VERSION);
-    stw_be_p(evm + APPLE_WLAN_EVM_FLAGS, 0);
+    stw_be_p(evm + APPLE_WLAN_EVM_FLAGS, flags);
     stl_be_p(evm + APPLE_WLAN_EVM_EVENT_TYPE, event_type);
     stl_be_p(evm + APPLE_WLAN_EVM_STATUS, status);
     stl_be_p(evm + APPLE_WLAN_EVM_REASON, 0);
     stl_be_p(evm + APPLE_WLAN_EVM_AUTH_TYPE, 0);
     stl_be_p(evm + APPLE_WLAN_EVM_DATALEN, datalen);
-    memcpy(evm + 24, apple_wlan_event_mac, APPLE_WLAN_MAC_LEN);
+    /*
+     * addr. The join handlers match it against the candidate BSSIDs they asked
+     * to join (handleAuth verifyBSSID, handleSetSSID's memcmp over the
+     * candidate array), so an association event has to name the AP, not the
+     * station.
+     */
+    memcpy(evm + 24, event_addr, APPLE_WLAN_MAC_LEN);
     // ifname, NUL-padded within its 16 bytes (pkt is already zeroed).
     memcpy(evm + APPLE_WLAN_EVM_IFNAME, "wl0", sizeof("wl0"));
     evm[46] = ifidx;
@@ -1871,6 +1891,90 @@ static bool apple_wlan_post_event(AppleWLANDeviceState *s, uint32_t event_type,
                                 APPLE_WLAN_EV_DMA_OFF + pktlen -
                                     APPLE_WLAN_EV_LEN_BIAS);
     return apple_wlan_d2h_post(s, cmplt);
+}
+
+/*
+ * Answer a join. AppleBCMWLANJoinManager::join builds a wl_join_params_t and
+ * pushes it with WLC_SET_SSID, then waits for the firmware to report what
+ * happened; the ioctl completion alone is only an acknowledgement, so without
+ * events the join times out in timeoutJoin. The sequence and the fields each
+ * handler reads come from the driver itself:
+ *
+ *   handleAuth      verifyBSSID(addr) then status; status 6 is ignored outright
+ *   handleAssoc     same shape
+ *   handleSetSSID   walks its candidate array comparing addr, then status --
+ *                   status 3 is "the Association Scan (FW) did not find SSID"
+ *   handleLink      (Core) flags bit 0 is the link coming up
+ *
+ * So every event has to name the AP's BSSID in addr, not the station MAC, and
+ * carry status 0. This is an open network -- APPLE_WLAN_BSS_CAPABILITY has no
+ * privacy bit -- so there is no supplicant exchange to model and no PSK_SUP.
+ *
+ * wl_join_params_t is wlc_ssid_t { u32 len; u8 ssid[32] } followed by
+ * wl_assoc_params_t { ether_addr bssid; s16 bssid_cnt; s32 chanspec_num;
+ * chanspec_t chanspec_list[] }, which is what join fills: SSID length at +0,
+ * the name at +4, bssid_cnt at +42, and the chanspec list from +48 with the
+ * candidate BSSIDs packed after it.
+ */
+#define APPLE_WLAN_WLC_SET_SSID (26)
+#define APPLE_WLAN_JOIN_SSID_LEN_OFF (0)
+#define APPLE_WLAN_JOIN_SSID_OFF (4)
+#define APPLE_WLAN_JOIN_SSID_MAX (32)
+#define APPLE_WLAN_JOIN_BSSID_OFF (36)
+#define APPLE_WLAN_JOIN_BSSID_CNT_OFF (42)
+#define APPLE_WLAN_JOIN_CHANSPEC_NUM_OFF (44)
+#define APPLE_WLAN_JOIN_CHANSPEC_OFF (48)
+
+static void apple_wlan_handle_join(AppleWLANDeviceState *s, uint64_t in_addr,
+                                   uint16_t in_len, uint8_t ifidx)
+{
+    uint8_t params[APPLE_WLAN_JOIN_CHANSPEC_OFF] = { 0 };
+    char ssid[APPLE_WLAN_JOIN_SSID_MAX + 1] = { 0 };
+    uint32_t ssid_len;
+    uint16_t bssid_cnt;
+
+    if (in_addr == 0 || in_len < sizeof(params)) {
+        trace_apple_wlan_join_short(in_len);
+        return;
+    }
+    if (pci_dma_read(PCI_DEVICE(s), in_addr, params, sizeof(params)) !=
+        MEMTX_OK) {
+        trace_apple_wlan_ring_dma_fail(in_addr);
+        return;
+    }
+    ssid_len = ldl_le_p(params + APPLE_WLAN_JOIN_SSID_LEN_OFF);
+    bssid_cnt = lduw_le_p(params + APPLE_WLAN_JOIN_BSSID_CNT_OFF);
+    memcpy(ssid, params + APPLE_WLAN_JOIN_SSID_OFF,
+           MIN(ssid_len, APPLE_WLAN_JOIN_SSID_MAX));
+    trace_apple_wlan_join(ssid, bssid_cnt,
+                          ldl_le_p(params + APPLE_WLAN_JOIN_CHANSPEC_NUM_OFF));
+
+    /*
+     * Only this one network exists. Joining anything else has to fail, and the
+     * honest failure is the one the driver already has a message for: status 3,
+     * "the Association Scan (FW) did not find SSID".
+     */
+    if (ssid_len != strlen(APPLE_WLAN_SSID) ||
+        memcmp(ssid, APPLE_WLAN_SSID, ssid_len) != 0) {
+        trace_apple_wlan_join_unknown(ssid);
+        apple_wlan_post_event(s, APPLE_WLAN_WLC_E_SET_SSID,
+                              APPLE_WLAN_WLC_E_STATUS_NO_NETWORKS, 0,
+                              apple_wlan_bssid, ifidx, NULL, 0);
+        return;
+    }
+
+    apple_wlan_post_event(s, APPLE_WLAN_WLC_E_AUTH,
+                          APPLE_WLAN_WLC_E_STATUS_SUCCESS, 0, apple_wlan_bssid,
+                          ifidx, NULL, 0);
+    apple_wlan_post_event(s, APPLE_WLAN_WLC_E_ASSOC,
+                          APPLE_WLAN_WLC_E_STATUS_SUCCESS, 0, apple_wlan_bssid,
+                          ifidx, NULL, 0);
+    apple_wlan_post_event(
+        s, APPLE_WLAN_WLC_E_LINK, APPLE_WLAN_WLC_E_STATUS_SUCCESS,
+        APPLE_WLAN_WLC_EVENT_MSG_LINK, apple_wlan_bssid, ifidx, NULL, 0);
+    apple_wlan_post_event(s, APPLE_WLAN_WLC_E_SET_SSID,
+                          APPLE_WLAN_WLC_E_STATUS_SUCCESS, 0, apple_wlan_bssid,
+                          ifidx, NULL, 0);
 }
 
 static void apple_wlan_handle_ioctl(AppleWLANDeviceState *s,
@@ -1994,8 +2098,12 @@ static void apple_wlan_handle_ioctl(AppleWLANDeviceState *s,
         stl_le_p(bss + APPLE_WLAN_BSS_IE_LENGTH_OFF, 0);
         trace_apple_wlan_escan_result(sync_id, APPLE_WLAN_SSID);
         apple_wlan_post_event(s, APPLE_WLAN_WLC_E_ESCAN_RESULT,
-                              APPLE_WLAN_WLC_E_STATUS_SUCCESS, item[1], res,
-                              sizeof(res));
+                              APPLE_WLAN_WLC_E_STATUS_SUCCESS, 0,
+                              apple_wlan_event_mac, item[1], res, sizeof(res));
+    }
+
+    if (cmd == APPLE_WLAN_WLC_SET_SSID) {
+        apple_wlan_handle_join(s, in_addr, in_len, item[1]);
     }
 }
 
