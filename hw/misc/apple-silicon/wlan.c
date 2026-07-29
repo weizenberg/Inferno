@@ -724,14 +724,35 @@ static const struct {
  *   +116  ie_offset  u16, must be at least the struct size
  *   +120  ie_length  u32
  *
- * processScanResults refuses anything at or below 0x7B bytes ("Not enough space
- * in the data buffer for bss_ino"), so the struct is 124 bytes.
+ * The sizes are not guessed. eventScanComplete and processScanResults between
+ * them state every constraint, and 124 was only ever a lower bound:
+ *
+ *   eventScanComplete, on the wl_event_msg_t (payload starts at +48, so the
+ *   offsets below are the result header's own):
+ *     status  (+8)   must be 8, or the payload is not looked at at all
+ *     datalen (+20)  must be > 0x90 -- strictly greater, so 12 + 132 = 144 is
+ *                    one byte short and still logs "wle->datalen 144 is less
+ *                    than wl_escan_result_t 144"
+ *     bss_count (result +10) must be 1
+ *     buflen  (result +0) is passed to processScanResults as the size of the
+ *                    *BSS data*, not of the whole result
+ *
+ *   processScanResults(size = buflen) rejects:
+ *     size <= 0x7B                    "Not enough space ... for bss_ino"
+ *     size < bss->length              "... for bss len"
+ *     ie_offset - 1 <= 0x7A           "ie_offset is less than size of bss"
+ *     size < ie_offset + ie_length    "... for ie_offset + ie_len"
+ *
+ * A 136-byte entry satisfies all of them with the payload at 148 > 144:
+ * buflen 136, length 136, ie_offset 136, ie_length 0. brcmfmac's
+ * brcmf_bss_info_le comes to 128 with these same field offsets, so Apple's
+ * build carries a few bytes more; they sit past SNR at +124 and are left zero.
  *
  * The BSSID is locally administered (bit 1 of the first octet) and the SSID
  * says what this is. Both are invented for the emulator -- there is no radio
  * and nothing here was read off any real network.
  */
-#define APPLE_WLAN_BSS_LEN (124)
+#define APPLE_WLAN_BSS_LEN (136)
 #define APPLE_WLAN_BSS_VERSION_OFF (0)
 #define APPLE_WLAN_BSS_LENGTH_OFF (4)
 #define APPLE_WLAN_BSS_BSSID_OFF (8)
@@ -2087,7 +2108,13 @@ static void apple_wlan_handle_ioctl(AppleWLANDeviceState *s,
                 sync_id = le16_to_cpu(raw);
             }
         }
-        stl_le_p(res + APPLE_WLAN_ESCAN_RES_BUFLEN_OFF, sizeof(res));
+        /*
+         * buflen is the size of the BSS data that follows the header, not of
+         * the whole result: eventScanComplete passes it straight to
+         * processScanResults as that buffer's size, alongside a pointer to
+         * header + 12.
+         */
+        stl_le_p(res + APPLE_WLAN_ESCAN_RES_BUFLEN_OFF, APPLE_WLAN_BSS_LEN);
         stl_le_p(res + APPLE_WLAN_ESCAN_RES_VERSION_OFF,
                  APPLE_WLAN_ESCAN_VERSION);
         stw_le_p(res + APPLE_WLAN_ESCAN_RES_SYNC_ID_OFF, sync_id);
@@ -2117,8 +2144,7 @@ static void apple_wlan_handle_ioctl(AppleWLANDeviceState *s,
 
         // Then close the scan. Same header, no entries; the sync_id still has
         // to be there because that is what eventScanComplete matches on.
-        stl_le_p(res + APPLE_WLAN_ESCAN_RES_BUFLEN_OFF,
-                 APPLE_WLAN_ESCAN_RES_LEN);
+        stl_le_p(res + APPLE_WLAN_ESCAN_RES_BUFLEN_OFF, 0);
         stw_le_p(res + APPLE_WLAN_ESCAN_RES_BSS_COUNT_OFF, 0);
         apple_wlan_post_event(
             s, APPLE_WLAN_WLC_E_ESCAN_RESULT, APPLE_WLAN_WLC_E_STATUS_SUCCESS,
