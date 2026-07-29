@@ -1365,25 +1365,32 @@ static void apple_wlan_handle_ioctl(AppleWLANDeviceState *s,
 
     cap = MIN(out_len, sizeof(payload));
     resp_len = apple_wlan_ioctl_response(cmd, name, payload, cap, &status);
-    if (resp_len != 0 && s->ioctl_resp_count != 0) {
-        // The payload goes into a buffer the driver posted, not into the ring.
+    /*
+     * Every completion consumes one posted response buffer, whatever the status.
+     * The driver looks the buffer up by its resource id and removes it from the
+     * table it was registered in, so a completion that names anything else --
+     * the request's own resource id, say, which belongs to the Tx table -- is
+     * rejected outright with "Rx IO not found for resourceID N". Refusing an
+     * iovar is still an answer, and it still has to give the buffer back.
+     */
+    if (s->ioctl_resp_count != 0) {
         uint64_t addr = s->ioctl_resp_buf[s->ioctl_resp_head].addr;
         uint16_t len = MIN(resp_len, s->ioctl_resp_buf[s->ioctl_resp_head].len);
 
         buf_request_id = s->ioctl_resp_buf[s->ioctl_resp_head].request_id;
         have_buf_request_id = true;
-
-        if (pci_dma_write(PCI_DEVICE(s), addr, payload, len) != MEMTX_OK) {
+        if (len != 0 &&
+            pci_dma_write(PCI_DEVICE(s), addr, payload, len) != MEMTX_OK) {
             trace_apple_wlan_ring_dma_fail(addr);
             status = APPLE_WLAN_BCME_UNSUPPORTED;
-            resp_len = 0;
-        } else {
-            resp_len = len;
+            len = 0;
         }
+        resp_len = len;
         s->ioctl_resp_head =
             (s->ioctl_resp_head + 1) % APPLE_WLAN_IOCTL_RESP_BUFS;
         s->ioctl_resp_count--;
-    } else if (resp_len != 0) {
+    } else {
+        // Nothing to answer into, and nothing valid to name.
         trace_apple_wlan_ioctl_no_buf(cmd);
         status = APPLE_WLAN_BCME_UNSUPPORTED;
         resp_len = 0;
