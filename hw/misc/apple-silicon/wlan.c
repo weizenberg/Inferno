@@ -228,6 +228,20 @@ static const struct {
 #define APPLE_WLAN_DEVICE_BAR2_SIZE (8 * MiB)
 // One trace line per this many bytes written to the TCM, instead of per access.
 #define APPLE_WLAN_TCM_LOG_STRIDE (256 * KiB)
+/*
+ * AI (AXI interconnect) wrapper registers, at the wrapper's 4 KiB page. Wrapper
+ * space begins at 0x18100000 — every core the driver visits is below that.
+ */
+#define APPLE_WLAN_WRAPPER_BASE (0x18100000)
+#define APPLE_WLAN_AI_IOCTRL (0x408)
+#define APPLE_WLAN_AI_RESETCTRL (0x800)
+#define APPLE_WLAN_AI_RESETSTATUS (0x804)
+/*
+ * Written into the firmware-alive marker when the core is released. Any value
+ * that is neither the host's signature nor 0xFFFFFFFF satisfies the driver; zero
+ * is what a firmware that had consumed the host's pointer would plausibly leave.
+ */
+#define APPLE_WLAN_FW_ALIVE_MARKER (0)
 
 struct AppleWLANDeviceState {
     PCIDevice parent_obj;
@@ -250,6 +264,13 @@ struct AppleWLANDeviceState {
     uint8_t bar0_regs[APPLE_WLAN_DEVICE_BAR0_SIZE];
     uint8_t *bar2_backing;
     uint64_t tcm_written_bytes;
+    // See apple_wlan_bar2_ops_read(): identifying the firmware-alive marker from
+    // the driver's own poll of it, rather than guessing its address.
+    bool arm_core_released;
+    bool tcm_marker_done;
+    uint32_t tcm_marker_offset;
+    uint32_t tcm_last_read_offset;
+    bool tcm_last_read_valid;
 
     // Backplane addresses currently mapped by each of BAR0's two windows, set by
     // the guest through PCI config space. Tracking them turns the otherwise
@@ -540,6 +561,25 @@ static uint64_t apple_wlan_bar0_ops_read(void *opaque, hwaddr offset,
     return value;
 }
 
+/*
+ * The chip's ARM core is taken out of reset by clearing bit 0 of the AI wrapper's
+ * RESETCTRL. There is no core here to run the downloaded firmware, so note the
+ * release and let the read path stand in for the one thing the driver checks to
+ * decide whether it booted — see apple_wlan_bar2_ops_read().
+ *
+ * This is where the model stops being a passive device and starts impersonating
+ * running firmware. Everything past it is protocol, not plumbing.
+ */
+static void apple_wlan_release_arm_core(AppleWLANDeviceState *s)
+{
+    if (s->tcm_written_bytes == 0 || s->arm_core_released) {
+        return;
+    }
+    s->arm_core_released = true;
+    s->tcm_last_read_valid = false;
+    trace_apple_wlan_arm_core_released(s->tcm_written_bytes);
+}
+
 static void apple_wlan_bar0_ops_write(void *opaque, hwaddr offset,
                                       uint64_t value, unsigned size)
 {
@@ -547,6 +587,16 @@ static void apple_wlan_bar0_ops_write(void *opaque, hwaddr offset,
     uint32_t backplane = 0;
 
     if (apple_wlan_bar0_to_backplane(s, offset, &backplane)) {
+        /*
+         * Wrapper space starts at 0x18100000; the cores the driver visits all sit
+         * below it. A RESETCTRL deassert there is the core coming up.
+         */
+        if (backplane >= APPLE_WLAN_WRAPPER_BASE &&
+            (backplane & (APPLE_WLAN_BACKPLANE_PAGE_SIZE - 1)) ==
+                APPLE_WLAN_AI_RESETCTRL &&
+            (value & 1) == 0) {
+            apple_wlan_release_arm_core(s);
+        }
         if (backplane == APPLE_WLAN_CHIPCOMMON_BASE +
                              APPLE_WLAN_CC_SROM_CONTROL) {
             s->cc_srom_control = (uint32_t)value;
@@ -585,9 +635,33 @@ static uint64_t apple_wlan_bar2_ops_read(void *opaque, hwaddr offset,
     AppleWLANDeviceState *s = opaque;
     uint64_t value = 0;
 
-    if (offset + size <= APPLE_WLAN_DEVICE_BAR2_SIZE) {
-        memcpy(&value, s->bar2_backing + offset, size);
+    if (offset + size > APPLE_WLAN_DEVICE_BAR2_SIZE) {
+        return 0;
     }
+    /*
+     * Stand in for firmware having booted. Once the ARM core has been released,
+     * the driver polls the last word of chip RAM every 10 ms for ~4.8 s and
+     * requires it to become something that is neither the signature it wrote there
+     * nor 0xFFFFFFFF; otherwise it logs "last 4 bytes in WiFi chip RAM does not
+     * change after init!" and fails with "Chip Init failure".
+     *
+     * The marker's address is not guessed: the poll identifies it. A repeated
+     * 32-bit read of one offset after the core came up is that poll, so the second
+     * such read is answered as a live firmware would have, once.
+     */
+    if (s->arm_core_released && !s->tcm_marker_done && size == 4) {
+        if (s->tcm_last_read_valid && s->tcm_last_read_offset == offset) {
+            stl_le_p(s->bar2_backing + offset, APPLE_WLAN_FW_ALIVE_MARKER);
+            s->tcm_marker_done = true;
+            s->tcm_marker_offset = (uint32_t)offset;
+            trace_apple_wlan_fw_alive_marker((uint32_t)offset,
+                                             APPLE_WLAN_FW_ALIVE_MARKER,
+                                             s->tcm_written_bytes);
+        }
+        s->tcm_last_read_offset = (uint32_t)offset;
+        s->tcm_last_read_valid = true;
+    }
+    memcpy(&value, s->bar2_backing + offset, size);
     return value;
 }
 
@@ -602,6 +676,23 @@ static void apple_wlan_bar2_ops_write(void *opaque, hwaddr offset,
     }
     memcpy(s->bar2_backing + offset, &value, size);
     s->tcm_written_bytes += size;
+    /*
+     * The driver retries the whole bring-up on failure, rewriting the signature
+     * and polling again, so the stand-in has to re-arm. A write covering the word
+     * it last answered means a fresh attempt is under way.
+     *
+     * Forget the last-read offset at the same time. Two reads of this word want
+     * opposite answers: loadImage() verifies it still holds the host's signature
+     * ("NVRAM Location Mismatch @ %u: host 0x%X, chip 0x%X" if not), and only the
+     * later poll in loadChipImage() wants it changed. Carrying a stale offset over
+     * from the previous pass made the very first verify read look like a repeat and
+     * answered it with the marker.
+     */
+    if (s->tcm_marker_done && offset <= s->tcm_marker_offset &&
+        s->tcm_marker_offset < offset + size) {
+        s->tcm_marker_done = false;
+        s->tcm_last_read_valid = false;
+    }
     /*
      * The firmware is over a megabyte, so trace progress rather than every
      * access — a per-access event here buries everything else in the log.
