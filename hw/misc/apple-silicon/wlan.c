@@ -237,11 +237,57 @@ static const struct {
 #define APPLE_WLAN_AI_RESETCTRL (0x800)
 #define APPLE_WLAN_AI_RESETSTATUS (0x804)
 /*
- * Written into the firmware-alive marker when the core is released. Any value
- * that is neither the host's signature nor 0xFFFFFFFF satisfies the driver; zero
- * is what a firmware that had consumed the host's pointer would plausibly leave.
+ * The word at the end of chip RAM is not a liveness flag: createFirmwarePCIeIPC()
+ * reads it as the *backplane address of the firmware's shared-memory structure*
+ * and validates it against the chip RAM window --
+ *
+ *     v114 = ramBase; v115 = addr - v114; v116 = ramSize;
+ *     if (addr == -1)                       -> "Failed to read shared memory address"
+ *     if (addr < v114 || v114 + v116 <= addr
+ *         || v116 <= v115 || v115 + 120 > v116
+ *         || (v115 & 3) != 0)               -> bad address / "Failed to map shared memory"
+ *
+ * so it must sit inside RAM, be 4-byte aligned, and leave at least 120 bytes. A
+ * plain 0 is below ramBase, which is what produced "BCMWLAN FW provide bad
+ * address".
+ *
+ * For this aperture a BAR2 offset *is* the chip address: the chip table gives
+ * ramBase 0x352000 / ramSize 0x1ce000, and the marker word (ramBase + ramSize - 4)
+ * was observed at bar2+0x51fffc = 0x352000 + 0x1cdffc. So the address can be
+ * derived from where the driver polls rather than by hardcoding that constant.
+ *
+ * Place the structure 16 KiB below the marker. The driver's own layout puts its
+ * free region at 1317624..1883080 and NVRAM at 1883344..1892342 with the marker at
+ * 1892348, so 16 KiB back lands in free space and clear of NVRAM.
  */
-#define APPLE_WLAN_FW_ALIVE_MARKER (0)
+#define APPLE_WLAN_FW_SHARED_BACKOFF (16 * KiB)
+/*
+ * First word of that structure is `flags`, whose low byte is the protocol version
+ * (brcmfmac's BRCMF_PCIE_SHARED_VERSION_MASK). The driver checks it immediately:
+ *
+ *   createFirmwarePCIeIPC@7045: Host requires version 7, firmware supports 0
+ */
+#define APPLE_WLAN_FW_SHARED_VERSION (7)
+/*
+ * Device-wake capability bits in the same word. createFirmwarePCIeIPC() reads
+ *
+ *     if ((flags & 0x20000000) != 0 && (flags & 0x40000000) == 0)
+ *         -> "device does not support oob or inband device wake, bailing"
+ *     log OOB as (flags & 0x20000000) ? "No" : "Has"
+ *     log DS  as (flags & 0x40000000) ? "has" : "no"
+ *     if ((flags & 0x40000000) == 0) -> needs a device-wake GPIO
+ *
+ * so 0x20000000 means *no* out-of-band device wake and 0x40000000 means inband
+ * deep sleep is supported. Leaving both clear advertises OOB-only, and the driver
+ * then bails with "device wake GPIO not available, and inband device wake not
+ * supported by endpoint" because this platform has no such GPIO. Declaring no-OOB
+ * plus inband takes the path that needs no GPIO.
+ */
+#define APPLE_WLAN_FW_SHARED_NO_OOB_DW (0x20000000)
+#define APPLE_WLAN_FW_SHARED_INBAND_DS (0x40000000)
+#define APPLE_WLAN_FW_SHARED_FLAGS                                   \
+    (APPLE_WLAN_FW_SHARED_VERSION | APPLE_WLAN_FW_SHARED_NO_OOB_DW | \
+     APPLE_WLAN_FW_SHARED_INBAND_DS)
 
 struct AppleWLANDeviceState {
     PCIDevice parent_obj;
@@ -269,6 +315,8 @@ struct AppleWLANDeviceState {
     bool arm_core_released;
     bool tcm_marker_done;
     uint32_t tcm_marker_offset;
+    // Where the stand-in told the driver its shared-memory structure lives.
+    uint32_t fw_shared_offset;
     uint32_t tcm_last_read_offset;
     bool tcm_last_read_valid;
 
@@ -650,12 +698,17 @@ static uint64_t apple_wlan_bar2_ops_read(void *opaque, hwaddr offset,
      * such read is answered as a live firmware would have, once.
      */
     if (s->arm_core_released && !s->tcm_marker_done && size == 4) {
-        if (s->tcm_last_read_valid && s->tcm_last_read_offset == offset) {
-            stl_le_p(s->bar2_backing + offset, APPLE_WLAN_FW_ALIVE_MARKER);
+        if (s->tcm_last_read_valid && s->tcm_last_read_offset == offset &&
+            offset > APPLE_WLAN_FW_SHARED_BACKOFF) {
+            uint32_t shared = (uint32_t)offset - APPLE_WLAN_FW_SHARED_BACKOFF;
+
+            stl_le_p(s->bar2_backing + offset, shared);
             s->tcm_marker_done = true;
             s->tcm_marker_offset = (uint32_t)offset;
-            trace_apple_wlan_fw_alive_marker((uint32_t)offset,
-                                             APPLE_WLAN_FW_ALIVE_MARKER,
+            s->fw_shared_offset = shared;
+            // Publish the structure the address points at, starting with `flags`.
+            stl_le_p(s->bar2_backing + shared, APPLE_WLAN_FW_SHARED_FLAGS);
+            trace_apple_wlan_fw_alive_marker((uint32_t)offset, shared,
                                              s->tcm_written_bytes);
         }
         s->tcm_last_read_offset = (uint32_t)offset;
