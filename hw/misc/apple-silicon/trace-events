@@ -9,8 +9,7 @@ apple_wlan_bar0_read(uint64_t offset, unsigned size, uint64_t val) "offset 0x%05
 apple_wlan_bar0_write(uint64_t offset, unsigned size, uint64_t val) "offset 0x%05" PRIx64 " size %u val 0x%" PRIx64
 apple_wlan_bar2_read(uint64_t offset, unsigned size, uint64_t val) "offset 0x%05" PRIx64 " size %u val 0x%" PRIx64
 apple_wlan_bar2_write(uint64_t offset, unsigned size, uint64_t val) "offset 0x%05" PRIx64 " size %u val 0x%" PRIx64
-apple_wlan_bar0_window(uint32_t base) "BAR0_WINDOW <- backplane 0x%08x"
-apple_wlan_bar0_core2_window(uint32_t base) "BAR0_CORE2_WINDOW <- backplane 0x%08x"
+apple_wlan_bar0_window(uint32_t cfg, uint32_t page, uint32_t base) "window cfg 0x%02x (bar0 page %u) <- backplane 0x%08x"
 apple_wlan_backplane_read(uint32_t backplane, uint64_t offset, unsigned size, uint64_t val) "backplane 0x%08x (bar0+0x%05" PRIx64 ") size %u -> 0x%" PRIx64
 apple_wlan_backplane_write(uint32_t backplane, uint64_t offset, unsigned size, uint64_t val) "backplane 0x%08x (bar0+0x%05" PRIx64 ") size %u <- 0x%" PRIx64
 apple_wlan_backplane_written(uint64_t bytes, uint32_t pages, uint32_t hash) "backplane written: %" PRIu64 " bytes across %u pages, fnv1a 0x%08x"

@@ -48,32 +48,49 @@ OBJECT_DECLARE_SIMPLE_TYPE(AppleWLANState, APPLE_WLAN)
 #define APPLE_WLAN_SUBDEVICE_ID (0x4378)
 
 /*
- * On Broadcom PCIe parts BAR0 carries *two* independently moveable 4 KiB windows
- * onto the chip's backplane, each with its own base register in PCI config
- * space:
+ * On Broadcom PCIe parts BAR0 is a set of 4 KiB pages, and several of those pages
+ * are independently moveable windows onto the chip's backplane. Each such page
+ * has its own base register in PCI config space. Counted over one boot of the
+ * iOS 14 driver, four are used:
  *
- *   BAR0 + 0x0000  <-  config 0x80 (BAR0_WINDOW)
- *   BAR0 + 0x4000  <-  config 0x74 (the "core 2" window)
+ *   BAR0 + 0x0000  <-  config 0x80   (332 writes)   "BAR0_WINDOW"
+ *   BAR0 + 0x1000  <-  config 0x70   ( 60 writes)
+ *   BAR0 + 0x4000  <-  config 0x74   ( 93 writes)   the "core 2" window
+ *   BAR0 + 0x5000  <-  config 0x78   ( 61 writes)
  *
- * Both must be modelled. The driver keeps track of which core each window
+ * All of them must be modelled. The driver keeps track of which core each window
  * currently maps and reaches for whichever one is not already pointing at a core
- * it still needs, so which window a given access arrives through varies from
- * boot to boot for identical driver code. Modelling only BAR0_WINDOW silently
- * loses every access made through the other window: they land beyond the end of
- * a too-small BAR0 and are absorbed by whatever the guest mapped next (here,
- * BAR2), which reads back as zeroes. That is what made the OTP read — and hence
- * the whole hardware-identity publish — fail on some boots and succeed on
- * others with no change in the binary.
+ * it still needs, so which window a given access arrives through varies from boot
+ * to boot for identical driver code. A window that is not modelled silently loses
+ * every access made through it: the access either lands beyond the end of a
+ * too-small BAR0 and is absorbed by whatever the guest mapped next, or falls
+ * through to the flat register array, and in both cases reads back as zero. That
+ * is what made the OTP read — and hence the whole hardware-identity publish —
+ * fail on some boots and succeed on others with no change in the binary.
+ *
+ * Pages 2 and 3 also see traffic (424 and 60 accesses) but no config write was
+ * observed selecting a base for them, so they are presumed to be fixed apertures
+ * rather than windows — the `bar0 + 0x21e8` write looks like a PCIe2 core
+ * register block. They are left falling through to bar0_regs until identified.
  *
  * The chip identity is the ChipCommon `chipid` register at backplane 0x18000000
  * offset 0, encoded as id | rev << 16 | package << 20 | type << 28.
  */
-#define APPLE_WLAN_BAR0_WINDOW_CFG (0x80)
-#define APPLE_WLAN_BAR0_CORE2_WINDOW_CFG (0x74)
 #define APPLE_WLAN_BAR0_WINDOW_SIZE (4 * KiB)
-#define APPLE_WLAN_BAR0_CORE2_WINDOW_OFFSET (16 * KiB)
+#define APPLE_WLAN_BAR0_PAGES (APPLE_WLAN_DEVICE_BAR0_SIZE / APPLE_WLAN_BAR0_WINDOW_SIZE)
 // The reset value the driver expects to find in the core-2 window register.
 #define APPLE_WLAN_BAR0_CORE2_WINDOW_RESET (0x18002000)
+
+// PCI config register -> which 4 KiB page of BAR0 its base applies to.
+static const struct {
+    uint32_t cfg;
+    uint32_t page;
+} apple_wlan_bar0_windows[] = {
+    { 0x80, 0 },
+    { 0x70, 1 },
+    { 0x74, 4 },
+    { 0x78, 5 },
+};
 #define APPLE_WLAN_CHIPCOMMON_BASE (0x18000000)
 #define APPLE_WLAN_CHIPID_OFFSET (0x0)
 // n104 ships a BCM4378 stepping B1; the guest picks its firmware directory from
@@ -197,8 +214,8 @@ struct AppleWLANDeviceState {
     // Backplane addresses currently mapped by each of BAR0's two windows, set by
     // the guest through PCI config space. Tracking them turns the otherwise
     // opaque BAR0 offsets into real backplane addresses.
-    uint32_t bar0_window;
-    uint32_t bar0_core2_window;
+    uint32_t bar0_window_base[APPLE_WLAN_BAR0_PAGES];
+    bool bar0_page_windowed[APPLE_WLAN_BAR0_PAGES];
 
     /*
      * Backplane storage, sparse and keyed by *backplane* address rather than by
@@ -413,15 +430,11 @@ static uint8_t *apple_wlan_backplane_page(AppleWLANDeviceState *s, uint32_t addr
 static bool apple_wlan_bar0_to_backplane(AppleWLANDeviceState *s, hwaddr offset,
                                          uint32_t *backplane)
 {
-    if (offset < APPLE_WLAN_BAR0_WINDOW_SIZE) {
-        *backplane = s->bar0_window + (uint32_t)offset;
-        return true;
-    }
-    if (offset >= APPLE_WLAN_BAR0_CORE2_WINDOW_OFFSET &&
-        offset < APPLE_WLAN_BAR0_CORE2_WINDOW_OFFSET +
-                     APPLE_WLAN_BAR0_WINDOW_SIZE) {
-        *backplane = s->bar0_core2_window +
-                     (uint32_t)(offset - APPLE_WLAN_BAR0_CORE2_WINDOW_OFFSET);
+    uint32_t page = (uint32_t)(offset / APPLE_WLAN_BAR0_WINDOW_SIZE);
+
+    if (page < APPLE_WLAN_BAR0_PAGES && s->bar0_page_windowed[page]) {
+        *backplane = s->bar0_window_base[page] +
+                     (uint32_t)(offset & (APPLE_WLAN_BAR0_WINDOW_SIZE - 1));
         return true;
     }
     return false;
@@ -621,16 +634,21 @@ static void apple_wlan_device_qdev_reset_hold(Object *obj, ResetType type)
 
     pci_set_word(dev->config + PCI_COMMAND,
                  PCI_COMMAND_MEMORY | PCI_COMMAND_MASTER);
-    s->bar0_window = 0;
-    s->bar0_core2_window = APPLE_WLAN_BAR0_CORE2_WINDOW_RESET;
+    memset(s->bar0_window_base, 0, sizeof(s->bar0_window_base));
+    memset(s->bar0_page_windowed, 0, sizeof(s->bar0_page_windowed));
+    for (size_t i = 0; i < ARRAY_SIZE(apple_wlan_bar0_windows); i++) {
+        s->bar0_page_windowed[apple_wlan_bar0_windows[i].page] = true;
+    }
+    // Only the core-2 window has a non-zero base out of reset.
+    s->bar0_window_base[4] = APPLE_WLAN_BAR0_CORE2_WINDOW_RESET;
 }
 
 /*
- * Track both BAR0 window registers so BAR0 accesses can be resolved to backplane
- * addresses. The core-2 window register overlaps the PCI Express capability, so
- * pci_default_write_config() treats it as read-only and drops the value; capture
- * it here regardless, since the guest's window writes are what give the BAR0
- * offsets meaning.
+ * Track every BAR0 window base register so BAR0 accesses can be resolved to
+ * backplane addresses. Three of the four (0x70, 0x74, 0x78) overlap the PCI
+ * Express capability, so pci_default_write_config() treats them as read-only and
+ * drops the value; capture them here regardless, since the guest's window writes
+ * are what give the BAR0 offsets meaning.
  */
 static void apple_wlan_device_config_write(PCIDevice *dev, uint32_t addr,
                                            uint32_t val, int len)
@@ -640,16 +658,13 @@ static void apple_wlan_device_config_write(PCIDevice *dev, uint32_t addr,
     pci_default_write_config(dev, addr, val, len);
 
     if (len == 4) {
-        switch (addr) {
-        case APPLE_WLAN_BAR0_WINDOW_CFG:
-            s->bar0_window = val;
-            trace_apple_wlan_bar0_window(val);
-            break;
-        case APPLE_WLAN_BAR0_CORE2_WINDOW_CFG:
-            s->bar0_core2_window = val;
-            trace_apple_wlan_bar0_core2_window(val);
-            break;
-        default:
+        for (size_t i = 0; i < ARRAY_SIZE(apple_wlan_bar0_windows); i++) {
+            if (addr != apple_wlan_bar0_windows[i].cfg) {
+                continue;
+            }
+            s->bar0_window_base[apple_wlan_bar0_windows[i].page] = val;
+            trace_apple_wlan_bar0_window(apple_wlan_bar0_windows[i].cfg,
+                                         apple_wlan_bar0_windows[i].page, val);
             break;
         }
     }
