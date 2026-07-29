@@ -1353,10 +1353,43 @@ static void apple_wlan_int_assert(AppleWLANDeviceState *s)
                      APPLE_WLAN_INT_HOLD_NS);
 }
 
+/*
+ * The driver acknowledges a completion by advancing its read index, not by
+ * writing MAILBOXINT -- it only bothers with the write-1-to-clear when its ISR
+ * had work to do. So the latched doorbell bit alone is not "unserviced": once
+ * the driver has caught up to our write index there is nothing left to signal,
+ * and retrying on the bit alone re-asserted the MSI at 100 Hz for the whole
+ * boot (150k spurious notifies in one run, on a guest that pays a trap for
+ * each one). Only the completion ring is ever posted to, so one index compare
+ * answers it.
+ */
+static bool apple_wlan_d2h_outstanding(AppleWLANDeviceState *s)
+{
+    unsigned id = APPLE_WLAN_RING_D2H_CONTROL_COMPLETE;
+    AppleWLANRing ring;
+    uint16_t host_r_idx;
+
+    if (!apple_wlan_get_ring(s, id, &ring)) {
+        return false;
+    }
+    if (!apple_wlan_read_ring_index(s, APPLE_WLAN_RING_INFO_D2H_R_IDX_OFF,
+                                    ring.slot, &host_r_idx)) {
+        // Cannot tell; treat as outstanding so a real completion is not dropped.
+        return true;
+    }
+    return host_r_idx != s->ring_w_idx[id];
+}
+
 static void apple_wlan_int_timer(void *opaque)
 {
     AppleWLANDeviceState *s = opaque;
     bool pending = (s->mailbox_int & s->mailbox_mask) != 0;
+
+    if (pending && !apple_wlan_d2h_outstanding(s)) {
+        // Caught up. Drop the doorbell bit the driver never wrote back.
+        s->mailbox_int &= ~(uint32_t)APPLE_WLAN_MB_INT_D2H_DB0;
+        pending = (s->mailbox_int & s->mailbox_mask) != 0;
+    }
 
     if (s->int_asserted) {
         apple_wlan_int_deassert(s);
