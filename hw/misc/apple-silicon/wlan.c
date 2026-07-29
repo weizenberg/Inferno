@@ -333,6 +333,16 @@ static const struct {
  */
 #define APPLE_WLAN_FW_RING_MEM_BACKOFF (0x200)
 /*
+ * The mailbox-data words, brcmfmac's BRCMF_SHARED_{HTOD,DTOH}_MB_DATA_ADDR.
+ * These hold a TCM address each, and the FN0 bit in MAILBOXINT is what tells
+ * the driver to go read the D2H one. Left at zero, as the firmware image
+ * leaves them, that read lands at TCM offset 0.
+ */
+#define APPLE_WLAN_FW_SHARED_HTOD_MB_DATA_OFF (0x24)
+#define APPLE_WLAN_FW_SHARED_DTOH_MB_DATA_OFF (0x28)
+#define APPLE_WLAN_FW_DTOH_MB_DATA_BACKOFF (0x300)
+#define APPLE_WLAN_FW_HTOD_MB_DATA_BACKOFF (0x304)
+/*
  * ring_info's ring counts. The layout is pinned by what the driver itself writes
  * rather than by trusting the public struct: it fills four 64-bit host index
  * addresses at ring_info+0x14, +0x1c, +0x24 and +0x2c (v236[5..12] in
@@ -1270,6 +1280,12 @@ static void apple_wlan_h2d_doorbell(AppleWLANDeviceState *s)
     apple_wlan_write_ring_index(s, APPLE_WLAN_RING_INFO_H2D_R_IDX_OFF, id,
                                 s->ring_r_idx[id]);
     if (posted) {
+        /*
+         * Only the doorbell. The driver also unmasks FN0_0, but that bit means
+         * mailbox data is waiting, and raising it with the D2H word at zero
+         * changed nothing -- measured, no extra handler activity at all -- so
+         * it is not asserted here.
+         */
         apple_wlan_raise_int(s, APPLE_WLAN_MB_INT_D2H_DB0);
     }
 }
@@ -1380,6 +1396,23 @@ static uint64_t apple_wlan_bar2_ops_read(void *opaque, hwaddr offset,
                          APPLE_WLAN_FW_RING_INFO_BACKOFF +
                          APPLE_WLAN_FW_RING_INFO_MAX_SUBMIT_OFF,
                      APPLE_WLAN_FW_RING_MAX_DYN_SUBMIT);
+            /*
+             * Give the mailbox-data words somewhere real to live, so that
+             * raising FN0 makes the driver read a defined location rather than
+             * whatever the firmware image left at TCM offset 0.
+             */
+            stl_le_p(s->bar2_backing + shared +
+                         APPLE_WLAN_FW_SHARED_DTOH_MB_DATA_OFF,
+                     shared + APPLE_WLAN_FW_DTOH_MB_DATA_BACKOFF);
+            stl_le_p(s->bar2_backing + shared +
+                         APPLE_WLAN_FW_SHARED_HTOD_MB_DATA_OFF,
+                     shared + APPLE_WLAN_FW_HTOD_MB_DATA_BACKOFF);
+            stl_le_p(s->bar2_backing + shared +
+                         APPLE_WLAN_FW_DTOH_MB_DATA_BACKOFF,
+                     0);
+            stl_le_p(s->bar2_backing + shared +
+                         APPLE_WLAN_FW_HTOD_MB_DATA_BACKOFF,
+                     0);
             trace_apple_wlan_fw_alive_marker((uint32_t)offset, shared,
                                              s->tcm_written_bytes);
         }
