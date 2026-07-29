@@ -232,6 +232,20 @@ static const struct {
  * AI (AXI interconnect) wrapper registers, at the wrapper's 4 KiB page. Wrapper
  * space begins at 0x18100000 — every core the driver visits is below that.
  */
+/*
+ * PCIe2 core registers. BAR0 page 2 is a fixed aperture onto them, so these are
+ * raw BAR0 offsets. Names follow brcmfmac's BRCMF_PCIE_64_PCIE2REG_*.
+ *
+ * MAILBOXINT is status and is cleared by writing ones, so it must not be plain
+ * storage: the driver writes 0xffffffff to clear and would read 0xffffffff back,
+ * i.e. see every D2H doorbell and mailbox event asserted at once. Measured, the
+ * driver unmasks 0x10100 -- D2H doorbell 0 (0x10000) and FN0 mailbox data
+ * (0x0100) -- so those are the two bits the device has to be able to raise.
+ */
+#define APPLE_WLAN_PCIE2_MAILBOXINT (0x2c30)
+#define APPLE_WLAN_PCIE2_MAILBOXMASK (0x2c34)
+#define APPLE_WLAN_MB_INT_D2H_DB0 (0x10000)
+#define APPLE_WLAN_MB_INT_FN0_0 (0x0100)
 #define APPLE_WLAN_WRAPPER_BASE (0x18100000)
 #define APPLE_WLAN_AI_IOCTRL (0x408)
 #define APPLE_WLAN_AI_RESETCTRL (0x800)
@@ -406,6 +420,9 @@ struct AppleWLANDeviceState {
     uint32_t fw_shared_offset;
     uint32_t tcm_last_read_offset;
     bool tcm_last_read_valid;
+    // PCIe2 core mailbox status (write-1-to-clear) and its enable mask.
+    uint32_t mailbox_int;
+    uint32_t mailbox_mask;
 
     // Backplane addresses currently mapped by each of BAR0's two windows, set by
     // the guest through PCI config space. Tracking them turns the otherwise
@@ -684,6 +701,14 @@ static uint64_t apple_wlan_bar0_ops_read(void *opaque, hwaddr offset,
             memcpy(&value, page + (backplane & (APPLE_WLAN_BACKPLANE_PAGE_SIZE - 1)),
                    size);
         }
+    } else if (offset == APPLE_WLAN_PCIE2_MAILBOXINT) {
+        /*
+         * Status, not storage. The driver clears it by writing ones, so echoing
+         * the written value back makes every D2H event look permanently pending:
+         * it wrote 0xffffffff to clear and read 0xffffffff, i.e. all eight
+         * doorbells plus everything else asserted at once.
+         */
+        value = s->mailbox_int;
     } else {
         if (offset + size <= sizeof(s->bar0_regs)) {
             memcpy(&value, s->bar0_regs + offset, size);
@@ -756,6 +781,14 @@ static void apple_wlan_bar0_ops_write(void *opaque, hwaddr offset,
                 s->written_hash);
         }
         trace_apple_wlan_backplane_write(backplane, offset, size, value);
+    } else if (offset == APPLE_WLAN_PCIE2_MAILBOXINT) {
+        // Write-1-to-clear.
+        s->mailbox_int &= ~(uint32_t)value;
+        trace_apple_wlan_mailbox_int(s->mailbox_int, (uint32_t)value,
+                                     s->mailbox_mask);
+    } else if (offset == APPLE_WLAN_PCIE2_MAILBOXMASK) {
+        s->mailbox_mask = (uint32_t)value;
+        trace_apple_wlan_mailbox_mask(s->mailbox_mask);
     } else {
         if (offset + size <= sizeof(s->bar0_regs)) {
             memcpy(s->bar0_regs + offset, &value, size);

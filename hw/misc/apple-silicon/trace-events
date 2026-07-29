@@ -11,6 +11,8 @@ apple_wlan_tcm_written(uint64_t bytes, uint64_t offset) "TCM written: %" PRIu64 
 apple_wlan_arm_core_released(uint64_t tcm_bytes) "ARM core released after %" PRIu64 " TCM bytes"
 apple_wlan_fw_alive_marker(uint32_t off, uint32_t shared, uint64_t tcm_bytes) "fw shared-memory address bar2+0x%06x <- 0x%08x (%" PRIu64 " TCM bytes written)"
 apple_wlan_fw_shared_read(uint32_t field, unsigned size, uint64_t val) "fw shared+0x%03x size %u -> 0x%" PRIx64
+apple_wlan_mailbox_int(uint32_t status, uint32_t cleared, uint32_t mask) "MAILBOXINT now 0x%08x (cleared 0x%08x, mask 0x%08x)"
+apple_wlan_mailbox_mask(uint32_t mask) "MAILBOXMASK <- 0x%08x"
 apple_wlan_bar0_window(uint32_t cfg, uint32_t page, uint32_t base) "window cfg 0x%02x (bar0 page %u) <- backplane 0x%08x"
 apple_wlan_backplane_read(uint32_t backplane, uint64_t offset, unsigned size, uint64_t val) "backplane 0x%08x (bar0+0x%05" PRIx64 ") size %u -> 0x%" PRIx64
 apple_wlan_backplane_write(uint32_t backplane, uint64_t offset, unsigned size, uint64_t val) "backplane 0x%08x (bar0+0x%05" PRIx64 ") size %u <- 0x%" PRIx64
