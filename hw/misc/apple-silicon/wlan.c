@@ -283,11 +283,60 @@ static const struct {
  * supported by endpoint" because this platform has no such GPIO. Declaring no-OOB
  * plus inband takes the path that needs no GPIO.
  */
+/*
+ * How much of the structure to trace reads within, for layout discovery. Wide
+ * enough to cover the pointer chain the driver walks: the structure itself, then
+ * ring_info at +0x100, then the ring memory ring_info points at.
+ */
+#define APPLE_WLAN_FW_SHARED_WINDOW (4 * KiB)
+/*
+ * Field offsets within the structure, established by tracing which words the
+ * driver actually reads. Over a whole attempt it touches exactly three:
+ *
+ *   +0x00  flags          (version + device-wake bits)
+ *   +0x30  ring_info      read once, immediately before the failure
+ *   +0x50  capabilities   the deviceShared+80 word: 0x4 BT streaming log,
+ *                         0x8 core dump, 0x100 extended TX status, and
+ *                         bits 0xC0 select the control ring item counts
+ *
+ * +0x30 is the ring-info pointer: it is validated the same way as the shared
+ * address itself, and the check demands at least 80 bytes of room --
+ *
+ *     if (ramSize <= off || off + 80 > ramSize || (off & 3) != 0)
+ *         -> "Failed to map common ring memory @ %#X"
+ *
+ * Reading 0 there puts it below ramBase, which is the second source of
+ * "BCMWLAN FW provide bad address". Point it just past the structure; the whole
+ * 16 KiB backoff region sits in the driver's own free space.
+ */
+#define APPLE_WLAN_FW_SHARED_RING_INFO_OFF (0x30)
+#define APPLE_WLAN_FW_RING_INFO_BACKOFF (0x100)
+/*
+ * ring_info's own first word is another address -- the ring memory holding the
+ * ring descriptors -- and a zero there fails the same validation. Traced: the
+ * driver reads ring_info+0x00 once and then fails. Give it a further slot in the
+ * same free-space region.
+ */
+#define APPLE_WLAN_FW_RING_MEM_BACKOFF (0x200)
 #define APPLE_WLAN_FW_SHARED_NO_OOB_DW (0x20000000)
 #define APPLE_WLAN_FW_SHARED_INBAND_DS (0x40000000)
+/*
+ * Ring indices are DMAed rather than read over the bus, and the driver supports
+ * nothing else:
+ *
+ *     if ( (**((_DWORD **)this + 154) & 0x10000) == 0 ) {
+ *         v11 = 3758097095LL;              // kIOReturnUnsupported
+ *         logAlert("Driver only supports FW with bi-directional ring index DMA.");
+ *     }
+ *
+ * (brcmfmac calls this bit BRCMF_PCIE_SHARED_DMA_INDEX.) Past it the driver fills
+ * the host-side index array addresses into ring_info itself, so those need not be
+ * published here.
+ */
+#define APPLE_WLAN_FW_SHARED_DMA_INDEX (0x10000)
 #define APPLE_WLAN_FW_SHARED_FLAGS                                   \
-    (APPLE_WLAN_FW_SHARED_VERSION | APPLE_WLAN_FW_SHARED_NO_OOB_DW | \
-     APPLE_WLAN_FW_SHARED_INBAND_DS)
+    (APPLE_WLAN_FW_SHARED_VERSION | APPLE_WLAN_FW_SHARED_DMA_INDEX | \
+     APPLE_WLAN_FW_SHARED_NO_OOB_DW | APPLE_WLAN_FW_SHARED_INBAND_DS)
 
 struct AppleWLANDeviceState {
     PCIDevice parent_obj;
@@ -708,6 +757,12 @@ static uint64_t apple_wlan_bar2_ops_read(void *opaque, hwaddr offset,
             s->fw_shared_offset = shared;
             // Publish the structure the address points at, starting with `flags`.
             stl_le_p(s->bar2_backing + shared, APPLE_WLAN_FW_SHARED_FLAGS);
+            stl_le_p(s->bar2_backing + shared +
+                         APPLE_WLAN_FW_SHARED_RING_INFO_OFF,
+                     shared + APPLE_WLAN_FW_RING_INFO_BACKOFF);
+            stl_le_p(s->bar2_backing + shared +
+                         APPLE_WLAN_FW_RING_INFO_BACKOFF,
+                     shared + APPLE_WLAN_FW_RING_MEM_BACKOFF);
             trace_apple_wlan_fw_alive_marker((uint32_t)offset, shared,
                                              s->tcm_written_bytes);
         }
@@ -715,6 +770,17 @@ static uint64_t apple_wlan_bar2_ops_read(void *opaque, hwaddr offset,
         s->tcm_last_read_valid = true;
     }
     memcpy(&value, s->bar2_backing + offset, size);
+    /*
+     * Trace reads inside the published structure only. A per-access event across
+     * the whole 8 MiB TCM buries the log, but the driver's reads *here* are what
+     * tell us which fields of the structure it consults, and in what order --
+     * which is how its layout gets established instead of guessed.
+     */
+    if (s->fw_shared_offset != 0 && offset >= s->fw_shared_offset &&
+        offset < s->fw_shared_offset + APPLE_WLAN_FW_SHARED_WINDOW) {
+        trace_apple_wlan_fw_shared_read((uint32_t)(offset - s->fw_shared_offset),
+                                        size, value);
+    }
     return value;
 }
 
