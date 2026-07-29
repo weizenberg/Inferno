@@ -537,8 +537,14 @@ static const struct {
 #define APPLE_WLAN_CHANSPEC_BW_20 (0x1000)
 #define APPLE_WLAN_CHANNEL_FIRST (1)
 #define APPLE_WLAN_CHANNEL_COUNT (11)
-#define APPLE_WLAN_CHANSPEC_DEFAULT \
-    (APPLE_WLAN_CHANSPEC_BW_20 | APPLE_WLAN_CHANNEL_FIRST)
+/*
+ * chanspec is deliberately left refused. getCHANNEL rejected both a 4-byte and
+ * a 16-byte answer as "data underrun", so the length it wants is not the
+ * CommandRxExpected value it appeared to be, and it hands the result to
+ * AppleBCMWLANChanSpec::getAppleChannelSpec as a struct of unknown layout.
+ * getCHANNEL is a status query and does not block anything, so an honest
+ * refusal beats a wrong-length reply that reads as a device fault.
+ */
 
 // Likewise for the TX capability table; the driver only logs this one.
 #define APPLE_WLAN_TXCAP_VERSION_STRING \
@@ -615,8 +621,6 @@ static const struct {
      * fails setupDriver ("Failure to get default Home Away Time").
      */
     { "scan_home_away_time", 100 },
-    // The channel currently sat on, read by getCHANNEL.
-    { "chanspec", APPLE_WLAN_CHANSPEC_DEFAULT },
 };
 
 /*
