@@ -190,13 +190,30 @@ struct AppleWLANDeviceState {
 // platform "moana", module "GODF", vendor "m". These are model identity, not any
 // real device's calibration or MAC.
 /*
- * P-moana_M-GODF_V-m__m-4.3.txt decodes as platform "moana", module "GODF",
- * vendor "m". Three strings is the maximum this tuple can carry: the PCIe
- * parseVersion1Tuple() loop is bounded by `cmp w21, #3`, and it fills exactly
- * this->+0xC8/+0xD0/+0xD8. Measured: a fourth string changes nothing, because
- * this->+0xE0 -- the remaining gate -- is filled from somewhere else.
+ * Version-1 tuple payload, per AppleBCMWLANBusInterfacePCIe::parseVersion1Tuple()
+ * as decompiled:
+ *
+ *   v13 = len - 3;                            // effective payload length
+ *   if (v13 == 0) { all four slots = "" }
+ *   do {
+ *       b = data[off + 2];                    // strings start at data + 2
+ *       if (idx > 3 || b == 0xFF) break;
+ *       off += strlcpy(buf, data + off + 2, 256, 256) + 1;
+ *       slot[idx++] = OSString::withCString(buf);
+ *   } while (off < v13);
+ *   if (idx <= 3) fill the remaining slots with "";
+ *
+ * so: two header bytes, then NUL-separated strings, and the slot order is
+ * this->+0xD8, +0xE0, +0xC8, +0xD0 (not address order). Unfilled slots get
+ * empty strings, which is why all four pointers are non-NULL yet publishing
+ * still failed: publishHWIdentifiers() feeds each string to
+ * AppleBCMWLANUtil::appendParsedKeyValuePairsToDictionary(), so the strings
+ * have to be "key=value" text. The guest image names the keys for us --
+ * its NVRAM file is P-moana_M-GODF_V-m__m-4.3.txt, i.e. P=platform,
+ * M=module, V=vendor. Model identity only; no calibration or MAC.
  */
-static const char apple_wlan_otp_identity[] = "moana\0GODF\0m";
+static const char apple_wlan_otp_identity[] =
+    "\x01\x00" "P=moana\0M=GODF\0V=m\0";
 
 static void apple_wlan_build_otp(AppleWLANDeviceState *s, const uint8_t *table)
 {
@@ -205,10 +222,10 @@ static void apple_wlan_build_otp(AppleWLANDeviceState *s, const uint8_t *table)
 
     memset(s->otp, APPLE_WLAN_CIS_TYPE_NULL, sizeof(s->otp));
     s->otp[n++] = APPLE_WLAN_CIS_TYPE_VERS1;
-    s->otp[n++] = (uint8_t)sizeof(apple_wlan_otp_identity);
+    s->otp[n++] = (uint8_t)(sizeof(apple_wlan_otp_identity) - 1);
     memcpy(&s->otp[n], apple_wlan_otp_identity,
-           sizeof(apple_wlan_otp_identity));
-    n += sizeof(apple_wlan_otp_identity);
+           sizeof(apple_wlan_otp_identity) - 1);
+    n += sizeof(apple_wlan_otp_identity) - 1;
     s->otp[n++] = APPLE_WLAN_CIS_TYPE_END;
     g_assert_cmpuint(n, <, sizeof(s->otp));
 
