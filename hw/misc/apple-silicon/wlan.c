@@ -471,6 +471,16 @@ static const struct {
     "API: 12.2 Data: 9.10.39 Compiler: 1.29.4 ClmImport: 1.36.3 " \
     "Creation: 2020-01-01 00:00:00"
 
+/*
+ * The chip capability list. processChipCaps compares this against a set of
+ * optional feature tokens -- ap, he, rsdb, sc, hp2p, ecounters, nap, psbw,
+ * txhist and friends -- and enables the matching feature for each one present.
+ * None of them are listed here on purpose: there is no radio behind this, so
+ * every gated feature should stay off. Refusing the iovar outright is what
+ * fails, not the shortness of the answer.
+ */
+#define APPLE_WLAN_CHIP_CAPS_STRING "802.11d 802.11h"
+
 // Likewise for the TX capability table; the driver only logs this one.
 #define APPLE_WLAN_TXCAP_VERSION_STRING \
     "TxCap: 1.0 Creation: 2020-01-01 00:00:00"
@@ -529,8 +539,18 @@ static const struct {
  * the iovar leaves it at its own default of 3. The real layout is not known, and
  * a confidently wrong structure is harder to notice than a refusal.
  */
-// How many event-log sets the firmware claims. Read as a plain integer.
-#define APPLE_WLAN_EVENT_LOG_MAX_SETS (8)
+/*
+ * Plain integer iovars. Each is read as a u32, and the driver sets some of them
+ * straight back, so a set of any name listed here is accepted too. mpc is
+ * Minimum Power Consumption, reported off -- nothing here sleeps.
+ */
+static const struct {
+    const char *name;
+    uint32_t value;
+} apple_wlan_int_iovars[] = {
+    { "event_log_max_sets", 8 },
+    { "mpc", 0 },
+};
 
 /*
  * The version banner an ioctl "ver" get answers with. This is the shape real
@@ -1262,8 +1282,8 @@ static void apple_wlan_handle_resp_buf_post(AppleWLANDeviceState *s,
  * one shows up as a refusal in the log instead of as plausible-looking zeroes.
  */
 static uint16_t apple_wlan_ioctl_response(uint32_t cmd, const char *name,
-                                          uint8_t *buf, uint16_t cap,
-                                          int16_t *status)
+                                          uint16_t in_len, uint8_t *buf,
+                                          uint16_t cap, int16_t *status)
 {
     *status = APPLE_WLAN_BCME_OK;
 
@@ -1275,30 +1295,49 @@ static uint16_t apple_wlan_ioctl_response(uint32_t cmd, const char *name,
         stl_le_p(buf, APPLE_WLAN_IOCTL_VERSION);
         return sizeof(uint32_t);
     }
+    /*
+     * Sets and gets are treated asymmetrically, on purpose.
+     *
+     * A set carries its payload in the input buffer and expects nothing back.
+     * There is no radio and no firmware state here for one to land in, so
+     * accepting it cannot corrupt anything, while refusing it stops setup dead
+     * -- the driver pushes a long batch of tuning iovars (ampdu_rx_factor,
+     * bw_cap, ldpc_cap, rxstreams, sgi_rx, txcapconfig ...) and treats a
+     * refusal of any one of them as fatal. So every set is accepted.
+     *
+     * A get is the opposite: answering one wrongly is worse than refusing it.
+     * wlc_ver showed why -- a plausible but wrong structure had the driver
+     * report interface version 0 where a refusal left it at its own default of
+     * 3. So gets stay explicit, and an unimplemented one shows up as a refusal
+     * in the log rather than as a confident wrong answer.
+     */
     if (cmd == APPLE_WLAN_WLC_SET_VAR) {
-        // A set carries its payload in the input buffer; nothing comes back.
-        for (size_t i = 0; i < ARRAY_SIZE(apple_wlan_blob_loads); i++) {
-            if (strcmp(name, apple_wlan_blob_loads[i].load) == 0) {
-                return 0;
-            }
-        }
-        // A timestamp push. There is no firmware clock to sync, so just take it.
-        if (strcmp(name, "rte_timesync") == 0) {
-            return 0;
-        }
-        *status = APPLE_WLAN_BCME_UNSUPPORTED;
+        trace_apple_wlan_ioctl_set_accepted(name, in_len);
         return 0;
     }
     if (cmd != APPLE_WLAN_WLC_GET_VAR) {
         *status = APPLE_WLAN_BCME_UNSUPPORTED;
         return 0;
     }
-    if (strcmp(name, "event_log_max_sets") == 0) {
+    if (strcmp(name, "cap") == 0) {
+        size_t len = strlen(APPLE_WLAN_CHIP_CAPS_STRING) + 1;
+
+        if (len > cap) {
+            *status = APPLE_WLAN_BCME_UNSUPPORTED;
+            return 0;
+        }
+        memcpy(buf, APPLE_WLAN_CHIP_CAPS_STRING, len);
+        return (uint16_t)len;
+    }
+    for (size_t i = 0; i < ARRAY_SIZE(apple_wlan_int_iovars); i++) {
+        if (strcmp(name, apple_wlan_int_iovars[i].name) != 0) {
+            continue;
+        }
         if (cap < sizeof(uint32_t)) {
             *status = APPLE_WLAN_BCME_UNSUPPORTED;
             return 0;
         }
-        stl_le_p(buf, APPLE_WLAN_EVENT_LOG_MAX_SETS);
+        stl_le_p(buf, apple_wlan_int_iovars[i].value);
         return sizeof(uint32_t);
     }
     if (strcmp(name, "ver") == 0) {
@@ -1364,7 +1403,8 @@ static void apple_wlan_handle_ioctl(AppleWLANDeviceState *s,
     apple_wlan_d2h_post(s, cmplt);
 
     cap = MIN(out_len, sizeof(payload));
-    resp_len = apple_wlan_ioctl_response(cmd, name, payload, cap, &status);
+    resp_len =
+        apple_wlan_ioctl_response(cmd, name, in_len, payload, cap, &status);
     /*
      * Every completion consumes one posted response buffer, whatever the status.
      * The driver looks the buffer up by its resource id and removes it from the
