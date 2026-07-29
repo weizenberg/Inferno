@@ -226,6 +226,27 @@ static const struct {
  */
 #define APPLE_WLAN_DEVICE_BAR0_SIZE (32 * KiB)
 #define APPLE_WLAN_DEVICE_BAR2_SIZE (8 * MiB)
+
+/*
+ * The TCM is real memory to the guest, so back it with RAM rather than MMIO and
+ * trap only the window that needs callbacks.
+ *
+ * Measured cost of getting this wrong: the driver reads all 1892352 bytes of
+ * chip RAM whenever it collects a SoCRAM dump for a fault report, and as MMIO
+ * that is ~472000 trapping four-byte accesses -- 11.0 seconds of wall clock with
+ * its workloop blocked. Its command-queue watchdog gives up after 10, so the
+ * stall was reported 0.04 s after each dump finished ("Pending queue stall after
+ * 10935 ms"), which reset the Commander and left the chip stuck in its
+ * initializing state. Nothing about that was a protocol problem.
+ *
+ * The window has to cover the firmware-alive marker and the shared structure
+ * below it. Chip RAM is ramBase 0x352000 + ramSize 0x1CE000, so the marker word
+ * (ramBase + ramSize - 4) is 0x51FFFC and the structure sits 16 KiB below at
+ * 0x51BFFC -- both inside the last 64 KiB, with room to spare. Everything below
+ * it, including the whole firmware image, is plain RAM.
+ */
+#define APPLE_WLAN_TCM_MMIO_BASE (0x510000)
+#define APPLE_WLAN_TCM_MMIO_SIZE (64 * KiB)
 // One trace line per this many bytes written to the TCM, instead of per access.
 #define APPLE_WLAN_TCM_LOG_STRIDE (256 * KiB)
 /*
@@ -661,6 +682,8 @@ struct AppleWLANDeviceState {
 
     MemoryRegion bar0;
     MemoryRegion bar2;
+    MemoryRegion bar2_ram;
+    MemoryRegion bar2_mmio;
 
     /*
      * BAR2 and the parts of BAR0 outside the windows are flat RAM, so that
@@ -1804,6 +1827,9 @@ static uint64_t apple_wlan_bar2_ops_read(void *opaque, hwaddr offset,
     AppleWLANDeviceState *s = opaque;
     uint64_t value = 0;
 
+    // Offsets arrive relative to the trapped window, not to the BAR.
+    offset += APPLE_WLAN_TCM_MMIO_BASE;
+
     if (offset + size > APPLE_WLAN_DEVICE_BAR2_SIZE) {
         return 0;
     }
@@ -1885,6 +1911,8 @@ static void apple_wlan_bar2_ops_write(void *opaque, hwaddr offset,
                                       uint64_t value, unsigned size)
 {
     AppleWLANDeviceState *s = opaque;
+
+    offset += APPLE_WLAN_TCM_MMIO_BASE;
     uint64_t before = s->tcm_written_bytes;
 
     if (offset + size > APPLE_WLAN_DEVICE_BAR2_SIZE) {
@@ -1958,7 +1986,6 @@ static void apple_wlan_device_pci_realize(PCIDevice *dev, Error **errp)
 
     s->int_timer =
         timer_new_ns(QEMU_CLOCK_VIRTUAL, apple_wlan_int_timer, s);
-    s->bar2_backing = g_malloc0(APPLE_WLAN_DEVICE_BAR2_SIZE);
     s->backplane = g_hash_table_new_full(g_direct_hash, g_direct_equal, NULL,
                                         g_free);
     s->written_hash = APPLE_WLAN_FNV_OFFSET;
@@ -1967,9 +1994,19 @@ static void apple_wlan_device_pci_realize(PCIDevice *dev, Error **errp)
     memory_region_init_io(&s->bar0, OBJECT(dev), &apple_wlan_bar0_ops, s,
                           TYPE_APPLE_WLAN_DEVICE ".bar0",
                           APPLE_WLAN_DEVICE_BAR0_SIZE);
-    memory_region_init_io(&s->bar2, OBJECT(dev), &apple_wlan_bar2_ops, s,
-                          TYPE_APPLE_WLAN_DEVICE ".bar2",
-                          APPLE_WLAN_DEVICE_BAR2_SIZE);
+    memory_region_init(&s->bar2, OBJECT(dev), TYPE_APPLE_WLAN_DEVICE ".bar2",
+                       APPLE_WLAN_DEVICE_BAR2_SIZE);
+    memory_region_init_ram(&s->bar2_ram, OBJECT(dev),
+                           TYPE_APPLE_WLAN_DEVICE ".bar2-ram",
+                           APPLE_WLAN_DEVICE_BAR2_SIZE, &error_fatal);
+    memory_region_add_subregion(&s->bar2, 0, &s->bar2_ram);
+    // The device works on the same bytes the guest sees.
+    s->bar2_backing = memory_region_get_ram_ptr(&s->bar2_ram);
+    memory_region_init_io(&s->bar2_mmio, OBJECT(dev), &apple_wlan_bar2_ops, s,
+                          TYPE_APPLE_WLAN_DEVICE ".bar2-mmio",
+                          APPLE_WLAN_TCM_MMIO_SIZE);
+    memory_region_add_subregion_overlap(&s->bar2, APPLE_WLAN_TCM_MMIO_BASE,
+                                        &s->bar2_mmio, 1);
 
     assert_true(pci_is_express(dev));
     /*
