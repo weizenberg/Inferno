@@ -400,7 +400,17 @@ static const struct {
 // Ring ids, in the order the driver populates ringmem.
 #define APPLE_WLAN_RING_H2D_CONTROL_SUBMIT (0)
 #define APPLE_WLAN_RING_D2H_CONTROL_COMPLETE (2)
-#define APPLE_WLAN_RING_COUNT (5)
+/*
+ * Five rings come from ringmem, and the driver creates more at runtime with
+ * H2D_RING_CREATE / D2H_RING_CREATE. Those live past the common ones in this
+ * id space; a dynamic ring carries its own slot number, which is the index it
+ * uses in its direction's arrays -- id 2 from submitH2DRingCreateMsg really is
+ * h2d_w_idx[2].
+ */
+#define APPLE_WLAN_RING_COMMON_COUNT (5)
+#define APPLE_WLAN_RING_DYNAMIC_MAX (8)
+#define APPLE_WLAN_RING_COUNT \
+    (APPLE_WLAN_RING_COMMON_COUNT + APPLE_WLAN_RING_DYNAMIC_MAX)
 /*
  * The two index arrays each cover only their own direction, and the driver
  * hands out slots sequentially as it walks the rings (brcmfmac does the same in
@@ -650,6 +660,15 @@ struct AppleWLANDeviceState {
     uint64_t ring_base_seen[APPLE_WLAN_RING_COUNT];
     // Current phase for each ring, flipped on wrap. See the phase bit above.
     bool ring_phase[APPLE_WLAN_RING_COUNT];
+    // Rings the driver created at runtime, past the common ones.
+    struct {
+        uint64_t base;
+        uint16_t max_item;
+        uint16_t item_size;
+        unsigned slot;
+        bool h2d;
+        bool valid;
+    } dyn_ring[APPLE_WLAN_RING_DYNAMIC_MAX];
     // Host buffers posted for ioctl responses, consumed oldest first.
     struct {
         uint64_t addr;
@@ -993,6 +1012,9 @@ typedef struct AppleWLANRing {
     uint64_t base;
     uint16_t max_item;
     uint16_t item_size;
+    // Which pair of index arrays this ring uses, and its slot within them.
+    bool h2d;
+    unsigned slot;
 } AppleWLANRing;
 
 static uint32_t apple_wlan_ring_info_off(AppleWLANDeviceState *s)
@@ -1018,6 +1040,19 @@ static bool apple_wlan_get_ring(AppleWLANDeviceState *s, unsigned id,
     if (s->fw_shared_offset == 0 || id >= APPLE_WLAN_RING_COUNT) {
         return false;
     }
+    if (id >= APPLE_WLAN_RING_COMMON_COUNT) {
+        unsigned d = id - APPLE_WLAN_RING_COMMON_COUNT;
+
+        if (!s->dyn_ring[d].valid) {
+            return false;
+        }
+        ring->base = s->dyn_ring[d].base;
+        ring->max_item = s->dyn_ring[d].max_item;
+        ring->item_size = s->dyn_ring[d].item_size;
+        ring->h2d = s->dyn_ring[d].h2d;
+        ring->slot = s->dyn_ring[d].slot;
+        return true;
+    }
     ringmem = ldl_le_p(s->bar2_backing + apple_wlan_ring_info_off(s));
     if (ringmem == 0) {
         return false;
@@ -1033,20 +1068,15 @@ static bool apple_wlan_get_ring(AppleWLANDeviceState *s, unsigned id,
         lduw_le_p(s->bar2_backing + desc + APPLE_WLAN_RING_DESC_ITEM_SIZE_OFF);
     ring->base =
         apple_wlan_tcm_addr64(s, desc + APPLE_WLAN_RING_DESC_BASE_OFF);
+    ring->h2d = id < APPLE_WLAN_RING_H2D_COUNT;
+    ring->slot = ring->h2d ? id : id - APPLE_WLAN_RING_H2D_COUNT;
     return ring->base != 0 && ring->max_item != 0 && ring->item_size != 0 &&
            ring->item_size <= APPLE_WLAN_RING_ITEM_MAX;
 }
 
-// A ring's slot in its direction's index array.
-static unsigned apple_wlan_ring_slot(unsigned id)
-{
-    return id < APPLE_WLAN_RING_H2D_COUNT ? id :
-                                            id - APPLE_WLAN_RING_H2D_COUNT;
-}
-
 // The index arrays are u16 per ring, at a host address published in ring_info.
 static bool apple_wlan_read_ring_index(AppleWLANDeviceState *s,
-                                       uint32_t ring_info_off, unsigned id,
+                                       uint32_t ring_info_off, unsigned slot,
                                        uint16_t *out)
 {
     uint64_t array = apple_wlan_tcm_addr64(s, apple_wlan_ring_info_off(s) +
@@ -1057,7 +1087,7 @@ static bool apple_wlan_read_ring_index(AppleWLANDeviceState *s,
         return false;
     }
     if (pci_dma_read(PCI_DEVICE(s),
-                     array + apple_wlan_ring_slot(id) * sizeof(uint16_t), &raw,
+                     array + slot * sizeof(uint16_t), &raw,
                      sizeof(raw)) != MEMTX_OK) {
         return false;
     }
@@ -1067,7 +1097,7 @@ static bool apple_wlan_read_ring_index(AppleWLANDeviceState *s,
 
 // The index arrays live in host memory; the device owns d2h w and h2d r.
 static bool apple_wlan_write_ring_index(AppleWLANDeviceState *s,
-                                        uint32_t ring_info_off, unsigned id,
+                                        uint32_t ring_info_off, unsigned slot,
                                         uint16_t value)
 {
     uint64_t array =
@@ -1078,8 +1108,8 @@ static bool apple_wlan_write_ring_index(AppleWLANDeviceState *s,
         return false;
     }
     return pci_dma_write(PCI_DEVICE(s),
-                         array + apple_wlan_ring_slot(id) * sizeof(uint16_t),
-                         &raw, sizeof(raw)) == MEMTX_OK;
+                         array + slot * sizeof(uint16_t), &raw,
+                         sizeof(raw)) == MEMTX_OK;
 }
 
 /*
@@ -1210,8 +1240,8 @@ static bool apple_wlan_d2h_post(AppleWLANDeviceState *s, const uint8_t *item)
      * Overrunning would silently destroy completions the driver has not read,
      * which would look like the firmware answering the wrong request.
      */
-    if (apple_wlan_read_ring_index(s, APPLE_WLAN_RING_INFO_D2H_R_IDX_OFF, id,
-                                   &host_r_idx) &&
+    if (apple_wlan_read_ring_index(s, APPLE_WLAN_RING_INFO_D2H_R_IDX_OFF,
+                                   ring.slot, &host_r_idx) &&
         next == host_r_idx) {
         trace_apple_wlan_d2h_full(id, w_idx, host_r_idx);
         return false;
@@ -1231,8 +1261,8 @@ static bool apple_wlan_d2h_post(AppleWLANDeviceState *s, const uint8_t *item)
         // Wrapped: the next pass through the ring carries the other phase.
         s->ring_phase[id] = !s->ring_phase[id];
     }
-    if (!apple_wlan_write_ring_index(s, APPLE_WLAN_RING_INFO_D2H_W_IDX_OFF, id,
-                                     next)) {
+    if (!apple_wlan_write_ring_index(s, APPLE_WLAN_RING_INFO_D2H_W_IDX_OFF,
+                                     ring.slot, next)) {
         return false;
     }
     trace_apple_wlan_d2h_post(stamped[0],
@@ -1270,8 +1300,42 @@ static void apple_wlan_handle_ring_create(AppleWLANDeviceState *s,
                         APPLE_WLAN_MSGBUF_D2H_RING_CREATE_CMPLT :
                         APPLE_WLAN_MSGBUF_H2D_RING_CREATE_CMPLT;
 
+    bool h2d = item[0] == APPLE_WLAN_MSGBUF_H2D_RING_CREATE;
+    unsigned free_slot = APPLE_WLAN_RING_DYNAMIC_MAX;
+    unsigned d;
+
     trace_apple_wlan_ring_create(item[0], ring_id, ring_type, ring_ptr,
                                  max_items, item_size);
+    /*
+     * Remember it, or the driver's submissions to it are never drained. Reuse
+     * the entry if this ring is being created again, which happens on retry.
+     */
+    for (d = 0; d < APPLE_WLAN_RING_DYNAMIC_MAX; d++) {
+        if (s->dyn_ring[d].valid && s->dyn_ring[d].h2d == h2d &&
+            s->dyn_ring[d].slot == ring_id) {
+            break;
+        }
+        if (!s->dyn_ring[d].valid && free_slot == APPLE_WLAN_RING_DYNAMIC_MAX) {
+            free_slot = d;
+        }
+    }
+    if (d == APPLE_WLAN_RING_DYNAMIC_MAX) {
+        d = free_slot;
+    }
+    if (d < APPLE_WLAN_RING_DYNAMIC_MAX && ring_ptr != 0 && max_items != 0 &&
+        item_size != 0 && item_size <= APPLE_WLAN_RING_ITEM_MAX) {
+        s->dyn_ring[d].base = ring_ptr;
+        s->dyn_ring[d].max_item = max_items;
+        s->dyn_ring[d].item_size = item_size;
+        s->dyn_ring[d].slot = ring_id;
+        s->dyn_ring[d].h2d = h2d;
+        s->dyn_ring[d].valid = true;
+        trace_apple_wlan_dyn_ring_added(d, h2d, ring_id, ring_ptr, max_items,
+                                        item_size);
+    } else {
+        trace_apple_wlan_dyn_ring_rejected(h2d, ring_id, ring_ptr, max_items,
+                                           item_size);
+    }
     apple_wlan_cmplt_init(cmplt, item, reply, APPLE_WLAN_BCME_OK, ring_id);
     apple_wlan_d2h_post(s, cmplt);
 }
@@ -1518,59 +1582,35 @@ static void apple_wlan_handle_ioctl(AppleWLANDeviceState *s,
 }
 
 /*
- * The driver has posted items into the control submission ring and rung the
- * doorbell. Drain them, answer what needs answering, then hand the read index
- * back and interrupt. The items live in host memory reached through the WLAN
- * DART, not in our TCM.
+ * Drain one H2D submission ring and answer what it holds. Returns whether
+ * anything was posted back, so the caller knows to interrupt. Items live in
+ * host memory reached through the WLAN DART, not in our TCM.
  */
-static void apple_wlan_h2d_doorbell(AppleWLANDeviceState *s)
+static bool apple_wlan_drain_h2d_ring(AppleWLANDeviceState *s, unsigned id,
+                                      const AppleWLANRing *ring)
 {
-    AppleWLANRing ring;
     uint16_t w_idx;
-    unsigned id = APPLE_WLAN_RING_H2D_CONTROL_SUBMIT;
     bool posted = false;
 
-    if (!apple_wlan_get_ring(s, id, &ring)) {
-        trace_apple_wlan_doorbell_no_ring(s->fw_shared_offset);
-        return;
+    apple_wlan_ring_check_rebuilt(s, id, ring);
+    if (!apple_wlan_read_ring_index(s, APPLE_WLAN_RING_INFO_H2D_W_IDX_OFF,
+                                   ring->slot, &w_idx)) {
+        trace_apple_wlan_doorbell_no_index(ring->base);
+        return false;
     }
-    apple_wlan_ring_check_rebuilt(s, id, &ring);
-    if (!apple_wlan_read_ring_index(s, APPLE_WLAN_RING_INFO_H2D_W_IDX_OFF, id,
-                                    &w_idx)) {
-        trace_apple_wlan_doorbell_no_index(ring.base);
-        return;
+    if (w_idx >= ring->max_item || s->ring_r_idx[id] == w_idx) {
+        return false;
     }
-    trace_apple_wlan_doorbell(id, ring.base, ring.max_item, ring.item_size,
+    trace_apple_wlan_doorbell(id, ring->base, ring->max_item, ring->item_size,
                               s->ring_r_idx[id], w_idx);
-    /*
-     * Diagnostic: which H2D slots the driver is actually writing to. The
-     * doorbell is one register for every submission ring, so a submission to
-     * anything other than the control ring would otherwise go unnoticed.
-     */
-    for (unsigned slot = 0; slot < 4; slot++) {
-        uint64_t array = apple_wlan_tcm_addr64(
-            s, apple_wlan_ring_info_off(s) + APPLE_WLAN_RING_INFO_H2D_W_IDX_OFF);
-        uint16_t raw = 0;
-
-        if (array == 0) {
-            break;
-        }
-        if (pci_dma_read(PCI_DEVICE(s), array + slot * sizeof(uint16_t), &raw,
-                         sizeof(raw)) == MEMTX_OK) {
-            trace_apple_wlan_h2d_slot(slot, le16_to_cpu(raw));
-        }
-    }
-    if (w_idx >= ring.max_item) {
-        return;
-    }
     while (s->ring_r_idx[id] != w_idx) {
         uint8_t item[APPLE_WLAN_RING_ITEM_MAX] = { 0 };
-        uint64_t addr = ring.base + s->ring_r_idx[id] * ring.item_size;
+        uint64_t addr = ring->base + s->ring_r_idx[id] * ring->item_size;
 
-        if (pci_dma_read(PCI_DEVICE(s), addr, item, ring.item_size) !=
+        if (pci_dma_read(PCI_DEVICE(s), addr, item, ring->item_size) !=
             MEMTX_OK) {
             trace_apple_wlan_ring_dma_fail(addr);
-            return;
+            return posted;
         }
         trace_apple_wlan_ring_item(id, s->ring_r_idx[id], item[0], item[1],
                                    item[2],
@@ -1598,10 +1638,37 @@ static void apple_wlan_h2d_doorbell(AppleWLANDeviceState *s)
             trace_apple_wlan_msgbuf_unhandled(item[0], s->ring_r_idx[id]);
             break;
         }
-        s->ring_r_idx[id] = (s->ring_r_idx[id] + 1) % ring.max_item;
+        s->ring_r_idx[id] = (s->ring_r_idx[id] + 1) % ring->max_item;
     }
-    apple_wlan_write_ring_index(s, APPLE_WLAN_RING_INFO_H2D_R_IDX_OFF, id,
-                                s->ring_r_idx[id]);
+    apple_wlan_write_ring_index(s, APPLE_WLAN_RING_INFO_H2D_R_IDX_OFF,
+                                ring->slot, s->ring_r_idx[id]);
+    return posted;
+}
+
+/*
+ * The doorbell is one register for every submission ring, so a ring of the
+ * driver's own making has to be drained too -- it creates one with
+ * submitH2DRingCreateMsg and posts to it, and leaving that ring alone stalls
+ * whatever was queued there whatever the control ring is doing.
+ */
+static void apple_wlan_h2d_doorbell(AppleWLANDeviceState *s)
+{
+    bool posted = false;
+    bool any = false;
+
+    for (unsigned id = 0; id < APPLE_WLAN_RING_COUNT; id++) {
+        AppleWLANRing ring;
+
+        if (!apple_wlan_get_ring(s, id, &ring) || !ring.h2d) {
+            continue;
+        }
+        any = true;
+        posted |= apple_wlan_drain_h2d_ring(s, id, &ring);
+    }
+    if (!any) {
+        trace_apple_wlan_doorbell_no_ring(s->fw_shared_offset);
+        return;
+    }
     if (posted) {
         /*
          * Only the doorbell. The driver also unmasks FN0_0, but that bit means
