@@ -32,6 +32,7 @@
 #include "qemu/timer.h"
 #include "ui/console.h"
 #include "ui/input.h"
+#include "trace.h"
 
 typedef struct AppleMTSPIBuffer {
     uint8_t *data;
@@ -889,6 +890,17 @@ static void apple_mt_spi_send_path_update(AppleMTSPIState *s, uint64_t ts,
     }
 
     QTAILQ_INSERT_TAIL(&s->pending_fw, packet, next);
+    {
+        AppleMTSPILLPacket *p;
+        unsigned queued = 0;
+
+        QTAILQ_FOREACH (p, &s->pending_fw, next) {
+            queued++;
+        }
+        trace_apple_mt_spi_path(
+            path_stage, s->x, s->y, ABS(x_delta) / ts_delta * 1000,
+            ABS(y_delta) / ts_delta * 1000, ts / SCALE_MS, queued);
+    }
     qemu_irq_lower(s->irq);
 }
 
@@ -982,6 +994,7 @@ static void apple_mt_spi_mouse_event(void *opaque, int dx, int dy, int dz,
                                   MT_SENSOR_SURFACE_HEIGHT);
     s->prev_btn_state = s->btn_state;
     s->btn_state = buttons_state;
+    trace_apple_mt_spi_mouse(dx, dy, s->x, s->y, buttons_state);
 
     if ((s->prev_btn_state & MOUSE_EVENT_LBUTTON) == 0 &&
         (s->btn_state & MOUSE_EVENT_LBUTTON) != 0) {
