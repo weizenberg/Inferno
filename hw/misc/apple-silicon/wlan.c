@@ -401,6 +401,16 @@ static const struct {
 #define APPLE_WLAN_RING_H2D_CONTROL_SUBMIT (0)
 #define APPLE_WLAN_RING_D2H_CONTROL_COMPLETE (2)
 #define APPLE_WLAN_RING_COUNT (5)
+/*
+ * The two index arrays each cover only their own direction, and the driver
+ * hands out slots sequentially as it walks the rings (brcmfmac does the same in
+ * brcmf_pcie_init_ringbuffers). So a D2H ring's slot is its id minus the number
+ * of H2D rings, not its id: ring 2's write index lives at d2h_w_idx[0], and
+ * writing it to d2h_w_idx[2] lands in ring 4's slot instead -- the driver then
+ * sees w_idx == r_idx for the control ring and reports
+ * "Primary Interrupt Pending 0" however many interrupts it has taken.
+ */
+#define APPLE_WLAN_RING_H2D_COUNT (2)
 // The H2D doorbell. brcmfmac calls this BRCMF_PCIE_64_PCIE2REG_H2D_MAILBOX_0.
 #define APPLE_WLAN_PCIE2_H2D_MAILBOX_0 (0x2140)
 #define APPLE_WLAN_PCIE2_H2D_MAILBOX_1 (0x2144)
@@ -909,6 +919,13 @@ static bool apple_wlan_get_ring(AppleWLANDeviceState *s, unsigned id,
            ring->item_size <= APPLE_WLAN_RING_ITEM_MAX;
 }
 
+// A ring's slot in its direction's index array.
+static unsigned apple_wlan_ring_slot(unsigned id)
+{
+    return id < APPLE_WLAN_RING_H2D_COUNT ? id :
+                                            id - APPLE_WLAN_RING_H2D_COUNT;
+}
+
 // The index arrays are u16 per ring, at a host address published in ring_info.
 static bool apple_wlan_read_ring_index(AppleWLANDeviceState *s,
                                        uint32_t ring_info_off, unsigned id,
@@ -921,7 +938,8 @@ static bool apple_wlan_read_ring_index(AppleWLANDeviceState *s,
     if (array == 0) {
         return false;
     }
-    if (pci_dma_read(PCI_DEVICE(s), array + id * sizeof(uint16_t), &raw,
+    if (pci_dma_read(PCI_DEVICE(s),
+                     array + apple_wlan_ring_slot(id) * sizeof(uint16_t), &raw,
                      sizeof(raw)) != MEMTX_OK) {
         return false;
     }
@@ -941,8 +959,9 @@ static bool apple_wlan_write_ring_index(AppleWLANDeviceState *s,
     if (array == 0) {
         return false;
     }
-    return pci_dma_write(PCI_DEVICE(s), array + id * sizeof(uint16_t), &raw,
-                         sizeof(raw)) == MEMTX_OK;
+    return pci_dma_write(PCI_DEVICE(s),
+                         array + apple_wlan_ring_slot(id) * sizeof(uint16_t),
+                         &raw, sizeof(raw)) == MEMTX_OK;
 }
 
 /*
