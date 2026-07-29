@@ -370,6 +370,93 @@ static const struct {
 #define APPLE_WLAN_FW_RING_INFO_MAX_SUBMIT_OFF (0x36)
 #define APPLE_WLAN_FW_RING_MAX_FLOWRINGS (8)
 #define APPLE_WLAN_FW_RING_MAX_DYN_SUBMIT (16)
+
+/*
+ * msgbuf. The layout below is not guessed: it is what the driver itself wrote
+ * into the TCM, observed through apple_wlan_fw_shared_write, and it agrees
+ * field for field with brcmfmac's brcmf_pcie_ringinfo and its ring-mem
+ * accessors. ring_info carries the host DMA addresses of four u16 index arrays
+ * (one entry per ring); ringmem is an array of 0x10-byte descriptors giving
+ * each ring's item count, item size and host base address.
+ */
+#define APPLE_WLAN_RING_INFO_H2D_W_IDX_OFF (0x14)
+#define APPLE_WLAN_RING_INFO_H2D_R_IDX_OFF (0x1C)
+#define APPLE_WLAN_RING_INFO_D2H_W_IDX_OFF (0x24)
+#define APPLE_WLAN_RING_INFO_D2H_R_IDX_OFF (0x2C)
+#define APPLE_WLAN_RING_DESC_SIZE (0x10)
+#define APPLE_WLAN_RING_DESC_MAX_ITEM_OFF (0x04)
+#define APPLE_WLAN_RING_DESC_ITEM_SIZE_OFF (0x06)
+#define APPLE_WLAN_RING_DESC_BASE_OFF (0x08)
+// Ring ids, in the order the driver populates ringmem.
+#define APPLE_WLAN_RING_H2D_CONTROL_SUBMIT (0)
+#define APPLE_WLAN_RING_D2H_CONTROL_COMPLETE (2)
+#define APPLE_WLAN_RING_COUNT (5)
+// The H2D doorbell. brcmfmac calls this BRCMF_PCIE_64_PCIE2REG_H2D_MAILBOX_0.
+#define APPLE_WLAN_PCIE2_H2D_MAILBOX_0 (0x2140)
+#define APPLE_WLAN_PCIE2_H2D_MAILBOX_1 (0x2144)
+// Longest submission item seen (control submit is 40 bytes).
+#define APPLE_WLAN_RING_ITEM_MAX (64)
+
+/*
+ * msgbuf message types, Broadcom's names (brcmfmac's MSGBUF_TYPE_*). Every one
+ * of these was observed being posted by the driver except the *_CMPLT replies,
+ * which are what it is waiting for.
+ */
+#define APPLE_WLAN_MSGBUF_IOCTLPTR_REQ (0x09)
+#define APPLE_WLAN_MSGBUF_IOCTLPTR_REQ_ACK (0x0A)
+#define APPLE_WLAN_MSGBUF_IOCTLRESP_BUF_POST (0x0B)
+#define APPLE_WLAN_MSGBUF_IOCTL_CMPLT (0x0C)
+#define APPLE_WLAN_MSGBUF_EVENT_BUF_POST (0x0D)
+#define APPLE_WLAN_MSGBUF_H2D_RING_CREATE (0x1B)
+#define APPLE_WLAN_MSGBUF_D2H_RING_CREATE (0x1C)
+#define APPLE_WLAN_MSGBUF_H2D_RING_CREATE_CMPLT (0x1D)
+#define APPLE_WLAN_MSGBUF_D2H_RING_CREATE_CMPLT (0x1E)
+// Control completions are 24 bytes, matching ring 2's item size.
+#define APPLE_WLAN_MSGBUF_CMPLT_SIZE (24)
+
+// Offsets within a submission/completion item, from the layouts above.
+#define APPLE_WLAN_MSGBUF_REQUEST_ID_OFF (0x04)
+#define APPLE_WLAN_MSGBUF_STATUS_OFF (0x08)
+#define APPLE_WLAN_MSGBUF_RING_ID_OFF (0x0A)
+
+#define APPLE_WLAN_BCME_OK (0)
+#define APPLE_WLAN_BCME_UNSUPPORTED (-23)
+
+#define APPLE_WLAN_WLC_GET_VAR (262)
+
+/*
+ * How many posted ioctl response buffers to remember. The driver posts one at a
+ * time and reclaims it with each completion, so this only needs to absorb a
+ * burst.
+ */
+#define APPLE_WLAN_IOCTL_RESP_BUFS (8)
+/*
+ * The MSI line apcie hands us is a level, and apcie never lowers it -- every
+ * lowering call site in the tree is commented out, above a comment noting that
+ * iOS storms if an interrupt stays asserted when it is not expected. It does:
+ * leaving it up cost 869k acknowledgements of one vector in a single boot.
+ *
+ * A message-signalled interrupt is really an edge, so the line is held only
+ * long enough to be seen. The AIC does not deliver on the edge; it polls
+ * eir_state every kAICWT (64us), so the hold has to outlast a poll or the
+ * interrupt is simply lost. If the guest still has not serviced the condition
+ * once the line drops, it is re-asserted -- slowly. That is a deliberate
+ * backstop rather than hardware behaviour: real firmware's driver clears
+ * MAILBOXINT and the quiesce path below fires instead.
+ */
+#define APPLE_WLAN_INT_HOLD_NS (200 * 1000)
+#define APPLE_WLAN_INT_RETRY_NS (10 * 1000 * 1000)
+
+#define APPLE_WLAN_IOVAR_NAME_MAX (64)
+#define APPLE_WLAN_IOVAR_PAYLOAD_MAX (512)
+
+/*
+ * The version banner an ioctl "ver" get answers with. This is the shape real
+ * firmware emits, with a deliberately synthetic build stamp and FWID -- it
+ * identifies the stand-in, not any real device.
+ */
+#define APPLE_WLAN_FW_VERSION_STRING \
+    "wl0: Jan  1 2020 00:00:00 version 18.20.309.0.0.0.0 FWID 01-00000000"
 #define APPLE_WLAN_FW_SHARED_NO_OOB_DW (0x20000000)
 #define APPLE_WLAN_FW_SHARED_INBAND_DS (0x40000000)
 /*
@@ -423,6 +510,25 @@ struct AppleWLANDeviceState {
     // PCIe2 core mailbox status (write-1-to-clear) and its enable mask.
     uint32_t mailbox_int;
     uint32_t mailbox_mask;
+    // Our side of each ring's index pair, mirrored to the host arrays.
+    uint16_t ring_r_idx[APPLE_WLAN_RING_COUNT];
+    uint16_t ring_w_idx[APPLE_WLAN_RING_COUNT];
+    /*
+     * The host base each ring last had. The driver tears the rings down and
+     * rebuilds them on retry, zeroing its indices; noticing the base change is
+     * what stops a stale read index from walking the whole ring as garbage.
+     */
+    uint64_t ring_base_seen[APPLE_WLAN_RING_COUNT];
+    // Host buffers posted for ioctl responses, consumed oldest first.
+    struct {
+        uint64_t addr;
+        uint16_t len;
+    } ioctl_resp_buf[APPLE_WLAN_IOCTL_RESP_BUFS];
+    unsigned ioctl_resp_head;
+    unsigned ioctl_resp_count;
+    // Interrupt moderation; see APPLE_WLAN_INT_HOLD_NS.
+    QEMUTimer *int_timer;
+    bool int_asserted;
 
     // Backplane addresses currently mapped by each of BAR0's two windows, set by
     // the guest through PCI config space. Tracking them turns the otherwise
@@ -740,6 +846,434 @@ static void apple_wlan_release_arm_core(AppleWLANDeviceState *s)
     trace_apple_wlan_arm_core_released(s->tcm_written_bytes);
 }
 
+/*
+ * A ring's parameters, read back out of the TCM the driver populated. Reading
+ * them rather than hardcoding them means the model follows whatever the driver
+ * chose, and it fails loudly (false) if the driver has not set a ring up yet.
+ */
+typedef struct AppleWLANRing {
+    uint64_t base;
+    uint16_t max_item;
+    uint16_t item_size;
+} AppleWLANRing;
+
+static uint32_t apple_wlan_ring_info_off(AppleWLANDeviceState *s)
+{
+    return s->fw_shared_offset + APPLE_WLAN_FW_RING_INFO_BACKOFF;
+}
+
+static uint64_t apple_wlan_tcm_addr64(AppleWLANDeviceState *s, uint32_t off)
+{
+    if ((uint64_t)off + 8 > APPLE_WLAN_DEVICE_BAR2_SIZE) {
+        return 0;
+    }
+    return (uint64_t)ldl_le_p(s->bar2_backing + off) |
+           ((uint64_t)ldl_le_p(s->bar2_backing + off + 4) << 32);
+}
+
+static bool apple_wlan_get_ring(AppleWLANDeviceState *s, unsigned id,
+                                AppleWLANRing *ring)
+{
+    uint32_t ringmem;
+    uint32_t desc;
+
+    if (s->fw_shared_offset == 0 || id >= APPLE_WLAN_RING_COUNT) {
+        return false;
+    }
+    ringmem = ldl_le_p(s->bar2_backing + apple_wlan_ring_info_off(s));
+    if (ringmem == 0) {
+        return false;
+    }
+    desc = ringmem + id * APPLE_WLAN_RING_DESC_SIZE;
+    if ((uint64_t)desc + APPLE_WLAN_RING_DESC_SIZE >
+        APPLE_WLAN_DEVICE_BAR2_SIZE) {
+        return false;
+    }
+    ring->max_item =
+        lduw_le_p(s->bar2_backing + desc + APPLE_WLAN_RING_DESC_MAX_ITEM_OFF);
+    ring->item_size =
+        lduw_le_p(s->bar2_backing + desc + APPLE_WLAN_RING_DESC_ITEM_SIZE_OFF);
+    ring->base =
+        apple_wlan_tcm_addr64(s, desc + APPLE_WLAN_RING_DESC_BASE_OFF);
+    return ring->base != 0 && ring->max_item != 0 && ring->item_size != 0 &&
+           ring->item_size <= APPLE_WLAN_RING_ITEM_MAX;
+}
+
+// The index arrays are u16 per ring, at a host address published in ring_info.
+static bool apple_wlan_read_ring_index(AppleWLANDeviceState *s,
+                                       uint32_t ring_info_off, unsigned id,
+                                       uint16_t *out)
+{
+    uint64_t array = apple_wlan_tcm_addr64(s, apple_wlan_ring_info_off(s) +
+                                                  ring_info_off);
+    uint16_t raw;
+
+    if (array == 0) {
+        return false;
+    }
+    if (pci_dma_read(PCI_DEVICE(s), array + id * sizeof(uint16_t), &raw,
+                     sizeof(raw)) != MEMTX_OK) {
+        return false;
+    }
+    *out = le16_to_cpu(raw);
+    return true;
+}
+
+// The index arrays live in host memory; the device owns d2h w and h2d r.
+static bool apple_wlan_write_ring_index(AppleWLANDeviceState *s,
+                                        uint32_t ring_info_off, unsigned id,
+                                        uint16_t value)
+{
+    uint64_t array =
+        apple_wlan_tcm_addr64(s, apple_wlan_ring_info_off(s) + ring_info_off);
+    uint16_t raw = cpu_to_le16(value);
+
+    if (array == 0) {
+        return false;
+    }
+    return pci_dma_write(PCI_DEVICE(s), array + id * sizeof(uint16_t), &raw,
+                         sizeof(raw)) == MEMTX_OK;
+}
+
+/*
+ * Raise the mailbox status the driver's ISR reads, and signal it. The MSI line
+ * is level and apcie never lowers it on its own, so the pairing with the
+ * write-1-to-clear of MAILBOXINT below is what keeps this from latching high
+ * forever -- that clear is the quiesce point apcie.c asks for.
+ */
+static void apple_wlan_int_deassert(AppleWLANDeviceState *s)
+{
+    if (!s->int_asserted) {
+        return;
+    }
+    s->int_asserted = false;
+    if (s->port != NULL) {
+        apple_pcie_port_temp_lower_msi_irq(s->port, 0);
+    }
+}
+
+static void apple_wlan_int_assert(AppleWLANDeviceState *s)
+{
+    PCIDevice *dev = PCI_DEVICE(s);
+    MSIMessage msg;
+
+    if (!msi_enabled(dev) || s->int_asserted) {
+        return;
+    }
+    msg = msi_get_message(dev, 0);
+    trace_apple_wlan_msi_notify(msg.address, msg.data);
+    msi_notify(dev, 0);
+    s->int_asserted = true;
+    timer_mod_ns(s->int_timer,
+                 qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                     APPLE_WLAN_INT_HOLD_NS);
+}
+
+static void apple_wlan_int_timer(void *opaque)
+{
+    AppleWLANDeviceState *s = opaque;
+    bool pending = (s->mailbox_int & s->mailbox_mask) != 0;
+
+    if (s->int_asserted) {
+        apple_wlan_int_deassert(s);
+        if (pending) {
+            timer_mod_ns(s->int_timer,
+                         qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                             APPLE_WLAN_INT_RETRY_NS);
+        }
+        return;
+    }
+    if (pending) {
+        trace_apple_wlan_int_retry(s->mailbox_int, s->mailbox_mask);
+        apple_wlan_int_assert(s);
+    }
+}
+
+static void apple_wlan_raise_int(AppleWLANDeviceState *s, uint32_t bits)
+{
+    s->mailbox_int |= bits;
+    trace_apple_wlan_raise_int(s->mailbox_int, s->mailbox_mask,
+                               msi_enabled(PCI_DEVICE(s)));
+    if ((s->mailbox_int & s->mailbox_mask) == 0) {
+        return;
+    }
+    apple_wlan_int_assert(s);
+}
+
+// The guest has acknowledged; drop the line and stop retrying.
+static void apple_wlan_lower_int_if_quiesced(AppleWLANDeviceState *s)
+{
+    if ((s->mailbox_int & s->mailbox_mask) != 0) {
+        return;
+    }
+    timer_del(s->int_timer);
+    apple_wlan_int_deassert(s);
+}
+
+// Post one control completion. The device owns this ring's write index.
+static bool apple_wlan_d2h_post(AppleWLANDeviceState *s, const uint8_t *item)
+{
+    unsigned id = APPLE_WLAN_RING_D2H_CONTROL_COMPLETE;
+    AppleWLANRing ring;
+    uint16_t w_idx;
+    uint16_t next;
+    uint16_t host_r_idx;
+
+    if (!apple_wlan_get_ring(s, id, &ring)) {
+        trace_apple_wlan_d2h_no_ring(id);
+        return false;
+    }
+    w_idx = s->ring_w_idx[id];
+    next = (w_idx + 1) % ring.max_item;
+    /*
+     * Overrunning would silently destroy completions the driver has not read,
+     * which would look like the firmware answering the wrong request.
+     */
+    if (apple_wlan_read_ring_index(s, APPLE_WLAN_RING_INFO_D2H_R_IDX_OFF, id,
+                                   &host_r_idx) &&
+        next == host_r_idx) {
+        trace_apple_wlan_d2h_full(id, w_idx, host_r_idx);
+        return false;
+    }
+    if (pci_dma_write(PCI_DEVICE(s), ring.base + w_idx * ring.item_size, item,
+                      MIN(ring.item_size, APPLE_WLAN_MSGBUF_CMPLT_SIZE)) !=
+        MEMTX_OK) {
+        trace_apple_wlan_ring_dma_fail(ring.base + w_idx * ring.item_size);
+        return false;
+    }
+    s->ring_w_idx[id] = next;
+    if (!apple_wlan_write_ring_index(s, APPLE_WLAN_RING_INFO_D2H_W_IDX_OFF, id,
+                                     next)) {
+        return false;
+    }
+    trace_apple_wlan_d2h_post(item[0], ldl_le_p(item +
+                                                APPLE_WLAN_MSGBUF_REQUEST_ID_OFF),
+                              w_idx, next);
+    return true;
+}
+
+// Every completion starts as the request's header with a new type and a status.
+static void apple_wlan_cmplt_init(uint8_t *cmplt, const uint8_t *req,
+                                  uint8_t msgtype, int16_t status,
+                                  uint16_t ring_id)
+{
+    memset(cmplt, 0, APPLE_WLAN_MSGBUF_CMPLT_SIZE);
+    cmplt[0] = msgtype;
+    cmplt[1] = req[1];
+    cmplt[2] = req[2];
+    stl_le_p(cmplt + APPLE_WLAN_MSGBUF_REQUEST_ID_OFF,
+             ldl_le_p(req + APPLE_WLAN_MSGBUF_REQUEST_ID_OFF));
+    stw_le_p(cmplt + APPLE_WLAN_MSGBUF_STATUS_OFF, (uint16_t)status);
+    stw_le_p(cmplt + APPLE_WLAN_MSGBUF_RING_ID_OFF, ring_id);
+}
+
+static void apple_wlan_handle_ring_create(AppleWLANDeviceState *s,
+                                          const uint8_t *item)
+{
+    uint16_t ring_id = lduw_le_p(item + 8);
+    uint16_t ring_type = lduw_le_p(item + 10);
+    uint64_t ring_ptr = ldq_le_p(item + 16);
+    uint16_t max_items = lduw_le_p(item + 24);
+    uint16_t item_size = lduw_le_p(item + 26);
+    uint8_t cmplt[APPLE_WLAN_MSGBUF_CMPLT_SIZE];
+    uint8_t reply = item[0] == APPLE_WLAN_MSGBUF_D2H_RING_CREATE ?
+                        APPLE_WLAN_MSGBUF_D2H_RING_CREATE_CMPLT :
+                        APPLE_WLAN_MSGBUF_H2D_RING_CREATE_CMPLT;
+
+    trace_apple_wlan_ring_create(item[0], ring_id, ring_type, ring_ptr,
+                                 max_items, item_size);
+    apple_wlan_cmplt_init(cmplt, item, reply, APPLE_WLAN_BCME_OK, ring_id);
+    apple_wlan_d2h_post(s, cmplt);
+}
+
+static void apple_wlan_handle_resp_buf_post(AppleWLANDeviceState *s,
+                                            const uint8_t *item)
+{
+    uint16_t len = lduw_le_p(item + 8);
+    uint64_t addr = ldq_le_p(item + 16);
+    unsigned slot;
+
+    if (addr == 0 || len == 0) {
+        return;
+    }
+    if (s->ioctl_resp_count == APPLE_WLAN_IOCTL_RESP_BUFS) {
+        // Drop the oldest rather than the newest; the driver reuses in order.
+        s->ioctl_resp_head =
+            (s->ioctl_resp_head + 1) % APPLE_WLAN_IOCTL_RESP_BUFS;
+        s->ioctl_resp_count--;
+    }
+    slot = (s->ioctl_resp_head + s->ioctl_resp_count) %
+           APPLE_WLAN_IOCTL_RESP_BUFS;
+    s->ioctl_resp_buf[slot].addr = addr;
+    s->ioctl_resp_buf[slot].len = len;
+    s->ioctl_resp_count++;
+    trace_apple_wlan_resp_buf_post(addr, len, s->ioctl_resp_count);
+}
+
+/*
+ * Fill an ioctl's response payload. Only the iovars the driver actually asks
+ * for are answered; anything else is refused explicitly, so an unimplemented
+ * one shows up as a refusal in the log instead of as plausible-looking zeroes.
+ */
+static uint16_t apple_wlan_ioctl_response(uint32_t cmd, const char *name,
+                                          uint8_t *buf, uint16_t cap,
+                                          int16_t *status)
+{
+    *status = APPLE_WLAN_BCME_OK;
+
+    if (cmd == APPLE_WLAN_WLC_GET_VAR && strcmp(name, "ver") == 0) {
+        size_t len = strlen(APPLE_WLAN_FW_VERSION_STRING) + 1;
+
+        if (len > cap) {
+            *status = APPLE_WLAN_BCME_UNSUPPORTED;
+            return 0;
+        }
+        memcpy(buf, APPLE_WLAN_FW_VERSION_STRING, len);
+        return (uint16_t)len;
+    }
+    *status = APPLE_WLAN_BCME_UNSUPPORTED;
+    return 0;
+}
+
+static void apple_wlan_handle_ioctl(AppleWLANDeviceState *s,
+                                    const uint8_t *item)
+{
+    uint32_t cmd = ldl_le_p(item + 8);
+    uint16_t trans_id = lduw_le_p(item + 12);
+    uint16_t in_len = lduw_le_p(item + 14);
+    uint16_t out_len = lduw_le_p(item + 16);
+    uint64_t in_addr = ldq_le_p(item + 24);
+    char name[APPLE_WLAN_IOVAR_NAME_MAX] = { 0 };
+    uint8_t cmplt[APPLE_WLAN_MSGBUF_CMPLT_SIZE];
+    uint8_t payload[APPLE_WLAN_IOVAR_PAYLOAD_MAX] = { 0 };
+    int16_t status = APPLE_WLAN_BCME_OK;
+    uint16_t resp_len;
+    uint16_t cap;
+
+    if (in_len != 0 && in_addr != 0) {
+        pci_dma_read(PCI_DEVICE(s), in_addr, name,
+                     MIN(in_len, sizeof(name) - 1));
+    }
+    trace_apple_wlan_ioctl(cmd, trans_id, in_len, out_len, name);
+
+    // The driver expects the request acknowledged before its result arrives.
+    apple_wlan_cmplt_init(cmplt, item, APPLE_WLAN_MSGBUF_IOCTLPTR_REQ_ACK,
+                          APPLE_WLAN_BCME_OK, 0);
+    apple_wlan_d2h_post(s, cmplt);
+
+    cap = MIN(out_len, sizeof(payload));
+    resp_len = apple_wlan_ioctl_response(cmd, name, payload, cap, &status);
+    if (resp_len != 0 && s->ioctl_resp_count != 0) {
+        // The payload goes into a buffer the driver posted, not into the ring.
+        uint64_t addr = s->ioctl_resp_buf[s->ioctl_resp_head].addr;
+        uint16_t len = MIN(resp_len, s->ioctl_resp_buf[s->ioctl_resp_head].len);
+
+        if (pci_dma_write(PCI_DEVICE(s), addr, payload, len) != MEMTX_OK) {
+            trace_apple_wlan_ring_dma_fail(addr);
+            status = APPLE_WLAN_BCME_UNSUPPORTED;
+            resp_len = 0;
+        } else {
+            resp_len = len;
+        }
+        s->ioctl_resp_head =
+            (s->ioctl_resp_head + 1) % APPLE_WLAN_IOCTL_RESP_BUFS;
+        s->ioctl_resp_count--;
+    } else if (resp_len != 0) {
+        trace_apple_wlan_ioctl_no_buf(cmd);
+        status = APPLE_WLAN_BCME_UNSUPPORTED;
+        resp_len = 0;
+    }
+
+    apple_wlan_cmplt_init(cmplt, item, APPLE_WLAN_MSGBUF_IOCTL_CMPLT, status,
+                          0);
+    stw_le_p(cmplt + 12, resp_len);
+    stw_le_p(cmplt + 14, trans_id);
+    stl_le_p(cmplt + 16, cmd);
+    trace_apple_wlan_ioctl_cmplt(cmd, status, resp_len, trans_id);
+    apple_wlan_d2h_post(s, cmplt);
+}
+
+/*
+ * The driver has posted items into the control submission ring and rung the
+ * doorbell. Drain them, answer what needs answering, then hand the read index
+ * back and interrupt. The items live in host memory reached through the WLAN
+ * DART, not in our TCM.
+ */
+static void apple_wlan_h2d_doorbell(AppleWLANDeviceState *s)
+{
+    AppleWLANRing ring;
+    uint16_t w_idx;
+    unsigned id = APPLE_WLAN_RING_H2D_CONTROL_SUBMIT;
+    bool posted = false;
+
+    if (!apple_wlan_get_ring(s, id, &ring)) {
+        trace_apple_wlan_doorbell_no_ring(s->fw_shared_offset);
+        return;
+    }
+    /*
+     * A rebuilt ring starts its indices over. Without this the stale read index
+     * walks the ring's untouched tail and reports a long run of zero items.
+     */
+    if (s->ring_base_seen[id] != ring.base) {
+        trace_apple_wlan_ring_rebuilt(id, s->ring_base_seen[id], ring.base);
+        s->ring_base_seen[id] = ring.base;
+        s->ring_r_idx[id] = 0;
+        s->ring_w_idx[id] = 0;
+    }
+    if (!apple_wlan_read_ring_index(s, APPLE_WLAN_RING_INFO_H2D_W_IDX_OFF, id,
+                                    &w_idx)) {
+        trace_apple_wlan_doorbell_no_index(ring.base);
+        return;
+    }
+    trace_apple_wlan_doorbell(id, ring.base, ring.max_item, ring.item_size,
+                              s->ring_r_idx[id], w_idx);
+    if (w_idx >= ring.max_item) {
+        return;
+    }
+    while (s->ring_r_idx[id] != w_idx) {
+        uint8_t item[APPLE_WLAN_RING_ITEM_MAX] = { 0 };
+        uint64_t addr = ring.base + s->ring_r_idx[id] * ring.item_size;
+
+        if (pci_dma_read(PCI_DEVICE(s), addr, item, ring.item_size) !=
+            MEMTX_OK) {
+            trace_apple_wlan_ring_dma_fail(addr);
+            return;
+        }
+        trace_apple_wlan_ring_item(id, s->ring_r_idx[id], item[0], item[1],
+                                   item[2],
+                                   ldl_le_p(item +
+                                            APPLE_WLAN_MSGBUF_REQUEST_ID_OFF),
+                                   ldq_le_p(item + 8), ldq_le_p(item + 16),
+                                   ldq_le_p(item + 24), ldq_le_p(item + 32));
+        switch (item[0]) {
+        case APPLE_WLAN_MSGBUF_H2D_RING_CREATE:
+        case APPLE_WLAN_MSGBUF_D2H_RING_CREATE:
+            apple_wlan_handle_ring_create(s, item);
+            posted = true;
+            break;
+        case APPLE_WLAN_MSGBUF_IOCTLRESP_BUF_POST:
+            apple_wlan_handle_resp_buf_post(s, item);
+            break;
+        case APPLE_WLAN_MSGBUF_EVENT_BUF_POST:
+            // Nothing to complete; there are no events to deliver yet.
+            break;
+        case APPLE_WLAN_MSGBUF_IOCTLPTR_REQ:
+            apple_wlan_handle_ioctl(s, item);
+            posted = true;
+            break;
+        default:
+            trace_apple_wlan_msgbuf_unhandled(item[0], s->ring_r_idx[id]);
+            break;
+        }
+        s->ring_r_idx[id] = (s->ring_r_idx[id] + 1) % ring.max_item;
+    }
+    apple_wlan_write_ring_index(s, APPLE_WLAN_RING_INFO_H2D_R_IDX_OFF, id,
+                                s->ring_r_idx[id]);
+    if (posted) {
+        apple_wlan_raise_int(s, APPLE_WLAN_MB_INT_D2H_DB0);
+    }
+}
+
 static void apple_wlan_bar0_ops_write(void *opaque, hwaddr offset,
                                       uint64_t value, unsigned size)
 {
@@ -786,9 +1320,13 @@ static void apple_wlan_bar0_ops_write(void *opaque, hwaddr offset,
         s->mailbox_int &= ~(uint32_t)value;
         trace_apple_wlan_mailbox_int(s->mailbox_int, (uint32_t)value,
                                      s->mailbox_mask);
+        apple_wlan_lower_int_if_quiesced(s);
     } else if (offset == APPLE_WLAN_PCIE2_MAILBOXMASK) {
         s->mailbox_mask = (uint32_t)value;
         trace_apple_wlan_mailbox_mask(s->mailbox_mask);
+    } else if (offset == APPLE_WLAN_PCIE2_H2D_MAILBOX_0 ||
+               offset == APPLE_WLAN_PCIE2_H2D_MAILBOX_1) {
+        apple_wlan_h2d_doorbell(s);
     } else {
         if (offset + size <= sizeof(s->bar0_regs)) {
             memcpy(s->bar0_regs + offset, &value, size);
@@ -875,6 +1413,16 @@ static void apple_wlan_bar2_ops_write(void *opaque, hwaddr offset,
     memcpy(s->bar2_backing + offset, &value, size);
     s->tcm_written_bytes += size;
     /*
+     * Trace writes inside the published structure. The msgbuf rings live in host
+     * memory, so the driver writes their DMA addresses and sizes in here -- this
+     * is how those get discovered rather than guessed.
+     */
+    if (s->fw_shared_offset != 0 && offset >= s->fw_shared_offset &&
+        offset < s->fw_shared_offset + APPLE_WLAN_FW_SHARED_WINDOW) {
+        trace_apple_wlan_fw_shared_write(
+            (uint32_t)(offset - s->fw_shared_offset), size, value);
+    }
+    /*
      * The driver retries the whole bring-up on failure, rewriting the signature
      * and polling again, so the stand-in has to re-arm. A write covering the word
      * it last answered means a fresh attempt is under way.
@@ -928,6 +1476,8 @@ static void apple_wlan_device_pci_realize(PCIDevice *dev, Error **errp)
     pci_set_word(pci_conf + PCI_SUBSYSTEM_VENDOR_ID, APPLE_WLAN_SUBVENDOR_ID);
     pci_set_word(pci_conf + PCI_SUBSYSTEM_ID, APPLE_WLAN_SUBDEVICE_ID);
 
+    s->int_timer =
+        timer_new_ns(QEMU_CLOCK_VIRTUAL, apple_wlan_int_timer, s);
     s->bar2_backing = g_malloc0(APPLE_WLAN_DEVICE_BAR2_SIZE);
     s->backplane = g_hash_table_new_full(g_direct_hash, g_direct_equal, NULL,
                                         g_free);
@@ -1041,6 +1591,10 @@ static void apple_wlan_device_pci_uninit(PCIDevice *dev)
     g_clear_pointer(&s->bar2_backing, g_free);
     pcie_aer_exit(dev);
     pcie_cap_exit(dev);
+    if (s->int_timer != NULL) {
+        timer_free(s->int_timer);
+        s->int_timer = NULL;
+    }
     msi_uninit(dev);
 }
 
