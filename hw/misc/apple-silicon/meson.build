@@ -14,6 +14,7 @@ system_ss.add(when: 'CONFIG_APPLE_SOC', if_true: files(
     'aop.c',
     'baseband.c',
     'buttons.c',
+    'wlan.c',
     'tempsensor.c',
     'mic_tempsensor.c',
     'fan53740.c',

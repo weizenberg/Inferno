@@ -487,13 +487,19 @@ static bool ck_kp_mac_mount_callback(void *ctx, uint8_t *buffer)
 static void ck_kp_mac_mount_patch(CKPatcherRange *range)
 {
     static const uint8_t pattern[] = {
-        0xE9, 0x2F, 0x1F, 0x32, // orr w9, wzr, 0x1FFE
+        0xE9,
+        0x2F,
+        0x1F,
+        0x32, // orr w9, wzr, 0x1FFE
     };
     if (!ck_patcher_find_callback(
             range, "allow remounting rootfs, union mounts (old)", pattern, NULL,
             sizeof(pattern), sizeof(uint32_t), ck_kp_mac_mount_callback)) {
         static const uint8_t new_pattern[] = {
-            0xC9, 0xFF, 0x83, 0x12, // movz w/x9, 0x1FFE/-0x1FFF
+            0xC9,
+            0xFF,
+            0x83,
+            0x12, // movz w/x9, 0x1FFE/-0x1FFF
         };
         static const uint8_t new_mask[] = { 0xFF, 0xFF, 0xFF, 0x3F };
         QEMU_BUILD_BUG_ON(sizeof(new_pattern) != sizeof(new_mask));
@@ -709,11 +715,57 @@ static void ck_kp_img4_patches(CKPatcherRange *range)
 {
     // in Img4DecodePerformTrustEvaluationWithCallbacksInternal
     static const uint8_t pattern[] = {
-        0x21, 0x09, 0x43, 0xB2, // orr x1, x9, #0xe000000000000000
+        0x21,
+        0x09,
+        0x43,
+        0xB2, // orr x1, x9, #0xe000000000000000
     };
     ck_patcher_find_callback(
         range, "allow unsigned firmware in img4_firmware_evaluate", pattern,
         NULL, sizeof(pattern), sizeof(uint32_t), ck_kp_img4_callback);
+}
+
+/*
+ * Redirect AppleBCMWLANBusInterfacePCIe's CCLogStream::logCrit calls to
+ * logAlert. Its error paths (bus attach, createEventSource, configureDevice)
+ * are logCrit, which the stream level suppresses and routes only to the
+ * CCLog pipe, leaving failures invisible on the serial console; logAlert
+ * prints there. Both are varargs sinks with identical signatures, so
+ * retargeting the BL is sufficient.
+ */
+static void ck_kp_wlan_log_patch(CKPatcherRange *range)
+{
+    const vaddr log_crit = 0xFFFFFFF0083F808C;
+    const vaddr log_info = 0xFFFFFFF0083F82E4;
+    const vaddr log_alert = 0xFFFFFFF0083F7FC4;
+    size_t count = 0;
+
+    if (range == NULL) {
+        warn_report("`WLAN log` patch: kext text range not found");
+        return;
+    }
+
+    for (vaddr off = 0; off < range->length; off += sizeof(uint32_t)) {
+        uint32_t insn = ldl_le_p(range->ptr + off);
+        int64_t site;
+        int64_t target;
+
+        if ((insn & 0xFC000000) != 0x94000000) {
+            continue;
+        }
+        site = (int64_t)(range->addr + off);
+        target = site + ((int64_t)((int32_t)(insn << 6) >> 6) * 4);
+        if (target != (int64_t)log_crit && target != (int64_t)log_info) {
+            continue;
+        }
+        stl_le_p(
+            range->ptr + off,
+            (insn & 0xFC000000) |
+                ((uint32_t)(((int64_t)log_alert - site) / 4) & 0x03FFFFFF));
+        count++;
+    }
+    info_report("`WLAN log` patch retargeted %zu log calls in `%s`.", count,
+                range->name);
 }
 
 static void ck_kp_cs_patches(CKPatcherRange *range)
@@ -808,8 +860,8 @@ static void ck_kp_gxf_hvc_patches(CKPatcherRange *range)
 
     genter = ck_kp_gxf_rewrite_all(range, APPLE_GXF_INSN_GENTER,
                                    HVF_HVC_GXF_ENTER_BASE, true);
-    gexit = ck_kp_gxf_rewrite_all(range, APPLE_GXF_INSN_GEXIT,
-                                  HVF_HVC_GXF_EXIT, false);
+    gexit = ck_kp_gxf_rewrite_all(range, APPLE_GXF_INSN_GEXIT, HVF_HVC_GXF_EXIT,
+                                  false);
 
     if (genter == 0 && gexit == 0) {
         warn_report("`GXF to HVC` patch found no GENTER/GEXIT in `%s`.",
@@ -829,6 +881,7 @@ void ck_patch_kernel(MachoHeader64 *hdr)
     g_autofree CKPatcherRange *amfi_text;
     g_autofree CKPatcherRange *sep_mgr_text;
     g_autofree CKPatcherRange *img4_text;
+    g_autofree CKPatcherRange *wlan_bus_text;
     g_autofree CKPatcherRange *kernel_text;
     g_autofree CKPatcherRange *kernel_const;
     g_autofree CKPatcherRange *kernel_ppltext;
@@ -852,6 +905,15 @@ void ck_patch_kernel(MachoHeader64 *hdr)
 
     img4_text = ck_kp_find_image_text(hdr, "com.apple.security.AppleImage4");
     ck_kp_img4_patches(img4_text);
+
+    /*
+     * The kmod load-address table stores chained-fixup-encoded pointers on
+     * this kernelcache, so locate the kext text by its final-layout VAs
+     * (symbol-verified) instead of by bundle id.
+     */
+    wlan_bus_text =
+        ck_kp_range_from_va("wlan-bus", 0xFFFFFFF0095B24D0, 0x43000);
+    ck_kp_wlan_log_patch(wlan_bus_text);
 
     kernel_text = ck_kp_get_kernel_section(hdr, "__TEXT_EXEC", "__text");
     ck_kp_mac_mount_patch(kernel_text);

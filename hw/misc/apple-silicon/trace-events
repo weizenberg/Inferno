@@ -3,3 +3,62 @@ apple_aes_reg_read(uint64_t addr, uint32_t val) "0x%04" PRIx64 " val 0x%08x"
 apple_aes_reg_write(uint64_t addr, uint32_t orig, uint32_t old, uint32_t result) "0x%04" PRIx64 " orig 0x%08x old 0x%08x val 0x%08x"
 apple_aes_update_irq(uint32_t level) "level %d"
 apple_aes_process_command(uint32_t op) "op 0x%x"
+
+# wlan.c
+apple_wlan_bar0_read(uint64_t offset, unsigned size, uint64_t val) "offset 0x%05" PRIx64 " size %u val 0x%" PRIx64
+apple_wlan_bar0_write(uint64_t offset, unsigned size, uint64_t val) "offset 0x%05" PRIx64 " size %u val 0x%" PRIx64
+apple_wlan_tcm_written(uint64_t bytes, uint64_t offset) "TCM written: %" PRIu64 " bytes, last at bar2+0x%06" PRIx64
+apple_wlan_arm_core_released(uint64_t tcm_bytes) "ARM core released after %" PRIu64 " TCM bytes"
+apple_wlan_fw_alive_marker(uint32_t off, uint32_t shared, uint64_t tcm_bytes) "fw shared-memory address bar2+0x%06x <- 0x%08x (%" PRIu64 " TCM bytes written)"
+apple_wlan_fw_shared_read(uint32_t field, unsigned size, uint64_t val) "fw shared+0x%03x size %u -> 0x%" PRIx64
+apple_wlan_fw_shared_write(uint32_t field, unsigned size, uint64_t val) "fw shared+0x%03x size %u <- 0x%" PRIx64
+apple_wlan_mailbox_int(uint32_t status, uint32_t cleared, uint32_t mask) "MAILBOXINT now 0x%08x (cleared 0x%08x, mask 0x%08x)"
+apple_wlan_mailbox_mask(uint32_t mask) "MAILBOXMASK <- 0x%08x"
+apple_wlan_bar0_window(uint32_t cfg, uint32_t page, uint32_t base) "window cfg 0x%02x (bar0 page %u) <- backplane 0x%08x"
+apple_wlan_backplane_read(uint32_t backplane, uint64_t offset, unsigned size, uint64_t val) "backplane 0x%08x (bar0+0x%05" PRIx64 ") size %u -> 0x%" PRIx64
+apple_wlan_backplane_write(uint32_t backplane, uint64_t offset, unsigned size, uint64_t val) "backplane 0x%08x (bar0+0x%05" PRIx64 ") size %u <- 0x%" PRIx64
+apple_wlan_backplane_written(uint64_t bytes, uint32_t pages, uint32_t hash) "backplane written: %" PRIu64 " bytes across %u pages, fnv1a 0x%08x"
+apple_wlan_srom_read(uint32_t off, unsigned size, uint64_t val) "srom[0x%03x] size %u -> 0x%" PRIx64
+apple_wlan_otp_read(uint32_t off, unsigned size, uint64_t val) "otp[0x%03x] size %u -> 0x%" PRIx64
+apple_wlan_gp11_read(uint32_t val) "val 0x%08x"
+apple_wlan_gp11_write(uint32_t val) "val 0x%08x"
+apple_wlan_doorbell(unsigned id, uint64_t base, uint16_t max_item, uint16_t item_size, uint16_t r_idx, uint16_t w_idx) "H2D doorbell ring %u base 0x%" PRIx64 " %u x %u r=%u w=%u"
+apple_wlan_doorbell_no_ring(uint32_t shared) "H2D doorbell but ring 0 not set up (shared 0x%x)"
+apple_wlan_doorbell_no_index(uint64_t base) "H2D doorbell but no index array (ring base 0x%" PRIx64 ")"
+apple_wlan_ring_dma_fail(uint64_t addr) "ring DMA read failed at 0x%" PRIx64
+apple_wlan_ring_item(unsigned id, uint16_t idx, uint8_t msgtype, uint8_t ifidx, uint8_t flags, uint32_t request_id, uint64_t w1, uint64_t w2, uint64_t w3, uint64_t w4) "ring %u item %u msgtype 0x%02x ifidx %u flags 0x%02x req 0x%08x | %016" PRIx64 " %016" PRIx64 " %016" PRIx64 " %016" PRIx64
+apple_wlan_raise_int(uint32_t status, uint32_t mask, bool msi) "raise int: MAILBOXINT 0x%08x mask 0x%08x msi %d"
+apple_wlan_d2h_no_ring(unsigned id) "cannot post completion: ring %u not set up"
+apple_wlan_d2h_full(unsigned id, uint16_t w_idx, uint16_t r_idx) "completion ring %u full: w=%u r=%u"
+apple_wlan_d2h_post(uint8_t msgtype, uint32_t request_id, uint16_t w_idx, uint16_t next, uint8_t flags) "posted completion 0x%02x req 0x%08x at %u -> w=%u flags 0x%02x"
+apple_wlan_ring_create(uint8_t msgtype, uint16_t ring_id, uint16_t ring_type, uint64_t ptr, uint16_t max_items, uint16_t item_size) "ring create 0x%02x id %u type %u ptr 0x%" PRIx64 " %u x %u"
+apple_wlan_resp_buf_post(uint64_t addr, uint16_t len, unsigned count) "ioctl resp buf 0x%" PRIx64 " len %u (%u held)"
+apple_wlan_ioctl(uint32_t cmd, uint16_t trans_id, uint16_t in_len, uint16_t out_len, const char *name) "ioctl cmd %u trans %u in %u out %u name \"%s\""
+apple_wlan_ioctl_cmplt(uint32_t cmd, int16_t status, uint16_t resp_len, uint16_t trans_id) "ioctl cmd %u -> status %d resp_len %u trans %u"
+apple_wlan_ioctl_no_buf(uint32_t cmd) "ioctl cmd %u has a response but no posted buffer"
+apple_wlan_ring_rebuilt(unsigned id, uint64_t old_base, uint64_t base) "ring %u rebuilt: 0x%" PRIx64 " -> 0x%" PRIx64
+apple_wlan_msgbuf_unhandled(uint8_t msgtype, uint16_t idx) "unhandled msgbuf type 0x%02x at item %u"
+apple_wlan_msi_notify(uint64_t addr, uint32_t data) "MSI notify -> 0x%" PRIx64 " data 0x%08x"
+apple_wlan_int_retry(uint32_t status, uint32_t mask) "re-asserting unserviced interrupt: MAILBOXINT 0x%08x mask 0x%08x"
+apple_wlan_ioctl_set_accepted(const char *name, uint16_t in_len) "accepted iovar set \"%s\" (%u bytes)"
+apple_wlan_ioctl_action_accepted(uint32_t cmd) "accepted action command %u"
+apple_wlan_dyn_ring_added(unsigned entry, bool h2d, uint16_t ring_id, uint64_t base, uint16_t max_item, uint16_t item_size) "dynamic ring %u: h2d %d slot %u base 0x%" PRIx64 " %u x %u"
+apple_wlan_dyn_ring_rejected(bool h2d, uint16_t ring_id, uint64_t base, uint16_t max_item, uint16_t item_size) "dynamic ring rejected: h2d %d slot %u base 0x%" PRIx64 " %u x %u"
+apple_wlan_event_buf_post(uint64_t addr, uint16_t len, unsigned count) "event buf 0x%" PRIx64 " len %u (%u held)"
+apple_wlan_event_no_buf(uint32_t event_type) "cannot deliver event %u: no posted buffer big enough"
+apple_wlan_post_event(uint32_t event_type, uint32_t status, uint64_t addr, uint16_t len) "event %u status %u -> buf 0x%" PRIx64 " len %u"
+apple_wlan_escan_result(uint16_t sync_id, const char *ssid) "escan complete, sync id %u, reporting \"%s\""
+apple_wlan_join(const char *ssid, uint16_t bssid_cnt, uint32_t chanspec_num) "join \"%s\": %u candidate BSSIDs, %u chanspecs"
+apple_wlan_join_short(uint16_t in_len) "WLC_SET_SSID payload too short: %u bytes"
+apple_wlan_join_unknown(const char *ssid) "refusing join of unknown network \"%s\""
+apple_wlan_flow_ring_create(uint16_t ring_id, uint8_t tid, uint64_t da, uint64_t base, uint16_t max_item, uint16_t item_size) "flow ring create id %u tid %u to %012" PRIx64 " base 0x%" PRIx64 " %u x %u"
+apple_wlan_flow_ring_gone(uint8_t msgtype, uint16_t ring_id) "flow ring msg 0x%02x for id %u"
+apple_wlan_ring_empty_item(unsigned id, uint16_t r_idx, uint16_t w_idx) "ring %u item %u is empty, not chasing w=%u"
+apple_wlan_h2d_w_idx_dump(unsigned slot, uint16_t value) "h2d_w_idx[%u] = %u"
+apple_wlan_ring_reset(unsigned id, uint16_t r_idx) "ring %u reset by the driver: dropping read index %u"
+apple_wlan_int_give_up(uint32_t status, unsigned retries) "giving up on unserviced interrupt: MAILBOXINT 0x%08x after %u retries"
+apple_wlan_tx_post(uint32_t request_id, uint64_t dst, uint16_t ethertype, uint64_t data_addr, uint16_t data_len) "tx req 0x%08x to %012" PRIx64 " type 0x%04x payload 0x%" PRIx64 " len %u"
+apple_wlan_rx_buf_post(uint32_t request_id, uint64_t data_addr, uint16_t data_len, unsigned count) "rx buf req 0x%08x at 0x%" PRIx64 " len %u (%u held)"
+apple_wlan_rx_buf_full(uint32_t request_id) "cannot retain rx buf req 0x%08x: pool full"
+apple_wlan_rx_too_large(size_t size, uint16_t data_len) "dropping rx frame of %zu bytes: guest buffer has %u"
+apple_wlan_rx_frame(uint32_t request_id, size_t size, uint64_t data_addr) "rx req 0x%08x len %zu -> 0x%" PRIx64

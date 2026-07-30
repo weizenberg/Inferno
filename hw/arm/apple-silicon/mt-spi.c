@@ -32,6 +32,7 @@
 #include "qemu/timer.h"
 #include "ui/console.h"
 #include "ui/input.h"
+#include "trace.h"
 
 typedef struct AppleMTSPIBuffer {
     uint8_t *data;
@@ -812,6 +813,8 @@ static void apple_mt_spi_send_path_update(AppleMTSPIState *s, uint64_t ts,
     uint64_t ts_delta;
     int32_t x_delta;
     int32_t y_delta;
+    uint16_t x_vel;
+    uint16_t y_vel;
 
     packet = g_new0(AppleMTSPILLPacket, 1);
 
@@ -821,6 +824,18 @@ static void apple_mt_spi_send_path_update(AppleMTSPIState *s, uint64_t ts,
 
     x_delta = s->x - s->prev_x;
     y_delta = s->y - s->prev_y;
+    /*
+     * Sensor units per second. ts_delta is nanoseconds, so the obvious
+     * `ABS(delta) / ts_delta * 1000` divides first by a number in the millions
+     * and reports zero for every real gesture -- traced across a 350 ms swipe
+     * covering two thirds of the surface, every packet carried vel (0,0). Scale
+     * before dividing, in 64-bit, and clamp: a full-height flick is around
+     * 40000 units/s, which fits, but nothing stops a faster one overflowing.
+     */
+    x_vel = MIN((uint64_t)ABS(x_delta) * NANOSECONDS_PER_SECOND / ts_delta,
+                UINT16_MAX);
+    y_vel = MIN((uint64_t)ABS(y_delta) * NANOSECONDS_PER_SECOND / ts_delta,
+                UINT16_MAX);
 
     packet->type = LL_PACKET_LOSSLESS_OUTPUT;
     apple_mt_spi_buf_ensure_capacity(&packet->buf, 9 + 27 + 20 + 2);
@@ -854,8 +869,8 @@ static void apple_mt_spi_send_path_update(AppleMTSPIState *s, uint64_t ts,
     apple_mt_spi_buf_push_byte(&packet->buf, 1); // Hand ID
     apple_mt_spi_buf_push_word(&packet->buf, s->x);
     apple_mt_spi_buf_push_word(&packet->buf, s->y);
-    apple_mt_spi_buf_push_word(&packet->buf, ABS(x_delta) / ts_delta * 1000);
-    apple_mt_spi_buf_push_word(&packet->buf, ABS(y_delta) / ts_delta * 1000);
+    apple_mt_spi_buf_push_word(&packet->buf, x_vel);
+    apple_mt_spi_buf_push_word(&packet->buf, y_vel);
     apple_mt_spi_buf_push_word(&packet->buf, 660); // rad0
     apple_mt_spi_buf_push_word(&packet->buf,
                                580); // rad1
@@ -889,6 +904,16 @@ static void apple_mt_spi_send_path_update(AppleMTSPIState *s, uint64_t ts,
     }
 
     QTAILQ_INSERT_TAIL(&s->pending_fw, packet, next);
+    {
+        AppleMTSPILLPacket *p;
+        unsigned queued = 0;
+
+        QTAILQ_FOREACH (p, &s->pending_fw, next) {
+            queued++;
+        }
+        trace_apple_mt_spi_path(path_stage, s->x, s->y, x_vel, y_vel,
+                                ts / SCALE_MS, queued);
+    }
     qemu_irq_lower(s->irq);
 }
 
@@ -982,6 +1007,7 @@ static void apple_mt_spi_mouse_event(void *opaque, int dx, int dy, int dz,
                                   MT_SENSOR_SURFACE_HEIGHT);
     s->prev_btn_state = s->btn_state;
     s->btn_state = buttons_state;
+    trace_apple_mt_spi_mouse(dx, dy, s->x, s->y, buttons_state);
 
     if ((s->prev_btn_state & MOUSE_EVENT_LBUTTON) == 0 &&
         (s->btn_state & MOUSE_EVENT_LBUTTON) != 0) {

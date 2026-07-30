@@ -193,6 +193,8 @@ static void apple_aic_set_irq(void *opaque, int irq, int level)
     QEMU_LOCK_GUARD(&s->mutex);
 
     trace_aic_set_irq(irq, level);
+    trace_aic_set_irq_mask(irq, level, test_bit32(irq, s->eir_mask) != 0,
+                           s->eir_dest[irq]);
     if (level) {
         set_bit32(irq, s->eir_state);
     } else {
@@ -237,6 +239,7 @@ static void apple_aic_write(void *opaque, hwaddr addr, uint64_t data,
     AppleAICState *s = o->aic;
     uint32_t val = (uint32_t)data;
 
+    trace_apple_aic_mmio_wr(addr, size, data);
     QEMU_LOCK_GUARD(&s->mutex);
 
     switch (addr) {
@@ -381,6 +384,9 @@ static uint64_t apple_aic_read(void *opaque, hwaddr addr, unsigned size)
     AppleAICCPU *o = opaque;
     AppleAICState *s = o->aic;
 
+    if (addr != REG_AIC_IACK) {
+        trace_apple_aic_mmio_rd(addr, size);
+    }
     QEMU_LOCK_GUARD(&s->mutex);
 
     switch (addr) {
@@ -414,6 +420,7 @@ static uint64_t apple_aic_read(void *opaque, hwaddr addr, unsigned size)
             if (test_bit32(i, s->eir_mask) == 0) {
                 if (s->eir_dest[i] & (1 << o->cpu_id)) {
                     set_bit32(i, s->eir_mask);
+                    trace_aic_ack(o->cpu_id, i);
                     return kAIC_INT_EXT | AIC_INT_EXTID(i);
                 }
             }

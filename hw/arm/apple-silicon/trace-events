@@ -6,3 +6,8 @@ apple_sep_iop_wakeup(const char *role) "%s"
 # dart.c
 
 apple_dart_dma_mirror_install(const char *id, uint64_t mapped, uint64_t total, uint32_t mirrored) "%s: %" PRIu64 "/%" PRIu64 " pages mapped, %u mirrored as RAM"
+
+# mt-spi.c
+
+apple_mt_spi_path(uint8_t stage, uint16_t x, uint16_t y, uint16_t vx, uint16_t vy, uint64_t ts_ms, unsigned queued) "path stage %u at (%u,%u) vel (%u,%u) ts %" PRIu64 "ms (%u queued)"
+apple_mt_spi_mouse(int x, int y, uint16_t sx, uint16_t sy, int buttons) "mouse abs (%d,%d) -> sensor (%u,%u) buttons 0x%x"

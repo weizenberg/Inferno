@@ -72,12 +72,19 @@ typedef struct ApplePCIEMSI {
 } ApplePCIEMSI;
 #endif
 
+#define APCIE_MAX_RANGES (4)
+
 struct ApplePCIEHost {
     PCIExpressHost parent_obj;
 
     ApplePCIEState *pcie;
 
     MemoryRegion mmio, io;
+    // Aliases that place the PCI memory space into the system memory map, one
+    // per `ranges` entry of the apcie DeviceTree node. Without these an
+    // endpoint's BARs are only mapped inside `mmio`, which nothing in the
+    // guest's physical address space points at, so no CPU access can reach them.
+    MemoryRegion mmio_windows[APCIE_MAX_RANGES];
     qemu_irq irqs[4];
     qemu_irq msi_irqs[8 * APCIE_MAX_PORTS];
     // uint32_t clkreq_gpio_id;

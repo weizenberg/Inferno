@@ -155,6 +155,9 @@ static const char *KEEP_COMP[] = {
     "mic-temp-sens,ica60\0$",
     "aapl,spmi\0$",
     "accbuck,fan53740\0$",
+    // WiFi endpoint; when the t8030 `enable-wlan` property is off the node is
+    // still dropped by REM_NAMES, so keeping this entry unconditional is safe.
+    "wlan-pcie,bcm4378\0$",
 };
 
 static const char *REM_NAMES[] = {
@@ -254,7 +257,8 @@ static uint64_t sstrlen(const char *str)
     return srawmemchr(str, '$') - str;
 }
 
-static void apple_boot_process_dt_node(AppleDTNode *node, AppleDTNode *parent)
+static void apple_boot_process_dt_node(AppleDTNode *node, AppleDTNode *parent,
+                                       uint32_t keep_flags)
 {
     GList *iter = NULL;
     AppleDTNode *child = NULL;
@@ -287,6 +291,14 @@ static void apple_boot_process_dt_node(AppleDTNode *node, AppleDTNode *parent)
         assert_nonnull(prop->data);
         for (i = 0; i < ARRAY_SIZE(REM_NAMES); i++) {
             uint64_t size = MIN(prop->len, sstrlen(REM_NAMES[i]));
+            // The WiFi endpoint/params nodes (and optionally the AMFM
+            // combo-chip power controller) stay when enabled.
+            if (((keep_flags & APPLE_BOOT_KEEP_WLAN) != 0 &&
+                 memcmp(REM_NAMES[i], "wlan\0$", size) == 0) ||
+                ((keep_flags & APPLE_BOOT_KEEP_AMFM) != 0 &&
+                 memcmp(REM_NAMES[i], "amfm\0$", size) == 0)) {
+                continue;
+            }
             if (memcmp(prop->data, REM_NAMES[i], size) == 0) {
                 assert_nonnull(parent);
                 DINFO("Removing node `%s` (blacklisted name)",
@@ -301,6 +313,10 @@ static void apple_boot_process_dt_node(AppleDTNode *node, AppleDTNode *parent)
         assert_nonnull(prop->data);
         for (i = 0; i < ARRAY_SIZE(REM_DEV_TYPES); i++) {
             uint64_t size = MIN(prop->len, sstrlen(REM_DEV_TYPES[i]));
+            if ((keep_flags & APPLE_BOOT_KEEP_WLAN) != 0 &&
+                memcmp(REM_DEV_TYPES[i], "wlan\0$", size) == 0) {
+                continue;
+            }
             if (memcmp(prop->data, REM_DEV_TYPES[i], size) == 0) {
                 assert_nonnull(parent);
                 DINFO("Removing node `%s` (blacklisted device type `%s`)",
@@ -326,7 +342,7 @@ static void apple_boot_process_dt_node(AppleDTNode *node, AppleDTNode *parent)
 
         // iter might get invalidated
         iter = iter->next;
-        apple_boot_process_dt_node(child, node);
+        apple_boot_process_dt_node(child, node, keep_flags);
     }
 }
 
@@ -524,7 +540,7 @@ static void apple_boot_init_mem_ranges(AppleDTNode *root)
 }
 
 void apple_boot_populate_dt(AppleDTNode *root, AppleBootInfo *info,
-                            bool auto_boot)
+                            bool auto_boot, uint32_t keep_flags)
 {
     AppleDTNode *child;
     AppleDTProp *prop;
@@ -608,7 +624,7 @@ void apple_boot_populate_dt(AppleDTNode *root, AppleBootInfo *info,
 
     apple_boot_init_mem_ranges(root);
 
-    apple_boot_process_dt_node(root, NULL);
+    apple_boot_process_dt_node(root, NULL, keep_flags);
 
     // Prevent further additions.
     info->device_tree_size = ROUND_UP_16K(apple_dt_finalise(root));
