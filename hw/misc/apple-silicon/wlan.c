@@ -514,6 +514,8 @@ static const struct {
 
 #define APPLE_WLAN_MSGBUF_IOCTLPTR_REQ (0x09)
 #define APPLE_WLAN_MSGBUF_IOCTLPTR_REQ_ACK (0x0A)
+#define APPLE_WLAN_MSGBUF_TX_POST (0x0F)
+#define APPLE_WLAN_MSGBUF_TX_STATUS (0x10)
 #define APPLE_WLAN_MSGBUF_IOCTLRESP_BUF_POST (0x0B)
 #define APPLE_WLAN_MSGBUF_IOCTL_CMPLT (0x0C)
 #define APPLE_WLAN_MSGBUF_EVENT_BUF_POST (0x0D)
@@ -1002,6 +1004,7 @@ struct AppleWLANDeviceState {
         uint16_t max_item;
         uint16_t item_size;
         unsigned slot;
+        uint16_t type;
         bool h2d;
         bool valid;
         // Created by FLOW_RING_CREATE rather than H2D/D2H_RING_CREATE.
@@ -1518,20 +1521,30 @@ static void apple_wlan_int_assert(AppleWLANDeviceState *s)
  */
 static bool apple_wlan_d2h_outstanding(AppleWLANDeviceState *s)
 {
-    unsigned id = APPLE_WLAN_RING_D2H_CONTROL_COMPLETE;
-    AppleWLANRing ring;
-    uint16_t host_r_idx;
+    /*
+     * Every completion ring, not just the control one. Tx completions go to the
+     * D2H TX_COMPLETE ring the driver creates at runtime, and looking only at
+     * the control ring answered "nothing outstanding" the instant a TX_STATUS
+     * was posted -- so the doorbell bit was dropped before the driver had read
+     * it, and the guest stalled after three frames.
+     */
+    for (unsigned id = 0; id < APPLE_WLAN_RING_COUNT; id++) {
+        AppleWLANRing ring;
+        uint16_t host_r_idx;
 
-    if (!apple_wlan_get_ring(s, id, &ring)) {
-        return false;
+        if (!apple_wlan_get_ring(s, id, &ring) || ring.h2d) {
+            continue;
+        }
+        if (!apple_wlan_read_ring_index(s, APPLE_WLAN_RING_INFO_D2H_R_IDX_OFF,
+                                        ring.slot, &host_r_idx)) {
+            // Cannot tell; treat as outstanding so a completion is not dropped.
+            return true;
+        }
+        if (host_r_idx != s->ring_w_idx[id]) {
+            return true;
+        }
     }
-    if (!apple_wlan_read_ring_index(s, APPLE_WLAN_RING_INFO_D2H_R_IDX_OFF,
-                                    ring.slot, &host_r_idx)) {
-        // Cannot tell; treat as outstanding so a real completion is not
-        // dropped.
-        return true;
-    }
-    return host_r_idx != s->ring_w_idx[id];
+    return false;
 }
 
 static void apple_wlan_int_timer(void *opaque)
@@ -1622,9 +1635,9 @@ static void apple_wlan_ring_check_rebuilt(AppleWLANDeviceState *s, unsigned id,
 }
 
 // Post one control completion. The device owns this ring's write index.
-static bool apple_wlan_d2h_post(AppleWLANDeviceState *s, const uint8_t *item)
+static bool apple_wlan_d2h_post_ring(AppleWLANDeviceState *s, unsigned id,
+                                     const uint8_t *item)
 {
-    unsigned id = APPLE_WLAN_RING_D2H_CONTROL_COMPLETE;
     AppleWLANRing ring;
     uint16_t w_idx;
     uint16_t next;
@@ -1672,6 +1685,33 @@ static bool apple_wlan_d2h_post(AppleWLANDeviceState *s, const uint8_t *item)
         stamped[0], ldl_le_p(stamped + APPLE_WLAN_MSGBUF_REQUEST_ID_OFF), w_idx,
         next, stamped[2]);
     return true;
+}
+
+static bool apple_wlan_d2h_post(AppleWLANDeviceState *s, const uint8_t *item)
+{
+    return apple_wlan_d2h_post_ring(s, APPLE_WLAN_RING_D2H_CONTROL_COMPLETE,
+                                    item);
+}
+
+/*
+ * Find the ring the driver created for Tx completions. brcmfmac's
+ * BRCMF_D2H_MSGRING_TX_COMPLETE is ring type 4, and the driver announces
+ * exactly that at startup -- "ring create 0x1c id 3 type 4 ptr ... 64 x 24" --
+ * so a TX_STATUS belongs there, not on the control-complete ring.
+ */
+#define APPLE_WLAN_RING_TYPE_D2H_TX_COMPLETE (4)
+
+static bool apple_wlan_find_ring_by_type(AppleWLANDeviceState *s, uint16_t type,
+                                         unsigned *id)
+{
+    for (unsigned d = 0; d < APPLE_WLAN_RING_DYNAMIC_MAX; d++) {
+        if (s->dyn_ring[d].valid && !s->dyn_ring[d].h2d &&
+            s->dyn_ring[d].type == type) {
+            *id = APPLE_WLAN_RING_COMMON_COUNT + d;
+            return true;
+        }
+    }
+    return false;
 }
 
 // Every completion starts as the request's header with a new type and a status.
@@ -1747,6 +1787,7 @@ static void apple_wlan_handle_ring_create(AppleWLANDeviceState *s,
         s->dyn_ring[d].max_item = max_items;
         s->dyn_ring[d].item_size = item_size;
         s->dyn_ring[d].slot = ring_id;
+        s->dyn_ring[d].type = ring_type;
         s->dyn_ring[d].h2d = h2d;
         s->dyn_ring[d].valid = true;
         s->dyn_ring[d].flow = false;
@@ -1823,6 +1864,66 @@ static void apple_wlan_handle_flow_ring_create(AppleWLANDeviceState *s,
     apple_wlan_cmplt_init(cmplt, item, APPLE_WLAN_MSGBUF_FLOW_RING_CREATE_CMPLT,
                           status, ring_id);
     apple_wlan_d2h_post(s, cmplt);
+}
+
+/*
+ * Take one frame off a flow ring and complete it. The layout is brcmfmac's
+ * msgbuf_tx_msghdr, and the frames themselves confirm it -- the 14 bytes at +8
+ * are a real ethernet header, and the first few the guest sends are an IPv6
+ * neighbour solicitation to 33:33:ff:.., a DHCP DISCOVER to ff:ff:ff:ff:ff:ff
+ * with ethertype 0x0800, a router solicitation to 33:33:00:00:00:02 and mDNS to
+ * 33:33:00:00:00:fb:
+ *
+ *   +8   txhdr        14   destination, source, ethertype
+ *   +22  flags         1
+ *   +23  seg_cnt       1
+ *   +24  metadata_buf_addr  8
+ *   +32  data_buf_addr      8   low then high, host address of the payload
+ *   +40  metadata_buf_len   2
+ *   +42  data_len           2
+ *   +44  priority           4
+ *
+ * The completion is a msgbuf_tx_status on the D2H TX_COMPLETE ring, carrying
+ * the request id the driver used so it can release the packet. Nothing is sent
+ * anywhere yet -- there is no netdev attached -- but completing is not
+ * optional: a frame the driver believes is still in flight stalls its queue,
+ * and the interface watchdogs.
+ */
+#define APPLE_WLAN_TX_TXHDR_OFF (8)
+#define APPLE_WLAN_TX_DATA_ADDR_OFF (32)
+#define APPLE_WLAN_TX_DATA_LEN_OFF (42)
+#define APPLE_WLAN_TX_STATUS_METADATA_LEN_OFF (12)
+#define APPLE_WLAN_TX_STATUS_OFF (14)
+#define APPLE_WLAN_TX_STATUS_ACKED (0)
+
+static void apple_wlan_handle_tx_post(AppleWLANDeviceState *s,
+                                      const uint8_t *item)
+{
+    const uint8_t *eth = item + APPLE_WLAN_TX_TXHDR_OFF;
+    uint16_t data_len = lduw_le_p(item + APPLE_WLAN_TX_DATA_LEN_OFF);
+    uint64_t data_addr =
+        ldl_le_p(item + APPLE_WLAN_TX_DATA_ADDR_OFF) |
+        (uint64_t)ldl_le_p(item + APPLE_WLAN_TX_DATA_ADDR_OFF + 4) << 32;
+    uint8_t cmplt[APPLE_WLAN_MSGBUF_CMPLT_SIZE];
+    unsigned cmplt_ring;
+
+    trace_apple_wlan_tx_post(ldl_le_p(item + APPLE_WLAN_MSGBUF_REQUEST_ID_OFF),
+                             (uint64_t)eth[0] << 40 | (uint64_t)eth[1] << 32 |
+                                 (uint64_t)eth[2] << 24 |
+                                 (uint64_t)eth[3] << 16 |
+                                 (uint64_t)eth[4] << 8 | eth[5],
+                             lduw_be_p(eth + 12), data_addr, data_len);
+
+    if (!apple_wlan_find_ring_by_type(s, APPLE_WLAN_RING_TYPE_D2H_TX_COMPLETE,
+                                      &cmplt_ring)) {
+        trace_apple_wlan_tx_no_cmplt_ring();
+        return;
+    }
+    apple_wlan_cmplt_init(cmplt, item, APPLE_WLAN_MSGBUF_TX_STATUS,
+                          APPLE_WLAN_BCME_OK, 0);
+    stw_le_p(cmplt + APPLE_WLAN_TX_STATUS_METADATA_LEN_OFF, 0);
+    stw_le_p(cmplt + APPLE_WLAN_TX_STATUS_OFF, APPLE_WLAN_TX_STATUS_ACKED);
+    apple_wlan_d2h_post_ring(s, cmplt_ring, cmplt);
 }
 
 static void apple_wlan_handle_resp_buf_post(AppleWLANDeviceState *s,
@@ -2514,6 +2615,10 @@ static bool apple_wlan_drain_h2d_ring(AppleWLANDeviceState *s, unsigned id,
             break;
         case APPLE_WLAN_MSGBUF_IOCTLPTR_REQ:
             apple_wlan_handle_ioctl(s, item);
+            posted = true;
+            break;
+        case APPLE_WLAN_MSGBUF_TX_POST:
+            apple_wlan_handle_tx_post(s, item);
             posted = true;
             break;
         default:
