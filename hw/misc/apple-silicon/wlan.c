@@ -905,11 +905,18 @@ static const uint8_t apple_wlan_event_mac[APPLE_WLAN_MAC_LEN] = { 0x02, 0x1B,
 // How many posted event buffers to remember.
 #define APPLE_WLAN_EVENT_BUFS (40)
 /*
- * The guest fills a 384-item RXPOST ring at startup. Keep enough entries for
- * the protocol maximum so backends can apply normal QEMU receive backpressure
- * without making the device consume a buffer it cannot later return.
+ * The Apple driver keeps 1535 packet buffers posted. This is larger than the
+ * RXPOST ring because it refills the ring as the device consumes submissions.
+ * Retaining only brcmfmac's 1024-pktid maximum leaked request ids 0x400..0x5fe:
+ * the guest had already transferred ownership, but the device could never
+ * complete those buffers. Once Safari generated sustained traffic, the
+ * driver's replacement allocations failed and incoming TCP packets stopped
+ * reaching the stack even though the backend still received them.
+ *
+ * Leave one extra slot so the array covers the driver's full 0x600-id packet
+ * pool and every consumed RXBUF_POST can eventually receive an RX_CMPLT.
  */
-#define APPLE_WLAN_RX_BUFS (1024)
+#define APPLE_WLAN_RX_BUFS (1536)
 
 #define APPLE_WLAN_IOVAR_NAME_MAX (64)
 #define APPLE_WLAN_IOVAR_PAYLOAD_MAX (512)
