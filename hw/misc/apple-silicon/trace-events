@@ -51,3 +51,7 @@ apple_wlan_escan_result(uint16_t sync_id, const char *ssid) "escan complete, syn
 apple_wlan_join(const char *ssid, uint16_t bssid_cnt, uint32_t chanspec_num) "join \"%s\": %u candidate BSSIDs, %u chanspecs"
 apple_wlan_join_short(uint16_t in_len) "WLC_SET_SSID payload too short: %u bytes"
 apple_wlan_join_unknown(const char *ssid) "refusing join of unknown network \"%s\""
+apple_wlan_flow_ring_create(uint16_t ring_id, uint8_t tid, uint64_t da, uint64_t base, uint16_t max_item, uint16_t item_size) "flow ring create id %u tid %u to %012" PRIx64 " base 0x%" PRIx64 " %u x %u"
+apple_wlan_flow_ring_gone(uint8_t msgtype, uint16_t ring_id) "flow ring msg 0x%02x for id %u"
+apple_wlan_ring_empty_item(unsigned id, uint16_t r_idx, uint16_t w_idx) "ring %u item %u is empty, not chasing w=%u"
+apple_wlan_h2d_w_idx_dump(unsigned slot, uint16_t value) "h2d_w_idx[%u] = %u"

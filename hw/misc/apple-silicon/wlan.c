@@ -459,6 +459,35 @@ static const struct {
  * of these was observed being posted by the driver except the *_CMPLT replies,
  * which are what it is waiting for.
  */
+/*
+ * The Tx flow ring. Once associated and with a peer to send to, the driver asks
+ * for one, waits, and watchdogs the entire interface if no answer arrives:
+ *
+ *   createFlowRingTimeout@9372: Timed out waiting for flow ring create
+ *   watchdog@35338: <799> state 0xD watchdog@BCMWLAN Failed to Create Flow
+ * Ring~ detachTxSubmFwQueue@619: detach tx uc queue ifId 0, ac 3, flowId 4
+ *
+ * One real request pins the layout, and it is brcmfmac's
+ * msgbuf_tx_flowring_create_req field for field: da the AP's BSSID, sa the
+ * station MAC, flow_ring_id 4 matching the driver's own "flowId 4", 384 items
+ * of 48 bytes at 0x05650000 -- which continues the 16 KiB spacing of the rings
+ * it had already created. That is also what confirms 0x03 as FLOW_RING_CREATE
+ * rather than leaving the numbering inferred from brcmfmac.
+ */
+#define APPLE_WLAN_MSGBUF_FLOW_RING_CREATE (0x03)
+#define APPLE_WLAN_MSGBUF_FLOW_RING_CREATE_CMPLT (0x04)
+#define APPLE_WLAN_MSGBUF_FLOW_RING_DELETE (0x05)
+#define APPLE_WLAN_MSGBUF_FLOW_RING_DELETE_CMPLT (0x06)
+#define APPLE_WLAN_MSGBUF_FLOW_RING_FLUSH (0x07)
+#define APPLE_WLAN_MSGBUF_FLOW_RING_FLUSH_CMPLT (0x08)
+#define APPLE_WLAN_FLOW_DA_OFF (8)
+#define APPLE_WLAN_FLOW_SA_OFF (14)
+#define APPLE_WLAN_FLOW_TID_OFF (20)
+#define APPLE_WLAN_FLOW_RING_ID_OFF (22)
+#define APPLE_WLAN_FLOW_MAX_ITEMS_OFF (28)
+#define APPLE_WLAN_FLOW_LEN_ITEM_OFF (30)
+#define APPLE_WLAN_FLOW_RING_ADDR_OFF (32)
+
 #define APPLE_WLAN_MSGBUF_IOCTLPTR_REQ (0x09)
 #define APPLE_WLAN_MSGBUF_IOCTLPTR_REQ_ACK (0x0A)
 #define APPLE_WLAN_MSGBUF_IOCTLRESP_BUF_POST (0x0B)
@@ -942,6 +971,8 @@ struct AppleWLANDeviceState {
         unsigned slot;
         bool h2d;
         bool valid;
+        // Created by FLOW_RING_CREATE rather than H2D/D2H_RING_CREATE.
+        bool flow;
     } dyn_ring[APPLE_WLAN_RING_DYNAMIC_MAX];
     // Host buffers posted for ioctl responses, consumed oldest first.
     struct {
@@ -1628,6 +1659,23 @@ static void apple_wlan_handle_ring_create(AppleWLANDeviceState *s,
     trace_apple_wlan_ring_create(item[0], ring_id, ring_type, ring_ptr,
                                  max_items, item_size);
     /*
+     * A RING_CREATE means the driver is (re)building its IPC, and any flow ring
+     * from the previous life is gone with it -- createFirmwarePCIeIPC unmaps
+     * the lot. Keeping such an entry is fatal, not untidy: the stale read index
+     * keeps being chased on every later doorbell, and the DART does not return
+     * zeroes for an unmapped read, it faults and panics the guest
+     * ("dart-apcie2 ... PTE invalid exception on read with DVA 0x692832c",
+     * 812 bytes into a flow ring whose first page we had read successfully
+     * moments before).
+     */
+    for (unsigned e = 0; e < APPLE_WLAN_RING_DYNAMIC_MAX; e++) {
+        if (s->dyn_ring[e].valid && s->dyn_ring[e].flow) {
+            trace_apple_wlan_flow_ring_gone(item[0], s->dyn_ring[e].slot);
+            s->dyn_ring[e].valid = false;
+            s->dyn_ring[e].flow = false;
+        }
+    }
+    /*
      * Remember it, or the driver's submissions to it are never drained. Reuse
      * the entry if this ring is being created again, which happens on retry.
      */
@@ -1651,6 +1699,7 @@ static void apple_wlan_handle_ring_create(AppleWLANDeviceState *s,
         s->dyn_ring[d].slot = ring_id;
         s->dyn_ring[d].h2d = h2d;
         s->dyn_ring[d].valid = true;
+        s->dyn_ring[d].flow = false;
         trace_apple_wlan_dyn_ring_added(d, h2d, ring_id, ring_ptr, max_items,
                                         item_size);
     } else {
@@ -1658,6 +1707,71 @@ static void apple_wlan_handle_ring_create(AppleWLANDeviceState *s,
                                            item_size);
     }
     apple_wlan_cmplt_init(cmplt, item, reply, APPLE_WLAN_BCME_OK, ring_id);
+    apple_wlan_d2h_post(s, cmplt);
+}
+
+/*
+ * Register the Tx flow ring and answer. The flow ring is a submission ring like
+ * any other, so it goes in the same dynamic table and is drained by the same
+ * doorbell walk -- what is specific here is that the driver names its own slot
+ * (flow_ring_id), carries the ring geometry in the request rather than in
+ * ringmem, and gives up on the whole interface if the completion does not
+ * arrive.
+ */
+static void apple_wlan_handle_flow_ring_create(AppleWLANDeviceState *s,
+                                               const uint8_t *item)
+{
+    uint16_t ring_id = lduw_le_p(item + APPLE_WLAN_FLOW_RING_ID_OFF);
+    uint16_t max_items = lduw_le_p(item + APPLE_WLAN_FLOW_MAX_ITEMS_OFF);
+    uint16_t item_size = lduw_le_p(item + APPLE_WLAN_FLOW_LEN_ITEM_OFF);
+    uint64_t ring_addr = ldq_le_p(item + APPLE_WLAN_FLOW_RING_ADDR_OFF);
+    const uint8_t *da = item + APPLE_WLAN_FLOW_DA_OFF;
+    uint8_t cmplt[APPLE_WLAN_MSGBUF_CMPLT_SIZE];
+    int16_t status = APPLE_WLAN_BCME_OK;
+    unsigned free_slot = APPLE_WLAN_RING_DYNAMIC_MAX;
+    unsigned d;
+
+    trace_apple_wlan_flow_ring_create(
+        ring_id, item[APPLE_WLAN_FLOW_TID_OFF],
+        (uint64_t)da[0] << 40 | (uint64_t)da[1] << 32 | (uint64_t)da[2] << 24 |
+            (uint64_t)da[3] << 16 | (uint64_t)da[4] << 8 | da[5],
+        ring_addr, max_items, item_size);
+
+    for (d = 0; d < APPLE_WLAN_RING_DYNAMIC_MAX; d++) {
+        if (s->dyn_ring[d].valid && s->dyn_ring[d].h2d &&
+            s->dyn_ring[d].slot == ring_id) {
+            break;
+        }
+        if (!s->dyn_ring[d].valid && free_slot == APPLE_WLAN_RING_DYNAMIC_MAX) {
+            free_slot = d;
+        }
+    }
+    if (d == APPLE_WLAN_RING_DYNAMIC_MAX) {
+        d = free_slot;
+    }
+    if (d < APPLE_WLAN_RING_DYNAMIC_MAX && ring_addr != 0 && max_items != 0 &&
+        item_size != 0 && item_size <= APPLE_WLAN_RING_ITEM_MAX) {
+        s->dyn_ring[d].base = ring_addr;
+        s->dyn_ring[d].max_item = max_items;
+        s->dyn_ring[d].item_size = item_size;
+        s->dyn_ring[d].slot = ring_id;
+        s->dyn_ring[d].h2d = true;
+        s->dyn_ring[d].valid = true;
+        s->dyn_ring[d].flow = true;
+        trace_apple_wlan_dyn_ring_added(d, true, ring_id, ring_addr, max_items,
+                                        item_size);
+    } else {
+        /*
+         * Refusing is better than accepting and then never draining it: the
+         * driver has a timeout for a missing answer, but a ring it believes was
+         * created and is not being read would strand every packet queued on it.
+         */
+        trace_apple_wlan_dyn_ring_rejected(true, ring_id, ring_addr, max_items,
+                                           item_size);
+        status = APPLE_WLAN_BCME_UNSUPPORTED;
+    }
+    apple_wlan_cmplt_init(cmplt, item, APPLE_WLAN_MSGBUF_FLOW_RING_CREATE_CMPLT,
+                          status, ring_id);
     apple_wlan_d2h_post(s, cmplt);
 }
 
@@ -2243,12 +2357,70 @@ static bool apple_wlan_drain_h2d_ring(AppleWLANDeviceState *s, unsigned id,
             trace_apple_wlan_ring_dma_fail(addr);
             return posted;
         }
+        /*
+         * A submission with message type 0 does not exist, so this is ring
+         * memory the driver has not written and the write index we are chasing
+         * does not belong to this ring. Stop without consuming it, so the read
+         * index stays where the driver expects it.
+         *
+         * This is a guard, not an optimisation, and the flow ring is what
+         * showed why. Its slot reported w=16 over an untouched ring, so 16 zero
+         * items were consumed and the read index left at 16; when the same slot
+         * later read back 0, the walk had 368 items to go. Long before that
+         * mattered, the driver's watchdog tore the ring's DART mapping down --
+         * and the DART does not hand back zeroes for an unmapped read, it
+         * faults, which takes the guest with it:
+         *
+         *   panic: dart-apcie2 DART error: SID 1 PTE invalid exception on read
+         *          with DVA 0x838c32c
+         *
+         * That address is only 812 bytes into a ring based at 0x838c000, i.e.
+         * inside the first page we had already read successfully. So the rule
+         * is not "stay in bounds" -- bounds were never exceeded -- it is "never
+         * chase an index this ring did not publish".
+         */
+        if (item[0] == 0) {
+            trace_apple_wlan_ring_empty_item(id, s->ring_r_idx[id], w_idx);
+            break;
+        }
         trace_apple_wlan_ring_item(
             id, s->ring_r_idx[id], item[0], item[1], item[2],
             ldl_le_p(item + APPLE_WLAN_MSGBUF_REQUEST_ID_OFF),
             ldq_le_p(item + 8), ldq_le_p(item + 16), ldq_le_p(item + 24),
             ldq_le_p(item + 32));
         switch (item[0]) {
+        case APPLE_WLAN_MSGBUF_FLOW_RING_CREATE:
+            apple_wlan_handle_flow_ring_create(s, item);
+            posted = true;
+            break;
+        case APPLE_WLAN_MSGBUF_FLOW_RING_DELETE:
+        case APPLE_WLAN_MSGBUF_FLOW_RING_FLUSH: {
+            /*
+             * Both have to be answered or the teardown hangs the same way the
+             * create did. A flush has nothing to flush here and a delete drops
+             * the ring, so the honest answer to either is success.
+             */
+            uint8_t reply = item[0] == APPLE_WLAN_MSGBUF_FLOW_RING_DELETE ?
+                                APPLE_WLAN_MSGBUF_FLOW_RING_DELETE_CMPLT :
+                                APPLE_WLAN_MSGBUF_FLOW_RING_FLUSH_CMPLT;
+            uint16_t ring_id = lduw_le_p(item + APPLE_WLAN_FLOW_RING_ID_OFF);
+            uint8_t cmplt[APPLE_WLAN_MSGBUF_CMPLT_SIZE];
+
+            trace_apple_wlan_flow_ring_gone(item[0], ring_id);
+            if (item[0] == APPLE_WLAN_MSGBUF_FLOW_RING_DELETE) {
+                for (unsigned e = 0; e < APPLE_WLAN_RING_DYNAMIC_MAX; e++) {
+                    if (s->dyn_ring[e].valid && s->dyn_ring[e].h2d &&
+                        s->dyn_ring[e].slot == ring_id) {
+                        s->dyn_ring[e].valid = false;
+                    }
+                }
+            }
+            apple_wlan_cmplt_init(cmplt, item, reply, APPLE_WLAN_BCME_OK,
+                                  ring_id);
+            apple_wlan_d2h_post(s, cmplt);
+            posted = true;
+            break;
+        }
         case APPLE_WLAN_MSGBUF_H2D_RING_CREATE:
         case APPLE_WLAN_MSGBUF_D2H_RING_CREATE:
             apple_wlan_handle_ring_create(s, item);
@@ -2289,10 +2461,33 @@ static bool apple_wlan_drain_h2d_ring(AppleWLANDeviceState *s, unsigned id,
  * submitH2DRingCreateMsg and posts to it, and leaving that ring alone stalls
  * whatever was queued there whatever the control ring is doing.
  */
+/*
+ * Which slot of the h2d write-index array a flow ring uses is not known: the
+ * flow_ring_id in the create request is 4, and reading slot 4 produced a value
+ * that flip-flopped between 16 and 0 over a ring the driver had not written, so
+ * it belongs to something else. Dumping the whole array on each doorbell is
+ * what will identify the right one -- the slot that moves when the guest queues
+ * a packet is the answer.
+ */
+static void apple_wlan_dump_h2d_w_idx(AppleWLANDeviceState *s)
+{
+    for (unsigned slot = 0; slot < APPLE_WLAN_RING_COUNT; slot++) {
+        uint16_t v = 0;
+
+        if (apple_wlan_read_ring_index(s, APPLE_WLAN_RING_INFO_H2D_W_IDX_OFF,
+                                       slot, &v) &&
+            v != 0) {
+            trace_apple_wlan_h2d_w_idx_dump(slot, v);
+        }
+    }
+}
+
 static void apple_wlan_h2d_doorbell(AppleWLANDeviceState *s)
 {
     bool posted = false;
     bool any = false;
+
+    apple_wlan_dump_h2d_w_idx(s);
 
     for (unsigned id = 0; id < APPLE_WLAN_RING_COUNT; id++) {
         AppleWLANRing ring;
