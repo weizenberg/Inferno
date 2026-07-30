@@ -55,3 +55,5 @@ apple_wlan_flow_ring_create(uint16_t ring_id, uint8_t tid, uint64_t da, uint64_t
 apple_wlan_flow_ring_gone(uint8_t msgtype, uint16_t ring_id) "flow ring msg 0x%02x for id %u"
 apple_wlan_ring_empty_item(unsigned id, uint16_t r_idx, uint16_t w_idx) "ring %u item %u is empty, not chasing w=%u"
 apple_wlan_h2d_w_idx_dump(unsigned slot, uint16_t value) "h2d_w_idx[%u] = %u"
+apple_wlan_ring_reset(unsigned id, uint16_t r_idx) "ring %u reset by the driver: dropping read index %u"
+apple_wlan_int_give_up(uint32_t status, unsigned retries) "giving up on unserviced interrupt: MAILBOXINT 0x%08x after %u retries"

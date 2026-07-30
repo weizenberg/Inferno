@@ -420,6 +420,30 @@ static const struct {
 #define APPLE_WLAN_RING_INFO_H2D_R_IDX_OFF (0x1C)
 #define APPLE_WLAN_RING_INFO_D2H_W_IDX_OFF (0x24)
 #define APPLE_WLAN_RING_INFO_D2H_R_IDX_OFF (0x2C)
+/*
+ * Each entry in the four index arrays is 32 bits, not 16. brcmfmac makes this
+ * conditional -- BRCMF_PCIE_SHARED_DMA_2B_IDX in the shared flags selects
+ * 2-byte indices -- and this firmware does not set it.
+ *
+ * The mistake hid for a long time because the control submit ring is slot 0: a
+ * 2-byte read at byte 0 returns the low half of a little-endian u32, which for
+ * any index below 65536 is the index itself. Every other ring was reading the
+ * wrong half of the wrong entry. Dumping the array as 2-byte slots showed it
+ * plainly -- non-zero at slots 0, 2, 4 and 8, i.e. byte offsets 0, 4, 8 and 16,
+ * which as u32 entries are:
+ *
+ *   [0] = 76, moving   the control submit ring
+ *   [1] = 383          the rxpost ring, 384 entries, filled
+ *   [2] = 16           the h2d ring the driver creates at runtime, 64 x 40
+ *   [4] = 35           flow ring 4, 35 frames queued
+ *
+ * Read as 2-byte entries, slot 2 handed the rxpost index (383) to a 64-item
+ * ring, where the `w_idx >= max_item` guard silently dropped it, and slot 4
+ * handed the flow ring the *dynamic* ring's index -- a constant 16 that never
+ * moved while items kept appearing, which is what walked the read index past
+ * what the guest had written and eventually into an unmapped page.
+ */
+#define APPLE_WLAN_RING_INDEX_SIZE (4)
 #define APPLE_WLAN_RING_DESC_SIZE (0x10)
 #define APPLE_WLAN_RING_DESC_MAX_ITEM_OFF (0x04)
 #define APPLE_WLAN_RING_DESC_ITEM_SIZE_OFF (0x06)
@@ -650,6 +674,15 @@ static const struct {
  */
 #define APPLE_WLAN_INT_HOLD_NS (200 * 1000)
 #define APPLE_WLAN_INT_RETRY_NS (10 * 1000 * 1000)
+/*
+ * How many times to re-assert before concluding the driver is not going to
+ * answer. Unbounded retrying is what turned a torn-down IPC into a guest panic:
+ * the timer kept polling the D2H read index, and once the driver unmapped that
+ * array the DART faulted on the read. 200 retries is two seconds, far longer
+ * than any servicing delay observed, and giving up merely drops an interrupt
+ * the next doorbell would raise again.
+ */
+#define APPLE_WLAN_INT_RETRY_MAX (200)
 
 /*
  * A WLC event packet, as handleEventPacket parses it. Layout anchored on two
@@ -1004,6 +1037,8 @@ struct AppleWLANDeviceState {
     // Interrupt moderation; see APPLE_WLAN_INT_HOLD_NS.
     QEMUTimer *int_timer;
     bool int_asserted;
+    // Consecutive re-assertions with no sign of the driver consuming anything.
+    unsigned int_retries;
 
     // Backplane addresses currently mapped by each of BAR0's two windows, set
     // by the guest through PCI config space. Tracking them turns the otherwise
@@ -1340,6 +1375,8 @@ typedef struct AppleWLANRing {
     // Which pair of index arrays this ring uses, and its slot within them.
     bool h2d;
     unsigned slot;
+    // A Tx flow ring, which the driver may rip away without telling us.
+    bool flow;
 } AppleWLANRing;
 
 static uint32_t apple_wlan_ring_info_off(AppleWLANDeviceState *s)
@@ -1376,6 +1413,7 @@ static bool apple_wlan_get_ring(AppleWLANDeviceState *s, unsigned id,
         ring->item_size = s->dyn_ring[d].item_size;
         ring->h2d = s->dyn_ring[d].h2d;
         ring->slot = s->dyn_ring[d].slot;
+        ring->flow = s->dyn_ring[d].flow;
         return true;
     }
     ringmem = ldl_le_p(s->bar2_backing + apple_wlan_ring_info_off(s));
@@ -1398,23 +1436,23 @@ static bool apple_wlan_get_ring(AppleWLANDeviceState *s, unsigned id,
            ring->item_size <= APPLE_WLAN_RING_ITEM_MAX;
 }
 
-// The index arrays are u16 per ring, at a host address published in ring_info.
+// One index per ring, at a host address published in ring_info.
 static bool apple_wlan_read_ring_index(AppleWLANDeviceState *s,
                                        uint32_t ring_info_off, unsigned slot,
                                        uint16_t *out)
 {
     uint64_t array =
         apple_wlan_tcm_addr64(s, apple_wlan_ring_info_off(s) + ring_info_off);
-    uint16_t raw;
+    uint32_t raw;
 
     if (array == 0) {
         return false;
     }
-    if (pci_dma_read(PCI_DEVICE(s), array + slot * sizeof(uint16_t), &raw,
-                     sizeof(raw)) != MEMTX_OK) {
+    if (pci_dma_read(PCI_DEVICE(s), array + slot * APPLE_WLAN_RING_INDEX_SIZE,
+                     &raw, sizeof(raw)) != MEMTX_OK) {
         return false;
     }
-    *out = le16_to_cpu(raw);
+    *out = (uint16_t)le32_to_cpu(raw);
     return true;
 }
 
@@ -1425,12 +1463,13 @@ static bool apple_wlan_write_ring_index(AppleWLANDeviceState *s,
 {
     uint64_t array =
         apple_wlan_tcm_addr64(s, apple_wlan_ring_info_off(s) + ring_info_off);
-    uint16_t raw = cpu_to_le16(value);
+    uint32_t raw = cpu_to_le32(value);
 
     if (array == 0) {
         return false;
     }
-    return pci_dma_write(PCI_DEVICE(s), array + slot * sizeof(uint16_t), &raw,
+    return pci_dma_write(PCI_DEVICE(s),
+                         array + slot * APPLE_WLAN_RING_INDEX_SIZE, &raw,
                          sizeof(raw)) == MEMTX_OK;
 }
 
@@ -1515,6 +1554,16 @@ static void apple_wlan_int_timer(void *opaque)
         return;
     }
     if (pending) {
+        /*
+         * Not capped. A cap was tried -- 200 retries, two seconds -- to stop
+         * the timer polling a torn-down IPC, and it broke setup instead: the
+         * driver legitimately takes longer than that to service an interrupt
+         * while bringing the firmware up, and clearing MAILBOXINT threw the
+         * doorbell away rather than delaying it. Three give-ups, five Cmdr
+         * Resets, three setupFirmware failures, no interface. The function
+         * reset is the right place to stop this, because it is the only signal
+         * that actually means the host memory is gone.
+         */
         trace_apple_wlan_int_retry(s->mailbox_int, s->mailbox_mask);
         apple_wlan_int_assert(s);
     }
@@ -1534,6 +1583,7 @@ static void apple_wlan_raise_int(AppleWLANDeviceState *s, uint32_t bits)
 // The guest has acknowledged; drop the line and stop retrying.
 static void apple_wlan_lower_int_if_quiesced(AppleWLANDeviceState *s)
 {
+    s->int_retries = 0;
     if ((s->mailbox_int & s->mailbox_mask) != 0) {
         return;
     }
@@ -2346,6 +2396,36 @@ static bool apple_wlan_drain_h2d_ring(AppleWLANDeviceState *s, unsigned id,
     if (w_idx >= ring->max_item || s->ring_r_idx[id] == w_idx) {
         return false;
     }
+    /*
+     * The driver zeroed its write index, so this ring was reset out from under
+     * us with no FLOW_RING_DELETE -- which is what a watchdog reset looks like.
+     * Follow it instead of walking the items in between: they are stale, and
+     * the ring's DART mapping is gone with the reset, so reading one faults
+     * rather than returning zeroes and takes the guest down with it.
+     *
+     * Dynamic rings only, and the line is measured rather than cautious. A
+     * genuine wrap lands on zero too, and applying this to every ring cost the
+     * control submit ring three wraps from index 127 in one boot -- up to 128
+     * dropped submissions each time, 11 "Cmdr Reset"s, and a driver that never
+     * finished setup.
+     *
+     * The distinction is what the two kinds of ring are. The five common rings
+     * are described by ringmem and live for the whole IPC, so their indices
+     * only ever wrap. A dynamic ring exists because a message created it and
+     * stops existing when the driver says so -- with a FLOW_RING_DELETE if you
+     * are lucky, and with nothing at all on a watchdog reset. Both kinds seen
+     * here did it: flow ring 7 from index 35, and the driver's own 64 x 40 h2d
+     * ring 6 from index 16, whose item 16 at base + 0x280 is where the DART
+     * faulted.
+     */
+    if (id >= APPLE_WLAN_RING_COMMON_COUNT && w_idx == 0 &&
+        s->ring_r_idx[id] != 0) {
+        trace_apple_wlan_ring_reset(id, s->ring_r_idx[id]);
+        s->ring_r_idx[id] = 0;
+        apple_wlan_write_ring_index(s, APPLE_WLAN_RING_INFO_H2D_R_IDX_OFF,
+                                    ring->slot, 0);
+        return false;
+    }
     trace_apple_wlan_doorbell(id, ring->base, ring->max_item, ring->item_size,
                               s->ring_r_idx[id], w_idx);
     while (s->ring_r_idx[id] != w_idx) {
@@ -2824,6 +2904,45 @@ static void apple_wlan_device_qdev_reset_hold(Object *obj, ResetType type)
     }
     // Only the core-2 window has a non-zero base out of reset.
     s->bar0_window_base[4] = APPLE_WLAN_BAR0_CORE2_WINDOW_RESET;
+
+    /*
+     * Drop every scrap of IPC state. All of it -- the ring bases, the index
+     * array addresses reached through fw_shared_offset, the posted ioctl and
+     * event buffers -- is host memory the guest owns, and a function reset is
+     * the guest telling us it has taken that memory back. Keeping any of it is
+     * not merely stale: the DART faults on an unmapped read instead of
+     * returning zeroes, and that panics the guest. The driver's teardown really
+     * does end in an FLR ("flr@4726: pre-FLR ssResetStatus 0x0"), so this is
+     * the hook that has to notice.
+     *
+     * Zeroing fw_shared_offset is what stops the index-array traffic, since
+     * every read and write of an index resolves its address through it and
+     * bails when that comes out zero.
+     */
+    s->fw_shared_offset = 0;
+    memset(s->dyn_ring, 0, sizeof(s->dyn_ring));
+    memset(s->ring_r_idx, 0, sizeof(s->ring_r_idx));
+    memset(s->ring_w_idx, 0, sizeof(s->ring_w_idx));
+    memset(s->ring_base_seen, 0, sizeof(s->ring_base_seen));
+    memset(s->ring_phase, 0, sizeof(s->ring_phase));
+    memset(s->ioctl_resp_buf, 0, sizeof(s->ioctl_resp_buf));
+    s->ioctl_resp_head = 0;
+    s->ioctl_resp_count = 0;
+    memset(s->event_buf, 0, sizeof(s->event_buf));
+    s->event_buf_head = 0;
+    s->event_buf_count = 0;
+    s->mailbox_int = 0;
+    s->mailbox_mask = 0;
+    s->int_retries = 0;
+    s->arm_core_released = false;
+    s->tcm_marker_done = false;
+    s->tcm_marker_offset = 0;
+    s->tcm_last_read_valid = false;
+    s->tcm_written_bytes = 0;
+    if (s->int_timer != NULL) {
+        timer_del(s->int_timer);
+    }
+    s->int_asserted = false;
 }
 
 /*
