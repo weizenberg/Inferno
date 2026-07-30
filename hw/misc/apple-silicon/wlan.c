@@ -24,7 +24,10 @@
 #include "hw/misc/apple-silicon/wlan.h"
 #include "hw/pci/msi.h"
 #include "hw/pci/pci_device.h"
+#include "hw/qdev-properties.h"
 #include "migration/vmstate.h"
+#include "net/eth.h"
+#include "net/net.h"
 #include "qemu/units.h"
 #include "trace.h"
 
@@ -450,7 +453,10 @@ static const struct {
 #define APPLE_WLAN_RING_DESC_BASE_OFF (0x08)
 // Ring ids, in the order the driver populates ringmem.
 #define APPLE_WLAN_RING_H2D_CONTROL_SUBMIT (0)
+#define APPLE_WLAN_RING_H2D_RXPOST_SUBMIT (1)
 #define APPLE_WLAN_RING_D2H_CONTROL_COMPLETE (2)
+#define APPLE_WLAN_RING_D2H_TX_COMPLETE (3)
+#define APPLE_WLAN_RING_D2H_RX_COMPLETE (4)
 /*
  * Five rings come from ringmem, and the driver creates more at runtime with
  * H2D_RING_CREATE / D2H_RING_CREATE. Those live past the common ones in this
@@ -516,6 +522,8 @@ static const struct {
 #define APPLE_WLAN_MSGBUF_IOCTLPTR_REQ_ACK (0x0A)
 #define APPLE_WLAN_MSGBUF_TX_POST (0x0F)
 #define APPLE_WLAN_MSGBUF_TX_STATUS (0x10)
+#define APPLE_WLAN_MSGBUF_RXBUF_POST (0x11)
+#define APPLE_WLAN_MSGBUF_RX_CMPLT (0x12)
 #define APPLE_WLAN_MSGBUF_IOCTLRESP_BUF_POST (0x0B)
 #define APPLE_WLAN_MSGBUF_IOCTL_CMPLT (0x0C)
 #define APPLE_WLAN_MSGBUF_EVENT_BUF_POST (0x0D)
@@ -524,8 +532,11 @@ static const struct {
 #define APPLE_WLAN_MSGBUF_D2H_RING_CREATE (0x1C)
 #define APPLE_WLAN_MSGBUF_H2D_RING_CREATE_CMPLT (0x1D)
 #define APPLE_WLAN_MSGBUF_D2H_RING_CREATE_CMPLT (0x1E)
-// Control completions are 24 bytes, matching ring 2's item size.
-#define APPLE_WLAN_MSGBUF_CMPLT_SIZE (24)
+/*
+ * RX completions are 40 bytes; control and Tx completions are 24. Posting
+ * clips this buffer to the destination ring's item size.
+ */
+#define APPLE_WLAN_MSGBUF_CMPLT_SIZE (40)
 
 // Offsets within a submission/completion item, from the layouts above.
 #define APPLE_WLAN_MSGBUF_REQUEST_ID_OFF (0x04)
@@ -893,6 +904,12 @@ static const uint8_t apple_wlan_event_mac[APPLE_WLAN_MAC_LEN] = { 0x02, 0x1B,
 
 // How many posted event buffers to remember.
 #define APPLE_WLAN_EVENT_BUFS (40)
+/*
+ * The guest fills a 384-item RXPOST ring at startup. Keep enough entries for
+ * the protocol maximum so backends can apply normal QEMU receive backpressure
+ * without making the device consume a buffer it cannot later return.
+ */
+#define APPLE_WLAN_RX_BUFS (1024)
 
 #define APPLE_WLAN_IOVAR_NAME_MAX (64)
 #define APPLE_WLAN_IOVAR_PAYLOAD_MAX (512)
@@ -959,6 +976,8 @@ struct AppleWLANDeviceState {
     ApplePCIEPort *port;
     MemoryRegion *dma_mr;
     AddressSpace *dma_as;
+    NICConf conf;
+    NICState *nic;
 
     MemoryRegion bar0;
     MemoryRegion bar2;
@@ -1037,6 +1056,20 @@ struct AppleWLANDeviceState {
     } event_buf[APPLE_WLAN_EVENT_BUFS];
     unsigned event_buf_head;
     unsigned event_buf_count;
+    /*
+     * Packet buffers from MSGBUF_TYPE_RXBUF_POST. Like control buffers, the
+     * completion must return the request id under which the guest registered
+     * the buffer.
+     */
+    struct {
+        uint64_t data_addr;
+        uint64_t metadata_addr;
+        uint16_t data_len;
+        uint16_t metadata_len;
+        uint32_t request_id;
+    } rx_buf[APPLE_WLAN_RX_BUFS];
+    unsigned rx_buf_head;
+    unsigned rx_buf_count;
     // Interrupt moderation; see APPLE_WLAN_INT_HOLD_NS.
     QEMUTimer *int_timer;
     bool int_asserted;
@@ -1632,6 +1665,11 @@ static void apple_wlan_ring_check_rebuilt(AppleWLANDeviceState *s, unsigned id,
         s->ioctl_resp_head = 0;
         s->ioctl_resp_count = 0;
     }
+    if (id == APPLE_WLAN_RING_H2D_RXPOST_SUBMIT) {
+        memset(s->rx_buf, 0, sizeof(s->rx_buf));
+        s->rx_buf_head = 0;
+        s->rx_buf_count = 0;
+    }
 }
 
 // Post one control completion. The device owns this ring's write index.
@@ -1691,27 +1729,6 @@ static bool apple_wlan_d2h_post(AppleWLANDeviceState *s, const uint8_t *item)
 {
     return apple_wlan_d2h_post_ring(s, APPLE_WLAN_RING_D2H_CONTROL_COMPLETE,
                                     item);
-}
-
-/*
- * Find the ring the driver created for Tx completions. brcmfmac's
- * BRCMF_D2H_MSGRING_TX_COMPLETE is ring type 4, and the driver announces
- * exactly that at startup -- "ring create 0x1c id 3 type 4 ptr ... 64 x 24" --
- * so a TX_STATUS belongs there, not on the control-complete ring.
- */
-#define APPLE_WLAN_RING_TYPE_D2H_TX_COMPLETE (4)
-
-static bool apple_wlan_find_ring_by_type(AppleWLANDeviceState *s, uint16_t type,
-                                         unsigned *id)
-{
-    for (unsigned d = 0; d < APPLE_WLAN_RING_DYNAMIC_MAX; d++) {
-        if (s->dyn_ring[d].valid && !s->dyn_ring[d].h2d &&
-            s->dyn_ring[d].type == type) {
-            *id = APPLE_WLAN_RING_COMMON_COUNT + d;
-            return true;
-        }
-    }
-    return false;
 }
 
 // Every completion starts as the request's header with a new type and a status.
@@ -1883,11 +1900,12 @@ static void apple_wlan_handle_flow_ring_create(AppleWLANDeviceState *s,
  *   +42  data_len           2
  *   +44  priority           4
  *
- * The completion is a msgbuf_tx_status on the D2H TX_COMPLETE ring, carrying
- * the request id the driver used so it can release the packet. Nothing is sent
- * anywhere yet -- there is no netdev attached -- but completing is not
- * optional: a frame the driver believes is still in flight stalls its queue,
- * and the interface watchdogs.
+ * The completion is a msgbuf_tx_status on common D2H ring 3, carrying the
+ * request id the driver used so it can release the packet. The dynamically
+ * created D2H ring whose request says id 3/type 4 is the debug-completion ring;
+ * posting TX_STATUS there makes drainDebugCompleteRing reject message 0x10 and
+ * watchdog the interface. Completing on the fixed common ring is not optional:
+ * a frame the driver believes is still in flight stalls its queue.
  */
 #define APPLE_WLAN_TX_TXHDR_OFF (8)
 #define APPLE_WLAN_TX_DATA_ADDR_OFF (32)
@@ -1897,7 +1915,8 @@ static void apple_wlan_handle_flow_ring_create(AppleWLANDeviceState *s,
 #define APPLE_WLAN_TX_STATUS_ACKED (0)
 
 static void apple_wlan_handle_tx_post(AppleWLANDeviceState *s,
-                                      const uint8_t *item)
+                                      const uint8_t *item,
+                                      uint16_t flow_ring_id)
 {
     const uint8_t *eth = item + APPLE_WLAN_TX_TXHDR_OFF;
     uint16_t data_len = lduw_le_p(item + APPLE_WLAN_TX_DATA_LEN_OFF);
@@ -1905,7 +1924,7 @@ static void apple_wlan_handle_tx_post(AppleWLANDeviceState *s,
         ldl_le_p(item + APPLE_WLAN_TX_DATA_ADDR_OFF) |
         (uint64_t)ldl_le_p(item + APPLE_WLAN_TX_DATA_ADDR_OFF + 4) << 32;
     uint8_t cmplt[APPLE_WLAN_MSGBUF_CMPLT_SIZE];
-    unsigned cmplt_ring;
+    g_autofree uint8_t *frame = NULL;
 
     trace_apple_wlan_tx_post(ldl_le_p(item + APPLE_WLAN_MSGBUF_REQUEST_ID_OFF),
                              (uint64_t)eth[0] << 40 | (uint64_t)eth[1] << 32 |
@@ -1914,17 +1933,165 @@ static void apple_wlan_handle_tx_post(AppleWLANDeviceState *s,
                                  (uint64_t)eth[4] << 8 | eth[5],
                              lduw_be_p(eth + 12), data_addr, data_len);
 
-    if (!apple_wlan_find_ring_by_type(s, APPLE_WLAN_RING_TYPE_D2H_TX_COMPLETE,
-                                      &cmplt_ring)) {
-        trace_apple_wlan_tx_no_cmplt_ring();
-        return;
+    /*
+     * txhdr holds the Ethernet header while data_buf starts immediately after
+     * it. Reassemble the frame for QEMU's Ethernet backend. A missing backend
+     * is a valid configuration: the guest still gets its completion, just as
+     * it did before the NIC plumbing existed.
+     */
+    if (s->nic != NULL && data_addr != 0) {
+        frame = g_malloc(ETH_HLEN + data_len);
+        memcpy(frame, eth, ETH_HLEN);
+        if (pci_dma_read(PCI_DEVICE(s), data_addr, frame + ETH_HLEN,
+                         data_len) == MEMTX_OK) {
+            qemu_send_packet(qemu_get_queue(s->nic), frame,
+                             ETH_HLEN + data_len);
+        } else {
+            trace_apple_wlan_ring_dma_fail(data_addr);
+        }
     }
+
     apple_wlan_cmplt_init(cmplt, item, APPLE_WLAN_MSGBUF_TX_STATUS,
-                          APPLE_WLAN_BCME_OK, 0);
+                          APPLE_WLAN_BCME_OK, flow_ring_id);
     stw_le_p(cmplt + APPLE_WLAN_TX_STATUS_METADATA_LEN_OFF, 0);
     stw_le_p(cmplt + APPLE_WLAN_TX_STATUS_OFF, APPLE_WLAN_TX_STATUS_ACKED);
-    apple_wlan_d2h_post_ring(s, cmplt_ring, cmplt);
+    apple_wlan_d2h_post_ring(s, APPLE_WLAN_RING_D2H_TX_COMPLETE, cmplt);
 }
+
+/*
+ * RXBUF_POST is brcmfmac's msgbuf_rx_bufpost:
+ *
+ *   +8   metadata_buf_len  u16
+ *   +10  data_buf_len      u16
+ *   +16  metadata address  u64
+ *   +24  data address      u64
+ *
+ * The request id names the guest's Rx object and must be returned unchanged in
+ * RX_CMPLT. The guest posts hundreds of these at startup, so retain them in a
+ * FIFO and let QEMU's network queue apply backpressure when it runs empty.
+ */
+#define APPLE_WLAN_RXPOST_METADATA_LEN_OFF (8)
+#define APPLE_WLAN_RXPOST_DATA_LEN_OFF (10)
+#define APPLE_WLAN_RXPOST_METADATA_ADDR_OFF (16)
+#define APPLE_WLAN_RXPOST_DATA_ADDR_OFF (24)
+
+#define APPLE_WLAN_RX_CMPLT_METADATA_LEN_OFF (12)
+#define APPLE_WLAN_RX_CMPLT_DATA_LEN_OFF (14)
+#define APPLE_WLAN_RX_CMPLT_DATA_OFFSET_OFF (16)
+#define APPLE_WLAN_RX_CMPLT_FLAGS_OFF (18)
+#define APPLE_WLAN_RX_CMPLT_STATUS_0_OFF (20)
+#define APPLE_WLAN_RX_CMPLT_STATUS_1_OFF (24)
+#define APPLE_WLAN_RX_FLAG_FRAME_802_3 (0x01)
+
+static void apple_wlan_handle_rx_buf_post(AppleWLANDeviceState *s,
+                                          const uint8_t *item)
+{
+    uint16_t data_len = lduw_le_p(item + APPLE_WLAN_RXPOST_DATA_LEN_OFF);
+    uint64_t data_addr = ldq_le_p(item + APPLE_WLAN_RXPOST_DATA_ADDR_OFF);
+    unsigned slot;
+
+    if (data_addr == 0 || data_len == 0) {
+        return;
+    }
+    if (s->rx_buf_count == APPLE_WLAN_RX_BUFS) {
+        trace_apple_wlan_rx_buf_full(
+            ldl_le_p(item + APPLE_WLAN_MSGBUF_REQUEST_ID_OFF));
+        return;
+    }
+
+    slot = (s->rx_buf_head + s->rx_buf_count) % APPLE_WLAN_RX_BUFS;
+    s->rx_buf[slot].data_addr = data_addr;
+    s->rx_buf[slot].metadata_addr =
+        ldq_le_p(item + APPLE_WLAN_RXPOST_METADATA_ADDR_OFF);
+    s->rx_buf[slot].data_len = data_len;
+    s->rx_buf[slot].metadata_len =
+        lduw_le_p(item + APPLE_WLAN_RXPOST_METADATA_LEN_OFF);
+    s->rx_buf[slot].request_id =
+        ldl_le_p(item + APPLE_WLAN_MSGBUF_REQUEST_ID_OFF);
+    s->rx_buf_count++;
+    trace_apple_wlan_rx_buf_post(s->rx_buf[slot].request_id, data_addr,
+                                 data_len, s->rx_buf_count);
+
+    if (s->nic != NULL) {
+        qemu_flush_queued_packets(qemu_get_queue(s->nic));
+    }
+}
+
+static bool apple_wlan_net_can_receive(NetClientState *nc)
+{
+    AppleWLANDeviceState *s = qemu_get_nic_opaque(nc);
+
+    return s->fw_shared_offset != 0 && s->rx_buf_count != 0;
+}
+
+static ssize_t apple_wlan_net_receive(NetClientState *nc, const uint8_t *buf,
+                                      size_t size)
+{
+    AppleWLANDeviceState *s = qemu_get_nic_opaque(nc);
+    uint8_t cmplt[APPLE_WLAN_MSGBUF_CMPLT_SIZE] = { 0 };
+    unsigned slot;
+
+    if (s->rx_buf_count == 0) {
+        return 0;
+    }
+
+    slot = s->rx_buf_head;
+    if (size > s->rx_buf[slot].data_len || size > UINT16_MAX) {
+        trace_apple_wlan_rx_too_large(size, s->rx_buf[slot].data_len);
+        return size;
+    }
+    if (pci_dma_write(PCI_DEVICE(s), s->rx_buf[slot].data_addr, buf, size) !=
+        MEMTX_OK) {
+        trace_apple_wlan_ring_dma_fail(s->rx_buf[slot].data_addr);
+        return 0;
+    }
+
+    cmplt[0] = APPLE_WLAN_MSGBUF_RX_CMPLT;
+    /*
+     * RXBUF_POST is a common-ring message and uses the reserved/common ifidx
+     * value 0xf. The received Ethernet frame belongs to the primary BSS
+     * interface. Returning 0xf makes the driver discard it as "unknown
+     * interface 15", so complete it on interface 0 for delivery to en2.
+     */
+    cmplt[1] = 0;
+    stl_le_p(cmplt + APPLE_WLAN_MSGBUF_REQUEST_ID_OFF,
+             s->rx_buf[slot].request_id);
+    stw_le_p(cmplt + APPLE_WLAN_MSGBUF_STATUS_OFF, APPLE_WLAN_BCME_OK);
+    stw_le_p(cmplt + APPLE_WLAN_MSGBUF_RING_ID_OFF, 0);
+    stw_le_p(cmplt + APPLE_WLAN_RX_CMPLT_METADATA_LEN_OFF, 0);
+    stw_le_p(cmplt + APPLE_WLAN_RX_CMPLT_DATA_LEN_OFF, size);
+    stw_le_p(cmplt + APPLE_WLAN_RX_CMPLT_DATA_OFFSET_OFF, 0);
+    stw_le_p(cmplt + APPLE_WLAN_RX_CMPLT_FLAGS_OFF,
+             APPLE_WLAN_RX_FLAG_FRAME_802_3);
+    stl_le_p(cmplt + APPLE_WLAN_RX_CMPLT_STATUS_0_OFF, 0);
+    stl_le_p(cmplt + APPLE_WLAN_RX_CMPLT_STATUS_1_OFF, 0);
+
+    if (!apple_wlan_d2h_post_ring(s, APPLE_WLAN_RING_D2H_RX_COMPLETE, cmplt)) {
+        return 0;
+    }
+
+    trace_apple_wlan_rx_frame(s->rx_buf[slot].request_id, size,
+                              s->rx_buf[slot].data_addr);
+    s->rx_buf_head = (s->rx_buf_head + 1) % APPLE_WLAN_RX_BUFS;
+    s->rx_buf_count--;
+    apple_wlan_raise_int(s, APPLE_WLAN_MB_INT_D2H_DB0);
+    return size;
+}
+
+static void apple_wlan_net_cleanup(NetClientState *nc)
+{
+    AppleWLANDeviceState *s = qemu_get_nic_opaque(nc);
+
+    s->nic = NULL;
+}
+
+static NetClientInfo apple_wlan_net_info = {
+    .type = NET_CLIENT_DRIVER_NIC,
+    .size = sizeof(NICState),
+    .can_receive = apple_wlan_net_can_receive,
+    .receive = apple_wlan_net_receive,
+    .cleanup = apple_wlan_net_cleanup,
+};
 
 static void apple_wlan_handle_resp_buf_post(AppleWLANDeviceState *s,
                                             const uint8_t *item)
@@ -2613,12 +2780,15 @@ static bool apple_wlan_drain_h2d_ring(AppleWLANDeviceState *s, unsigned id,
         case APPLE_WLAN_MSGBUF_EVENT_BUF_POST:
             apple_wlan_handle_event_buf_post(s, item);
             break;
+        case APPLE_WLAN_MSGBUF_RXBUF_POST:
+            apple_wlan_handle_rx_buf_post(s, item);
+            break;
         case APPLE_WLAN_MSGBUF_IOCTLPTR_REQ:
             apple_wlan_handle_ioctl(s, item);
             posted = true;
             break;
         case APPLE_WLAN_MSGBUF_TX_POST:
-            apple_wlan_handle_tx_post(s, item);
+            apple_wlan_handle_tx_post(s, item, ring->slot);
             posted = true;
             break;
         default:
@@ -2929,6 +3099,17 @@ static void apple_wlan_device_pci_realize(PCIDevice *dev, Error **errp)
     s->written_hash = APPLE_WLAN_FNV_OFFSET;
     apple_wlan_build_provisioning(s);
 
+    /*
+     * Keep the backend-facing address identical to the synthetic address in
+     * arm-io/wlan's DeviceTree property. A mismatch makes the backend learn
+     * one station while the guest transmits as another.
+     */
+    memcpy(s->conf.macaddr.a, apple_wlan_event_mac, APPLE_WLAN_MAC_LEN);
+    s->nic = qemu_new_nic(&apple_wlan_net_info, &s->conf,
+                          object_get_typename(OBJECT(dev)), DEVICE(dev)->id,
+                          &DEVICE(dev)->mem_reentrancy_guard, s);
+    qemu_format_nic_info_str(qemu_get_queue(s->nic), s->conf.macaddr.a);
+
     memory_region_init_io(&s->bar0, OBJECT(dev), &apple_wlan_bar0_ops, s,
                           TYPE_APPLE_WLAN_DEVICE ".bar0",
                           APPLE_WLAN_DEVICE_BAR0_SIZE);
@@ -3036,6 +3217,9 @@ static void apple_wlan_device_qdev_reset_hold(Object *obj, ResetType type)
     memset(s->event_buf, 0, sizeof(s->event_buf));
     s->event_buf_head = 0;
     s->event_buf_count = 0;
+    memset(s->rx_buf, 0, sizeof(s->rx_buf));
+    s->rx_buf_head = 0;
+    s->rx_buf_count = 0;
     s->mailbox_int = 0;
     s->mailbox_mask = 0;
     s->int_retries = 0;
@@ -3082,6 +3266,9 @@ static void apple_wlan_device_pci_uninit(PCIDevice *dev)
 {
     AppleWLANDeviceState *s = APPLE_WLAN_DEVICE(dev);
 
+    if (s->nic != NULL) {
+        qemu_del_nic(s->nic);
+    }
     g_clear_pointer(&s->backplane, g_hash_table_unref);
     g_clear_pointer(&s->bar2_backing, g_free);
     pcie_aer_exit(dev);
@@ -3092,6 +3279,10 @@ static void apple_wlan_device_pci_uninit(PCIDevice *dev)
     }
     msi_uninit(dev);
 }
+
+static const Property apple_wlan_device_properties[] = {
+    DEFINE_NIC_PROPERTIES(AppleWLANDeviceState, conf),
+};
 
 static void apple_wlan_device_class_init(ObjectClass *klass, const void *data)
 {
@@ -3112,6 +3303,7 @@ static void apple_wlan_device_class_init(ObjectClass *klass, const void *data)
     dc->desc = "Apple WLAN Device";
     dc->user_creatable = false;
     dc->hotpluggable = false;
+    device_class_set_props(dc, apple_wlan_device_properties);
 
     set_bit(DEVICE_CATEGORY_NETWORK, dc->categories);
 }
@@ -3160,6 +3352,12 @@ SysBusDevice *apple_wlan_create(AppleDTNode *node, PCIBus *pci_bus,
     s->device->port = port;
     s->device->dma_mr = port->dma_mr;
     s->device->dma_as = &port->dma_as;
+    /*
+     * The endpoint is part of the board and cannot be named with -device.
+     * Match a regular/default NIC configuration here instead. For example:
+     *   -nic user,model=wlan
+     */
+    qemu_configure_nic_device(DEVICE(s->device), true, "wlan");
 
     object_property_add_child(OBJECT(s), "device", OBJECT(s->device));
 

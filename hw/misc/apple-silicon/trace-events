@@ -58,4 +58,7 @@ apple_wlan_h2d_w_idx_dump(unsigned slot, uint16_t value) "h2d_w_idx[%u] = %u"
 apple_wlan_ring_reset(unsigned id, uint16_t r_idx) "ring %u reset by the driver: dropping read index %u"
 apple_wlan_int_give_up(uint32_t status, unsigned retries) "giving up on unserviced interrupt: MAILBOXINT 0x%08x after %u retries"
 apple_wlan_tx_post(uint32_t request_id, uint64_t dst, uint16_t ethertype, uint64_t data_addr, uint16_t data_len) "tx req 0x%08x to %012" PRIx64 " type 0x%04x payload 0x%" PRIx64 " len %u"
-apple_wlan_tx_no_cmplt_ring(void) "cannot complete a frame: no D2H TX_COMPLETE ring"
+apple_wlan_rx_buf_post(uint32_t request_id, uint64_t data_addr, uint16_t data_len, unsigned count) "rx buf req 0x%08x at 0x%" PRIx64 " len %u (%u held)"
+apple_wlan_rx_buf_full(uint32_t request_id) "cannot retain rx buf req 0x%08x: pool full"
+apple_wlan_rx_too_large(size_t size, uint16_t data_len) "dropping rx frame of %zu bytes: guest buffer has %u"
+apple_wlan_rx_frame(uint32_t request_id, size_t size, uint64_t data_addr) "rx req 0x%08x len %zu -> 0x%" PRIx64
