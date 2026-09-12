@@ -9,7 +9,7 @@ the iOS 26 guest is not working yet.**
 
 The driver connection, application-side client, compiler coordinator, and native
 library/function/compute-pipeline objects are implemented. They preserve real
-host metadata and compiler errors. Verification passed 2,410 client/compiler/
+host metadata and compiler errors. The published v3 layer passed 2,410 client/compiler/
 coordinator checks, 994 kernel-service checks, native object tests, SDK builds,
 and ARM guest tests under both TCG and HVF. All 14 captured compiler replies
 passed the production decoder and matched direct host Metal metadata. Native
@@ -89,7 +89,8 @@ decoder and match direct host Metal metadata. The coordinator and native objects
 also passed their final error, recovery, protocol and lifetime checks.
 
 Direct host measurements confirmed that metadata cannot be replaced with empty
-values: executable libraries report an install name, ordinary kernels use a
+values: some source-created executable libraries report a non-nil install name,
+while the new compiled-library reference returns nil; ordinary kernels use a
 signed patch count of `-1`, and attributed functions expose real attribute lists.
 The implementation preserves these distinctions. GPU resource IDs and argument
 encoders remain explicitly unsupported until resource ownership and layout
@@ -104,14 +105,121 @@ iOS target; matching the actual iOS kernel interface is still outstanding.
 
 ## Current work
 
-The next implementation is reusable shared buffers and ordered compute command
-buffers. Source/API review confirmed that the existing single-operation path
-cannot preserve arbitrary bindings, aliases or dependent dispatches. Fable’s
-plan and revision have been reviewed, and Sol is implementing the bounded batch
-protocol and native queue/command/encoder objects. An independent fixture pass
-is preparing malformed-packet and lifecycle checks. The execution scheduler must
-capture shared-buffer bytes after preceding GPU writeback, including work
-already queued by the application.
+Compiled shader libraries now have a direct host reference. After installing
+Apple's missing Metal Toolchain, the same kernel was compiled for iOS 26 and
+macOS 26. Both artifacts loaded through the public data and URL APIs on the
+Mac and executed correctly: all four 100-byte outputs, including guards,
+matched an independent calculation. This proves one artifact's compatibility;
+it does not establish arbitrary iOS library compatibility. The Inferno bridge
+still accepts only UTF-8 shader source. Opaque library payloads, cache identity,
+pipeline reuse and guest bundle/URL loading remain implementation work.
+
+The iOS-compiled render and sampling shaders also loaded through the public
+host library API. Four commands reproduced all 1,224 bytes of the unchanged CPU
+texture oracle, including padding and guards. This extends compiled-library
+evidence to the rendering reference; it remains a direct host test.
+
+The inherited device wrapper method returns nil, so the native provider must
+explicitly handle Metal's optional wrapper path. This is now confirmed from
+actual method metadata and instructions. The remaining optional initialization
+call has been identified, but its behavior and compiled-library compatibility
+are still unverified.
+
+The native device-registration investigation now confirms wrapper selection
+and ownership after insertion into Metal's device list. Instruction-level
+review corrected a missed release in the model's decompilation report. The
+runtime wrapper configuration, truthful device capabilities and actual iOS
+initialization remain unresolved; this is framework-contract evidence only.
+
+The retained client/compiler/coordinator and service regression suites now
+pass against the current v4 source: **2,390 and 994 checks**, respectively,
+with address and undefined-behavior sanitizers. Three obsolete v3 assertions
+were omitted because their reserved values are now valid v4 fields. The service
+fixture supplies zero scheduled progress through a mock. These runs preserve
+coverage of the existing behavior; they do not cover the new batch coordinator,
+production kernel transport, or native iOS execution. Exact compatibility diffs
+and results are saved in `metal-v4-existing-regressions-8p5vic4w/root-review.json`
+under the local evidence directory.
+
+Preparation for reusable textures and rendering now has a verified host
+reference. A real shared texture accepted padded-row uploads and partial
+updates; four render commands exercised preserved contents, clears,
+overlapping draws and shader sampling into a second texture. All 1,224 captured
+bytes matched a separate CPU calculation,
+including padding and guard bytes. Both dependent render commands were
+committed before waiting, and vertex/fragment bindings used separate buffers at
+the same slot. Sampling used a real nearest/clamp sampler and preserved the
+patterned source image exactly. This establishes expected results for future guest code;
+textures and rendering are not yet implemented in the native provider.
+The SDK method and descriptor inventory is now checked, including optional
+methods and platform differences. A source-and-evidence packet now includes compiled-library requirements. Its
+Fable planning pass returned. Root review found an incompatible capability-mask
+assumption, an inconsistent sampler record size, and unresolved API contracts.
+A focused revision is running before texture/render implementation. Public Apple
+documentation now resolves normal default.metallib bundle loading and provides
+the family-specific texture, sampler and dimension limits needed by that plan.
+
+Reusable shared buffers and ordered compute command buffers are implemented
+under the reviewed Fable plan, with Sol owning the source changes. The bounded
+batch protocol preserves bindings, aliases and dependent dispatches. The host
+and transport code pass independent ARM execution under both TCG and HVF.
+
+The final native correction makes commit serial allocation, command-state
+publication and queue readiness one scheduler-locked transition. All 40
+kernel/iPhoneOS/macOS compile and link stages pass against this source. The
+recursive macOS protocol audit finds no missing required methods across the
+four new object classes. The native API fixture now passes 60 assertions with
+address and undefined-behavior sanitizers, covering admission-time buffer
+capture, ordering, callback waits, capacity recovery and typed error handling.
+Remote execution errors and cleanup diagnostics preserve error metadata while
+withholding every shadow-buffer writeback byte. A subsequent valid command
+still completes. These tests use a scripted coordinator; production driver
+integration and target iOS behavior remain unverified.
+
+Fable’s read-only review completed after the quota reset. Its source review
+identified retained scheduled-handler captures, incorrect first-commit behavior
+after a precommit failure, and unsafe host callback lifetime. Sol corrected the
+two affected files under the reviewed plan. The regression fixture reproduced
+six failures before the provider fix and now passes all 60 checks, including
+late completion handlers and waits that include every handler body. All 40 SDK
+compile/link stages also pass on the corrected provider. Host callback resource
+cleanup is corrected. The rebuilt, signed QEMU passes empty and inline-only
+batches, dependent compute, scheduled reset and recovery under TCG and HVF;
+all captured regions match the independently verified references. An additional
+Fable review with the actual accepted plan included exhausted its session quota
+before a final report. That final review remains incomplete; the earlier source
+review and root-verified corrections are recorded.
+Local source inspection found and a deterministic regression confirmed a queue
+stall: abandoning an enqueued, uncommitted head left later committed work asleep.
+Sol corrected head removal to schedule a rescan after releasing the queue lock.
+The same sanitized test now passes, including proof that the abandoned command
+deallocated and its successor completes without another submission. All 40 SDK
+stages were rerun successfully after that correction. Full v4 production
+coordinator/kernel acceptance remains incomplete.
+
+An earlier isolated wire test exposed validation gaps; source review confirms
+several have been corrected. A follow-up fixture revision was rejected by the
+platform and remains stopped. That rejection was a model-call failure, not a
+QEMU or GPU-test failure.
+
+A direct host Metal reference now passes dependent dispatches, simultaneous
+buffer aliases, nonzero offsets, inline-byte copies and two command buffers
+committed before waiting. All 576 buffer bytes, including guards, match an
+independent CPU calculation at both checkpoints. This supplies the expected
+results for upcoming bridge tests; it is not native iOS acceptance.
+The independent ARM batch fixture now passes actual host execution and reset
+recovery under both TCG and HVF. At four compute checkpoints per accelerator,
+all 576 bytes match independent CPU calculations. All seven captured result
+regions are identical between accelerators. Reset after an observed scheduled
+event preserves all 17,664 bytes of retired output; a fresh two-dispatch compute
+submission then succeeds. These are freestanding ARM tests, not native iOS.
+
+The existing compute/render/compiler guest assertions also pass under both
+accelerators. All 14 compiler reply captures pass the production decoder and
+match direct host metadata. A legacy v3 client is rejected explicitly by the
+v4 bridge under both TCG and HVF. The refreshed host also accepts a valid inline-only compute dispatch with no
+buffers under both accelerators. Native-object behavior now has the scoped macOS evidence above; target iOS
+runtime checks remain pending.
 
 The separate capability-getter investigation hit Kimi's weekly quota limit.
 After availability was restored, one bounded retry completed. Three concrete

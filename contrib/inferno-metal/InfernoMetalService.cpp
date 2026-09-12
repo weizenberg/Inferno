@@ -125,7 +125,7 @@ bool InfernoMetalService::start(IOService *provider)
         provider_ = nullptr;
         goto fail;
     }
-    status_ = { Idle, IMTL_OK, kIOReturnSuccess, { 0, 0 } };
+    status_ = { Idle, IMTL_OK, kIOReturnSuccess, { 0, 0 }, 0 };
     registerService();
     return true;
 
@@ -269,6 +269,7 @@ IOReturn InfernoMetalService::shutdownGated()
     }
     status_.state = Drained;
     status_.completion = { 0, 0 };
+    status_.progress = 0;
     if (provider_open_) {
         provider_open_ = false;
         /* Provider removal queues stop after this gated action returns. */
@@ -301,9 +302,26 @@ void InfernoMetalService::refreshGated()
     status_.transport_result =
         imtl_iokit_poll(owner_, resetting ? nullptr : &status_.completion);
     if (status_.transport_result == IMTL_AGAIN) {
+        if (!resetting) {
+            ImtlResult progress_result =
+                imtl_iokit_progress(owner_, &status_.progress);
+            if (progress_result != IMTL_OK) {
+                status_.transport_result = progress_result;
+                status_.state = Faulted;
+                return;
+            }
+        }
         armGated();
     } else if (status_.transport_result == IMTL_OK) {
-        status_.state = resetting ? Idle : Completed;
+        if (resetting) {
+            status_.state = Idle;
+            status_.progress = 0;
+        } else {
+            status_.transport_result =
+                imtl_iokit_progress(owner_, &status_.progress);
+            status_.state =
+                status_.transport_result == IMTL_OK ? Completed : Faulted;
+        }
     } else {
         /* Retain the failed request for explicit reset/shutdown recovery. */
         status_.state = Faulted;
@@ -386,7 +404,7 @@ IOReturn InfernoMetalService::dispatchGated(Request *r)
         if (result != kIOReturnSuccess) {
             return result;
         }
-        status_ = { Submitted, IMTL_AGAIN, kIOReturnSuccess, { 0, 0 } };
+        status_ = { Submitted, IMTL_AGAIN, kIOReturnSuccess, { 0, 0 }, 0 };
         armGated();
         /* Submission succeeded even if timer arming failed. Status reports
          * that distinct failure; never imply the doorbell was not written.
@@ -405,13 +423,14 @@ IOReturn InfernoMetalService::dispatchGated(Request *r)
     case Acknowledge: {
         ImtlResult result = imtl_iokit_ack(owner_);
         if (result == IMTL_OK) {
-            status_ = { Idle, IMTL_OK, kIOReturnSuccess, { 0, 0 } };
+            status_ = { Idle, IMTL_OK, kIOReturnSuccess, { 0, 0 }, 0 };
         }
         /* A rejected ACK must not replace the original polling fault. */
         return ioResult(result);
     }
     case Reset:
         status_.completion = { 0, 0 };
+        status_.progress = 0;
         status_.transport_result = imtl_iokit_reset(owner_);
         if (status_.transport_result == IMTL_OK) {
             status_.state = Idle;

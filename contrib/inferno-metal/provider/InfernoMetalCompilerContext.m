@@ -14,17 +14,15 @@
  * You should have received a copy of the GNU Affero General Public License
  * along with this program. If not, see <https://www.gnu.org/licenses/>.
  */
+#import "InfernoMetalBuffer.h"
+#import "InfernoMetalCommandQueue.h"
 #import "InfernoMetalCompilerContext.h"
 #import "InfernoMetalComputePipelineState.h"
+#import "InfernoMetalContextPrivate.h"
 #import "InfernoMetalErrors.h"
 #import "InfernoMetalFunction.h"
 #import "InfernoMetalLibrary.h"
 
-@interface InfernoMetalCompilerContext ()
-@property(nonatomic) ImtlCoordinator *coordinator;
-@property(nonatomic, weak) id<MTLDevice> owner;
-@property(nonatomic, strong) dispatch_queue_t completionQueue;
-@end
 @implementation InfernoMetalCompilerContext
 - (instancetype)initWithService:(io_service_t)service
                           owner:(id<MTLDevice>)owner
@@ -71,12 +69,31 @@
                               owner:(id<MTLDevice>)owner
                     completionQueue:(dispatch_queue_t)queue
 {
-    if (!(self = [super init]) || !coordinator || !owner || !queue)
+    self = [super init];
+    if (!self || !coordinator || !owner || !queue) {
+        if (coordinator)
+            imtl_coordinator_close(&coordinator);
         return nil;
+    }
     _coordinator = coordinator;
     _owner = owner;
     _completionQueue = queue;
+    _executionQueue = dispatch_queue_create("org.inferno.metal.execution",
+                                            DISPATCH_QUEUE_SERIAL);
+    _schedulerLock = [[NSLock alloc] init];
+    _queues = [NSHashTable weakObjectsHashTable];
+    _nextCommitSerial = 1;
+    if (!_executionQueue || !_schedulerLock || !_queues)
+        return nil;
     return self;
+}
+
+- (id<MTLDevice>)executionOwner
+{
+    [_schedulerLock lock];
+    id<MTLDevice> owner = _executionClosed ? nil : _owner;
+    [_schedulerLock unlock];
+    return owner;
 }
 - (void)dealloc
 {
@@ -90,10 +107,91 @@
 }
 - (void)invalidate
 {
+    [_schedulerLock lock];
+    if (_executionClosed) {
+        [_schedulerLock unlock];
+        return;
+    }
+    _executionClosed = YES;
+    NSArray *queues = _queues.allObjects;
+    [_schedulerLock unlock];
+    for (InfernoMetalCommandQueue *queue in queues)
+        [queue infernoClose];
     @synchronized(self) {
         if (_coordinator)
             imtl_coordinator_invalidate(_coordinator);
     }
+}
+
+- (id<MTLBuffer>)newBufferWithLength:(NSUInteger)length
+                             options:(MTLResourceOptions)options
+{
+    id<MTLDevice> owner = [self executionOwner];
+    if (!owner)
+        return nil;
+    return [[InfernoMetalBuffer alloc] initWithContext:self
+                                                device:owner
+                                                length:length
+                                               options:options
+                                                 bytes:NULL];
+}
+
+- (id<MTLBuffer>)newBufferWithBytes:(const void *)pointer
+                             length:(NSUInteger)length
+                            options:(MTLResourceOptions)options
+{
+    id<MTLDevice> owner = [self executionOwner];
+    if (!owner || !pointer)
+        return nil;
+    return [[InfernoMetalBuffer alloc] initWithContext:self
+                                                device:owner
+                                                length:length
+                                               options:options
+                                                 bytes:pointer];
+}
+
+- (id<MTLBuffer>)newBufferWithBytesNoCopy:(void *)pointer
+                                   length:(NSUInteger)length
+                                  options:(MTLResourceOptions)options
+                              deallocator:(void (^)(void *, NSUInteger))block
+{
+    (void)pointer;
+    (void)length;
+    (void)options;
+    (void)block;
+    return nil;
+}
+
+- (id<MTLCommandQueue>)newCommandQueue
+{
+    return [self newCommandQueueWithMaxCommandBufferCount:64];
+}
+
+- (id<MTLCommandQueue>)newCommandQueueWithMaxCommandBufferCount:
+    (NSUInteger)count
+{
+    id<MTLDevice> owner = [self executionOwner];
+    if (!owner || !count)
+        return nil;
+    InfernoMetalCommandQueue *queue =
+        [[InfernoMetalCommandQueue alloc] initWithContext:self
+                                                   device:owner
+                                                 maxCount:count];
+    if (queue && ![self registerCommandQueue:queue]) {
+        [queue infernoClose];
+        queue = nil;
+    }
+    return queue;
+}
+
+- (id<MTLCommandQueue>)newCommandQueueWithDescriptor:
+    (MTLCommandQueueDescriptor *)descriptor
+{
+    if (!descriptor || descriptor.logState || !descriptor.maxCommandBufferCount)
+        return nil;
+    return [self
+        newCommandQueueWithMaxCommandBufferCount:descriptor
+                                                     .maxCommandBufferCount];
 }
 
 static NSError *resultError(const ImtlCompilerResult *result, IOReturn timer,
@@ -138,7 +236,7 @@ static NSError *resultError(const ImtlCompilerResult *result, IOReturn timer,
         return nil;
     }
     ImtlQueryReply reply = { 0 };
-    ImtlCoordinatorError coordinatorError;
+    ImtlCoordinatorError coordinatorError = { 0 };
     BOOL ok;
     @synchronized(self) {
         ok = _coordinator && imtl_coordinator_query_library(
@@ -261,7 +359,7 @@ static NSError *resultError(const ImtlCompilerResult *result, IOReturn timer,
     }
     NSData *source = value.infernoLibrary.infernoSource;
     ImtlQueryReply reply = { 0 };
-    ImtlCoordinatorError coordinatorError;
+    ImtlCoordinatorError coordinatorError = { 0 };
     BOOL ok;
     @synchronized(self) {
         ok = _coordinator &&
@@ -345,7 +443,7 @@ static NSError *resultError(const ImtlCompilerResult *result, IOReturn timer,
     }
     NSData *source = function.infernoLibrary.infernoSource;
     ImtlQueryReply reply = { 0 };
-    ImtlCoordinatorError coordinatorError;
+    ImtlCoordinatorError coordinatorError = { 0 };
     BOOL ok;
     @synchronized(self) {
         ok = _coordinator && imtl_coordinator_query_imageblock(

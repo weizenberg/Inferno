@@ -214,6 +214,11 @@ ImtlResult imtl_iokit_poll(ImtlIokitTransport *t, ImtlCompletion *completion)
     return result;
 }
 
+ImtlResult imtl_iokit_progress(ImtlIokitTransport *t, uint32_t *flags)
+{
+    return t ? imtl_progress(&t->core, flags) : IMTL_BAD_ARGUMENT;
+}
+
 ImtlResult imtl_iokit_read_output(ImtlIokitTransport *t, size_t offset,
                                   void *output, size_t size)
 {

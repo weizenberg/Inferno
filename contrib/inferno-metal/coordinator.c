@@ -16,6 +16,7 @@
  */
 
 #include "coordinator.h"
+#include "batch-client.h"
 #include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
@@ -28,6 +29,12 @@ struct ImtlCoordinator {
     uint64_t next_sequence;
     bool needs_drain;
 };
+
+static uint32_t wireGet32(const uint8_t *p)
+{
+    return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 |
+           (uint32_t)p[3] << 24;
+}
 
 static uint64_t monotonicNS(void)
 {
@@ -392,6 +399,201 @@ bool imtl_coordinator_query_imageblock(ImtlCoordinator *c, const void *source,
 }
 
 void imtl_query_reply_free(ImtlQueryReply *reply)
+{
+    if (reply) {
+        free(reply->bytes);
+        memset(reply, 0, sizeof(*reply));
+    }
+}
+
+bool imtl_coordinator_execute_batch(ImtlCoordinator *c, const void *manifest,
+                                    size_t manifest_size, uint32_t buffer_count,
+                                    uint32_t images_size,
+                                    const ImtlBatchObserver *observer,
+                                    ImtlBatchReply *out,
+                                    ImtlCoordinatorError *error)
+{
+    clearError(error);
+    if (!c || !manifest || !out ||
+        manifest_size < INFERNO_METAL_BATCH_HEADER_SIZE ||
+        manifest_size > INFERNO_METAL_MAX_BUFFER ||
+        buffer_count > INFERNO_METAL_BATCH_MAX_BUFFERS ||
+        images_size > INFERNO_METAL_BATCH_MAX_IMAGES ||
+        (observer && !observer->scheduled)) {
+        return fail(error, IMTL_COORDINATOR_ERROR_INVALID_ARGUMENT,
+                    kIOReturnBadArgument, NULL, 0, 0);
+    }
+    memset(out, 0, sizeof(*out));
+    uint64_t deadline;
+    if (!makeDeadline(c->config.timeout_ns, &deadline)) {
+        return fail(error, IMTL_COORDINATOR_ERROR_INVALID_ARGUMENT,
+                    kIOReturnBadArgument, NULL, 0, 0);
+    }
+    pthread_mutex_lock(&c->mutex);
+    if (!c->client) {
+        pthread_mutex_unlock(&c->mutex);
+        return fail(error, IMTL_COORDINATOR_ERROR_CLOSED, kIOReturnNotOpen,
+                    NULL, 0, 0);
+    }
+    if (!drainLocked(c, deadline, error)) {
+        pthread_mutex_unlock(&c->mutex);
+        return false;
+    }
+    if (c->next_sequence == UINT64_MAX) {
+        IOReturn close_io = imtl_user_client_close(&c->client);
+        pthread_mutex_unlock(&c->mutex);
+        return fail(error, IMTL_COORDINATOR_ERROR_CLOSED, close_io, NULL,
+                    UINT64_MAX, close_io);
+    }
+    uint64_t sequence = c->next_sequence++;
+    out->sequence = sequence;
+    IOReturn submit_io;
+    uint64_t delay = 100000;
+retry_submit:
+    submit_io = imtl_batch_submit(c->client, sequence, manifest, manifest_size,
+                                  images_size);
+    bool uncertain = submit_io != kIOReturnSuccess;
+    /* Until an IDLE status proves rejection, the kernel may own the request. */
+    c->needs_drain = true;
+    ImtlUserStatus status = { 0 };
+    bool observed = false;
+    while (true) {
+        IOReturn status_io = imtl_user_client_status(c->client, &status);
+        if (status_io != kIOReturnSuccess) {
+            c->needs_drain = true;
+            if (pauseUntil(deadline, &delay)) {
+                continue;
+            }
+            pthread_mutex_unlock(&c->mutex);
+            return fail(error,
+                        uncertain ? IMTL_COORDINATOR_ERROR_UNCERTAIN :
+                                    IMTL_COORDINATOR_ERROR_TRANSPORT,
+                        uncertain ? submit_io : status_io, NULL, sequence, 0);
+        }
+        if (status.state == INFERNO_METAL_USER_COMPLETED &&
+            status.sequence != sequence) {
+            c->needs_drain = true;
+            pthread_mutex_unlock(&c->mutex);
+            return fail(error, IMTL_COORDINATOR_ERROR_PROTOCOL,
+                        kIOReturnBadMessageID, &status, sequence, 0);
+        }
+        if ((status.state == INFERNO_METAL_USER_SUBMITTED ||
+             status.state == INFERNO_METAL_USER_COMPLETED) &&
+            (status.progress & INFERNO_METAL_USER_PROGRESS_SCHEDULED) &&
+            !observed) {
+            observed = true;
+            out->scheduled_observed = true;
+            if (observer) {
+                observer->scheduled(observer->opaque, sequence);
+            }
+        }
+        if (status.state == INFERNO_METAL_USER_IDLE && uncertain) {
+            if (submit_io == kIOReturnBusy) {
+                uncertain = false;
+                c->needs_drain = false;
+                if (!pauseUntil(deadline, &delay)) {
+                    pthread_mutex_unlock(&c->mutex);
+                    return fail(error, IMTL_COORDINATOR_ERROR_BUSY,
+                                kIOReturnBusy, &status, sequence, 0);
+                }
+                goto retry_submit;
+            }
+            c->needs_drain = false;
+            pthread_mutex_unlock(&c->mutex);
+            return fail(error, IMTL_COORDINATOR_ERROR_TRANSPORT, submit_io,
+                        &status, sequence, 0);
+        }
+        if (status.state == INFERNO_METAL_USER_COMPLETED) {
+            if (status.transport_result != INFERNO_METAL_USER_RESULT_OK ||
+                status.completion_error) {
+                IOReturn cleanup = imtl_user_client_ack(c->client);
+                c->needs_drain = cleanup != kIOReturnSuccess;
+                pthread_mutex_unlock(&c->mutex);
+                return fail(error, IMTL_COORDINATOR_ERROR_DEVICE_FAULT,
+                            kIOReturnError, &status, sequence, cleanup);
+            }
+            break;
+        }
+        if (status.state == INFERNO_METAL_USER_FAULTED ||
+            status.state == INFERNO_METAL_USER_STOPPED) {
+            c->needs_drain = true;
+            pthread_mutex_unlock(&c->mutex);
+            return fail(error, IMTL_COORDINATOR_ERROR_DEVICE_FAULT,
+                        kIOReturnError, &status, sequence, 0);
+        }
+        if (!pauseUntil(deadline, &delay)) {
+            IOReturn cleanup = imtl_user_client_reset(c->client);
+            c->needs_drain = true;
+            pthread_mutex_unlock(&c->mutex);
+            return fail(error, IMTL_COORDINATOR_ERROR_TIMEOUT, kIOReturnTimeout,
+                        &status, sequence, cleanup);
+        }
+    }
+    size_t output_size = INFERNO_METAL_BATCH_RESULT_SIZE + images_size;
+    uint8_t *bytes = calloc(1, output_size);
+    if (!bytes) {
+        IOReturn cleanup = imtl_user_client_reset(c->client);
+        c->needs_drain = true;
+        pthread_mutex_unlock(&c->mutex);
+        return fail(error, IMTL_COORDINATOR_ERROR_TRANSPORT, kIOReturnNoMemory,
+                    &status, sequence, cleanup);
+    }
+    IOReturn read_io;
+    size_t read_size = 0;
+    while ((read_io = imtl_user_client_read(c->client, 0, bytes, output_size,
+                                            &read_size)) != kIOReturnSuccess) {
+        memset(bytes, 0, output_size);
+        if (!pauseUntil(deadline, &delay)) {
+            break;
+        }
+    }
+    ImtlBatchResult result;
+    bool valid = read_io == kIOReturnSuccess && read_size == output_size &&
+                 imtl_batch_decode_result(bytes, output_size, sequence,
+                                          buffer_count, images_size, &result);
+    if (valid && result.outcome != INFERNO_METAL_BATCH_OUTCOME_MALFORMED) {
+        const uint8_t *wire = manifest;
+        uint32_t pipeline_count =
+            wireGet32(wire + INFERNO_METAL_BATCH_PIPELINE_COUNT_OFFSET);
+        uint32_t dispatch_count =
+            wireGet32(wire + INFERNO_METAL_BATCH_DISPATCH_COUNT_OFFSET);
+        uint32_t binding_count =
+            wireGet32(wire + INFERNO_METAL_BATCH_BINDING_COUNT_OFFSET);
+        if ((result.failed_record_kind == INFERNO_METAL_BATCH_RECORD_PIPELINE &&
+             result.failed_record_index >= pipeline_count) ||
+            (result.failed_record_kind == INFERNO_METAL_BATCH_RECORD_DISPATCH &&
+             result.failed_record_index >= dispatch_count) ||
+            (result.failed_record_kind == INFERNO_METAL_BATCH_RECORD_BINDING &&
+             result.failed_record_index >= binding_count)) {
+            valid = false;
+        }
+    }
+    IOReturn cleanup = imtl_user_client_ack(c->client);
+    c->needs_drain = cleanup != kIOReturnSuccess;
+    if (!valid) {
+        free(bytes);
+        uint32_t kind = read_io != kIOReturnSuccess ?
+                            IMTL_COORDINATOR_ERROR_TRANSPORT :
+                            IMTL_COORDINATOR_ERROR_PROTOCOL;
+        IOReturn primary =
+            read_io == kIOReturnSuccess ? kIOReturnBadMessageID : read_io;
+        pthread_mutex_unlock(&c->mutex);
+        return fail(error, kind, primary, &status, sequence, cleanup);
+    }
+    *out = (ImtlBatchReply){
+        .bytes = bytes,
+        .size = output_size,
+        .result = result,
+        .timer_error = status.timer_error,
+        .cleanup_io = cleanup,
+        .sequence = sequence,
+        .scheduled_observed = observed,
+    };
+    pthread_mutex_unlock(&c->mutex);
+    return true;
+}
+
+void imtl_batch_reply_free(ImtlBatchReply *reply)
 {
     if (reply) {
         free(reply->bytes);

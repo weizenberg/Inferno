@@ -127,8 +127,34 @@ the current source-key cache supplies no persistent guest handle. SDK and
 macOS object tests do not establish that these objects initialize on the iOS
 runtime; native driver startup and device initialization remain prerequisites.
 
-The final registration block also needs instruction-level verification; its
-current decompilation is insufficient to settle optional wrapping behavior.
+The final registration block is now verified at instruction level. If its
+runtime wrapper callback is absent, it inserts the original device. Otherwise
+it asks for `_deviceWrapper`; an existing different wrapper is used directly,
+while a self result causes the callback to create a wrapper. The selected
+object is inserted with `addObject:`. Only the callback-created path then
+releases that object through a tail call to `objc_release`, balancing the
+wrapper after retaining-array insertion. The earlier decompiler interpretation
+missed this release. No device-return contract follows from its inferred return
+types, and no nil-result check exists between wrapper selection and insertion.
+
+The inherited `_MTLDevice._deviceWrapper` is now verified to return `nil`
+(`MOV X0,#0; RET` at `0x1861e29c8`). Inheriting that default is insufficient
+when the optional callback is present: registration takes the different-object
+branch and attempts to insert nil. The future provider must deliberately supply
+its wrapper behavior; no corresponding implementation or runtime is proven.
+
+The separate optional call before dispatch is now identified: a nonzero return
+from CoreFoundation's `__CFMZEnabled` triggers
+`allowLibrariesFromOtherPlatforms` on the original device. Only the call
+identity is established; predicate and method semantics are unresolved and this
+does not establish cross-platform compiled-library support. The runtime wrapper
+callback identity/value and complete byref ownership also remain unverified.
+See `metal-registration-defaults-w04w61p9/coordinator-review.md` under the local
+evidence root for verified partial-query evidence and the model's length-limit
+failure. Static registration does not prove
+native initialization. Exact instructions, selector-chain verification, export
+resolution and coordinator corrections are saved in
+`~/InfernoData/ios26/gpu-display-20260911/metal-registration-lifetime-gt7pyqa5/coordinator-review.md`.
 
 A successful first runtime milestone must show that stock
 `MTLCreateSystemDefaultDevice()` returns the Inferno provider and that an iOS

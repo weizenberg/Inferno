@@ -68,6 +68,7 @@ typedef struct ImtlUserStatus {
     IOReturn timer_error;
     uint64_t sequence;
     uint32_t completion_error;
+    uint32_t progress;
 } ImtlUserStatus;
 
 /* service is borrowed. On success the returned handle owns one type-0

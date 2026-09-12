@@ -35,8 +35,13 @@ NS_ASSUME_NONNULL_BEGIN
     FOUNDATION_EXPORT NSErrorUserInfoKey const InfernoMetalStateErrorKey;
     FOUNDATION_EXPORT NSErrorUserInfoKey const InfernoMetalCompletionErrorKey;
     FOUNDATION_EXPORT NSErrorUserInfoKey const InfernoMetalTimerErrorKey;
+    FOUNDATION_EXPORT NSErrorUserInfoKey const InfernoMetalFailedRecordKindKey;
+    FOUNDATION_EXPORT NSErrorUserInfoKey const InfernoMetalFailedRecordIndexKey;
+    FOUNDATION_EXPORT NSErrorUserInfoKey const InfernoMetalHostStatusKey;
+    FOUNDATION_EXPORT NSErrorUserInfoKey const InfernoMetalScheduledKey;
     FOUNDATION_EXPORT NSExceptionName const InfernoMetalUnsupportedException;
     FOUNDATION_EXPORT NSExceptionName const InfernoMetalTransportException;
+    FOUNDATION_EXPORT NSExceptionName const InfernoMetalInvalidUseException;
 
     typedef NS_ERROR_ENUM(InfernoMetalErrorDomain, InfernoMetalErrorCode){
         InfernoMetalErrorUnsupported = 1,
@@ -51,6 +56,10 @@ NS_ASSUME_NONNULL_BEGIN
         InfernoMetalErrorSpecializationRequired = 10,
         InfernoMetalErrorFunctionTypeMismatch = 11,
         InfernoMetalErrorRemoteWithoutNSError = 12,
+        InfernoMetalErrorExecutionFailed = 13,
+        InfernoMetalErrorInvalidDispatch = 14,
+        InfernoMetalErrorMalformedBatch = 15,
+        InfernoMetalErrorUnsupportedHost = 16,
     };
 
     FOUNDATION_EXPORT NSError *InfernoMetalMakeError(InfernoMetalErrorCode code,
@@ -59,5 +68,7 @@ NS_ASSUME_NONNULL_BEGIN
         const ImtlCompilerResult *result, IOReturn cleanupIO);
     FOUNDATION_EXPORT NSError *InfernoMetalErrorFromCoordinator(
         const ImtlCoordinatorError *error);
+    FOUNDATION_EXPORT NSError *InfernoMetalErrorFromBatchResult(
+        const ImtlBatchResult *result, IOReturn timerIO, IOReturn cleanupIO);
 
 NS_ASSUME_NONNULL_END

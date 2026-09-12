@@ -67,8 +67,8 @@ bool imtl_user_decode(const void *packet, size_t size, ImtlUserRequest *result)
     r.command.depth = get32(p + INFERNO_METAL_USER_DEPTH_OFFSET);
     r.command.options = get32(p + INFERNO_METAL_USER_OPTIONS_OFFSET);
     if (r.command.opcode < INFERNO_METAL_COMPUTE ||
-        r.command.opcode > INFERNO_METAL_QUERY_IMAGEBLOCK ||
-        r.command.options || r.command.source_size > INFERNO_METAL_MAX_SOURCE ||
+        r.command.opcode > INFERNO_METAL_BATCH || r.command.options ||
+        r.command.source_size > INFERNO_METAL_MAX_SOURCE ||
         r.command.input_size > INFERNO_METAL_MAX_BUFFER ||
         !r.command.output_size ||
         r.command.output_size > INFERNO_METAL_MAX_BUFFER) {
@@ -91,7 +91,19 @@ bool imtl_user_decode(const void *packet, size_t size, ImtlUserRequest *result)
     if (!function_end || !fragment_end) {
         return false;
     }
-    if (r.command.opcode >= INFERNO_METAL_QUERY_LIBRARY) {
+    if (r.command.opcode == INFERNO_METAL_BATCH) {
+        if (r.command.source_size ||
+            r.command.input_size < INFERNO_METAL_BATCH_HEADER_SIZE ||
+            r.command.output_size < INFERNO_METAL_BATCH_RESULT_SIZE ||
+            r.command.width != 1 || r.command.height != 1 ||
+            r.command.depth != 1 ||
+            !allZero((const uint8_t *)r.command.function,
+                     sizeof(r.command.function)) ||
+            !allZero((const uint8_t *)r.command.fragment,
+                     sizeof(r.command.fragment))) {
+            return false;
+        }
+    } else if (r.command.opcode >= INFERNO_METAL_QUERY_LIBRARY) {
         bool library = r.command.opcode == INFERNO_METAL_QUERY_LIBRARY;
         bool imageblock = r.command.opcode == INFERNO_METAL_QUERY_IMAGEBLOCK;
 

@@ -1,4 +1,4 @@
-# Inferno Metal bridge, protocol version 3
+# Inferno Metal bridge, protocol version 4
 
 This experimental device executes bounded guest requests on the host Metal GPU.
 It is available in Darwin builds with the Metal framework and is disabled by
@@ -11,7 +11,7 @@ The Apple DeviceTree node `arm-io/inferno-metal` has compatible
 `inferno,metal-v1`, child address `0xfff00000`, size `0x10000`, AIC parent
 `0x20`, and interrupt `0x200`. Its physical interval is
 `[0x2fff00000, 0x2fff10000)`. This does not replace the native AGX nodes.
-The `inferno,metal-v1` binding name remains unchanged; the MMIO register negotiates protocol version 3.
+The `inferno,metal-v1` binding name remains unchanged; the MMIO register negotiates protocol version 4.
 
 For freestanding ARM tests, `virt` also accepts
 `-device inferno-metal-bridge,addr=0x0b000000`. Its generated FDT supplies the
@@ -27,7 +27,7 @@ access sizes, and read/write directions fail the bus transaction.
 | Offset | Access | Meaning |
 | --- | --- | --- |
 | `0x00` | R | Magic `0x4c544d49` |
-| `0x04` | R | Protocol version, 3 |
+| `0x04` | R | Protocol version, 4 |
 | `0x08` | R | State: IDLE 0, BUSY 1, DONE 2, FAILED 3 |
 | `0x0c` | R | Error: success 0, bad descriptor 1, bad memory 2, backend 3 |
 | `0x10`, `0x14` | RW | Descriptor physical address, low/high halves |
@@ -37,12 +37,18 @@ access sizes, and read/write directions fail the bus transaction.
 | `0x2c` | RW | Interrupt enable, bit 0; reset value 0 |
 | `0x30` | W | Write bit 0 to acknowledge completion and return to IDLE |
 | `0x34` | W | Write 1 to reset; other values ignored |
+| `0x38` | R | Batch progress: bit 0 records actual host scheduling |
 
 A doorbell while BUSY or while a completion remains unacknowledged is ignored.
 An invalid doorbell value while IDLE produces a bad-descriptor completion with
 sequence 0. A descriptor that cannot be read also completes with sequence 0.
 The level interrupt is asserted while pending and enabled. Acknowledgement
 clears the pending bit; the guest must also acknowledge its interrupt controller.
+
+Scheduling progress does not complete a request, raise an interrupt, or permit
+buffer reuse. It is cleared on accepted submission, acknowledgement and reset.
+A rejected busy submission preserves the active request's progress. Generation
+checks prevent a delayed scheduled callback from publishing after reset.
 
 Before submission, make descriptor, shader and input writes visible with the
 guest architecture's DMA/MMIO barriers. Read completion, use an appropriate
@@ -58,8 +64,8 @@ All integers are little endian. Addresses are guest physical addresses.
 
 | Byte offset | Type | Meaning |
 | --- | --- | --- |
-| 0 | u32 | Version, 3 |
-| 4 | u32 | Operation: compute 1, triangle render 2, clear 3, library query 4, pipeline query 5, imageblock query 6 |
+| 0 | u32 | Version, 4 |
+| 4 | u32 | Operation: compute 1, triangle render 2, clear 3, library query 4, pipeline query 5, imageblock query 6, compute batch 7 |
 | 8 | u64 | Guest sequence identifier |
 | 16 | u64 | Shader source address |
 | 24 | u32 | Shader source byte length |
@@ -125,7 +131,7 @@ All integers are little endian; the complete output allocation is zero-filled.
 
 | Offset | Type | Meaning |
 | --- | --- | --- |
-| 0, 4 | u32 each | Protocol version 3, query opcode echo |
+| 0, 4 | u32 each | Protocol version 4, query opcode echo |
 | 8 | u64 | Sequence echo |
 | 16, 20, 24 | u32 each | Outcome, phase, flags |
 | 28, 32 | u32 each | Function count, selected function type |
@@ -188,9 +194,53 @@ Pipeline queries share the exact-source/function key with compute execution.
 The library and pipeline caches retain warning diagnostics. Reset preserves
 immutable cached objects and discards stale query output and interrupts through
 the existing generation check. No persistent host resource handle is exposed.
-Both hardware and application protocols require version 3. Older transports
+Both hardware and application protocols require version 4. Older transports
 fail at open, old descriptors fail validation, and application/kernel mismatches
 fail capability negotiation. There is no version fallback.
+
+## Compute batches
+
+Opcode 7 carries a complete batch in the descriptor's input range. Descriptor
+source and function names are empty, dimensions are 1/1/1, and options are zero.
+The batch carries its own source and entrypoint records. Its output capacity is
+exactly 16,640 bytes plus the combined buffer-image length.
+
+`include/standard-headers/inferno/metal.h` defines every wire offset. The input
+is a 64-byte header followed by pipeline, buffer, dispatch and binding records,
+then source bytes, inline bytes and complete initial buffer images. All integers
+are little endian; regions must be contiguous and reserved bytes zero.
+
+| Record or region | Size and limit |
+| --- | --- |
+| Pipeline | 80 bytes, at most 8; source range and terminated function name |
+| Buffer | 16 bytes, at most 64; byte length and default flags |
+| Dispatch | 64 bytes, at most 64; pipeline, binding range, grid and group dimensions |
+| Binding | 32 bytes, at most 1,024; kind, slot, resource/range and offset |
+| Source | At most 64 KiB per source and 8 × 64 KiB combined |
+| Inline bytes | At most 4,096 per binding and 64 KiB combined |
+| Buffer images | Combined length at most 16 MiB minus 16,640 bytes |
+
+Buffer and inline bindings share slots 0 through 30; threadgroup-memory bindings
+use a separate namespace. Full images preserve aliases and bytes outside shader
+writes. Pipelines sharing source may be grouped canonically, with dispatch IDs
+remapped without changing dispatch order. A nonempty batch requires pipelines
+and dispatches but may have no buffers. An empty batch has a
+64-byte header with version 4 and every other field zero; it still commits a
+real empty host command buffer.
+
+Validation checks all dimensions and products, actual pipeline/device limits,
+and static plus dynamic threadgroup memory before encoding. Host Metal compiles
+the real entrypoints, executes dispatches in order and returns final images.
+The scheduled flag comes from its native scheduled handler; committing a request
+does not itself establish scheduling.
+
+The fixed 16,640-byte result header includes version/opcode/sequence, typed
+outcome and phase, flags, failed-record kind/index, buffer/image counts, host
+command-buffer status, and bounded NSError domain/description with signed code.
+Complete buffer images follow. Successful results require observed scheduling
+and host status Completed. Typed failures retain diagnostics and return zeroed
+image storage. The entire response is validated before any guest shadow copy.
+This ABI is separate from the 17,168-byte compiler-query header.
 
 ## Reset and lifetime
 
@@ -206,7 +256,7 @@ driver that never completes can therefore delay shutdown. Buffers and textures
 are per-request. Each device retains up to eight compute/render pipelines,
 evicting the least recently used entry on insertion. Keys contain the opcode,
 an owned copy of the exact shader bytes, and both applicable entrypoint names.
-Protocol v3 fixes the remaining pipeline state, including BGRA8Unorm; future
+Protocol v4 fixes the remaining pipeline state, including BGRA8Unorm; future
 configurable state must extend the key. Failed compilation, function validation,
 or pipeline creation is never cached. A later encoding or execution failure
 still reports an error even when the valid pipeline is retained.
@@ -215,7 +265,8 @@ Reset preserves these immutable host pipelines while invalidating all request
 DMA and completion state as described above. The single outstanding worker
 owns cache access; teardown joins it before releasing the cache. No guest
 pointers, input/output buffers, command buffers, or render textures are cached.
-Persistent guest resources and presentation remain future work.
+The v4 provider retains guest buffer shadows across batches; host buffers remain
+per-request. Textures and native presentation remain future work.
 
 The `inferno_metal_submit`, `inferno_metal_complete`, and `inferno_metal_error`
 trace events expose accepted work and errors. A reset-invalidated request has
@@ -418,11 +469,18 @@ and may be smaller than their backing descriptor, but never larger. The adapter
 retains no user pointer, descriptor or staging allocation after the synchronous
 call, and the service makes its own DMA copy before submit returns.
 
-Capabilities advertise compute, render, clear, library, pipeline and imageblock queries
-as opcode bits 1 through 5. Status state and transport results use explicit stable wire mappings;
+Capabilities advertise compute, render, clear, library, pipeline and imageblock
+queries, and compute batches as opcode bits 1 through 7. Status state and
+transport results use explicit stable wire mappings;
 the timer error is the 32-bit `IOReturn` pattern, and completion sequence/error
 come only from the connection's session snapshot. Unknown internal enum values
 fail the call rather than encoding success.
+
+The status word at byte 28 contains batch progress bit 0, exposed only for the
+owning active session. Unknown bits fail validation. SUBMITTED status retains
+sequence zero; COMPLETED must echo the submitted sequence before its progress
+can be attributed to that command. Capability, submission and status packets
+all use version 4; older peers are rejected explicitly.
 
 The user client explicitly enables all three documented default-locking
 properties. It retains the service, shared workloop and session until `free`.
@@ -537,7 +595,8 @@ the target iOS kernel ABI or native driver loading.
 
 ## Native compilation objects and coordinator
 
-The v3 provider component is in `contrib/inferno-metal/provider/`, with the
+The compilation-object component introduced in v3 is in
+`contrib/inferno-metal/provider/`, with the
 synchronous C policy layer in `coordinator.[ch]`. It constructs ARC objects for
 `MTLLibrary`, `MTLFunction` and `MTLComputePipelineState` from validated host
 metadata. SDK builds, sanitized object tests and the recursive protocol audit
@@ -607,3 +666,92 @@ Exact source hashes, commands, results and remaining limitations are retained in
 `~/InfernoData/ios26/gpu-display-20260911/metal-native-objects-root-checks-4e2zun6d/acceptance.json`.
 The independent C/kernel fixtures are in `metal-v3-fixtures-4esdlng_/` under the
 same evidence root. Older v1/v2 fixture results above remain historical evidence.
+
+## Native buffers and command objects
+
+The v4 context also creates `InfernoMetalBuffer`, `InfernoMetalCommandQueue`,
+`InfernoMetalCommandBuffer`, and `InfernoMetalComputeCommandEncoder`. Shared
+buffers have stable, page-aligned contents and default CPU cache behavior.
+Default or tracked hazard mode is supported. No-copy, private/managed storage,
+unretained command references, textures, events and native presentation remain
+explicitly unsupported; GPU addresses, resource IDs and execution times are not
+invented.
+
+Encoding snapshots pipeline/binding state and copies inline bytes. Commit
+freezes commands. Initial shared-buffer images are captured later, at execution
+admission after preceding writeback. A serial executor chooses the earliest
+commit serial among ready queue heads. An explicitly enqueued, uncommitted head
+blocks its own queue only. Serial allocation, Committed publication and
+reservation readiness share one scheduler-locked transition. This does not
+promise a global FIFO across blocked queues.
+
+Shared resources use whole-image admission snapshots and successful writeback.
+Applications must synchronize CPU access with pending GPU work; concurrent CPU
+writes can be overwritten by the later full-image result. The provider does not
+track dirty ranges or merge unsynchronized CPU and GPU writes.
+
+Queue capacity waits are cancelable on invalidation. Stable reservation tokens
+are refunded exactly once; weak uncommitted reservations do not retain abandoned
+commands. Removing an abandoned uncommitted head schedules another scan after
+releasing the queue lock, so later committed work can proceed without another
+submission. Committed commands retain their resources until possible writeback.
+Per-command serial delivery queues run scheduled handlers before completed
+handlers on a concurrent executor. Waits include handler completion, and one
+command's callback can wait for another command without blocking its execution.
+Handlers run outside coordinator, scheduler and object locks. An unscheduled
+terminal failure releases undeliverable scheduled captures. If invalidation
+fails a command before commit, its first commit preserves that typed failure
+and delivers completion handlers added before commit; only a subsequent commit
+is a duplicate. Pending delivery batches keep waits from returning before late
+handler bodies finish.
+
+`imtl_coordinator_execute_batch` returns a fully validated reply even when it
+also carries timer or acknowledgement diagnostics. The provider maps either
+diagnostic to terminal Error and publishes no shadow bytes, preserving the
+typed result's phase, outcome, failed record, sequence and scheduling metadata.
+Transport/protocol failures return no result bytes; actual observed scheduling
+and sequence remain available separately. A logical timeout or cancellation
+never proves kernel DMA retirement. Existing compiler-query object-plus-cleanup
+diagnostic semantics remain unchanged.
+
+Build the eleven provider `.m` files with ARC and blocks, together with
+`user-client.c`, `compiler-client.c`, `batch-wire.c`, `batch-client.c` and
+`coordinator.c`; link Foundation, Metal, IOKit and CoreFoundation. The final
+source passes 40 kernel/iPhoneOS/macOS compilation and link stages. A recursive
+macOS runtime audit finds no missing required methods in the four new classes.
+Native ordering, abandonment and typed-error fixtures pass 60 assertions with
+address and undefined-behavior sanitizers. They use the real ARC objects with
+an explicit scripted coordinator boundary, not a native iOS driver connection.
+
+Retained client/compiler/coordinator and kernel-service regressions also pass
+against the current v4 source: 2,390 and 994 ASan/UBSan checks. Compatibility-only
+fixture changes omit three v3 assertions whose values are valid in v4, add the
+batch capability to the expected mask, and supply a zero-progress service mock.
+The client link includes the new batch modules; retained cases do not exercise
+batch execution. These results do not establish v4 batch coordinator/progress
+or production kernel transport coverage. Exact changes and verified results:
+`~/InfernoData/ios26/gpu-display-20260911/metal-v4-existing-regressions-8p5vic4w/root-review.json`.
+
+Real host GPU acceptance uses separate freestanding ARM fixtures under TCG and
+HVF: complete 576-byte images match independent CPU calculations after dependent
+dispatches and successive batches; reset after live scheduling preserves the
+retired output and allows fresh compute work. Empty and inline-only dispatches,
+legacy peer rejection, compute/render/clear regressions and all 14 compiler
+metadata captures also pass. Full-image transfer is deliberately bounded and
+does not establish production rendering performance.
+
+The library representation remains UTF-8 source-only, including native library
+objects, pipeline queries and batch records. Compiled `.metallib` loading and
+guest default/URL library resolution are not implemented. A separate direct
+host reference now accepts one iOS26-targeted and one macOS26-targeted kernel
+through public data/URL library APIs and executes four correct 100-byte guarded
+outputs. Actual compiler targets and artifact hashes are recorded in
+`~/InfernoData/ios26/gpu-display-20260911/metal-compiled-library-oracle-ynwcqy3q/root-verification.json`.
+This is limited host compatibility evidence; it neither generalizes to arbitrary
+iOS libraries nor proves any Inferno compiled-library execution.
+
+Current results and remaining acceptance gaps are recorded in
+`~/InfernoData/ios26/gpu-display-20260911/metal-v4-root-checks-vji9prnm/acceptance-registry.json`.
+Native iOS device discovery, driver startup, capability selection, full resource
+families, presentation and Settings virtual-display identification remain
+unverified and incomplete.

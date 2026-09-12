@@ -49,6 +49,7 @@ class InfernoMetalService : public IOService {
         /* Most recent timer-arm result; acknowledge/new submit clears it. */
         IOReturn timer_error;
         ImtlCompletion completion;
+        uint32_t progress;
     };
 
     bool start(IOService *provider) override;
@@ -134,7 +135,7 @@ class InfernoMetalService : public IOService {
     bool gate_added_ = false;
     bool timer_added_ = false;
     bool provider_recursing_ = false;
-    Status status_ = { Stopped, IMTL_OK, kIOReturnSuccess, { 0, 0 } };
+    Status status_ = { Stopped, IMTL_OK, kIOReturnSuccess, { 0, 0 }, 0 };
 
     static IOReturn gateAction(OSObject *, void *, void *, void *, void *);
     static IOReturn stopAction(OSObject *, void *, void *, void *, void *);
@@ -158,7 +159,7 @@ class InfernoMetalSession : public OSObject {
      */
     InfernoMetalService *service_ = nullptr;
     InfernoMetalService::Status status_ = {
-        InfernoMetalService::Idle, IMTL_OK, kIOReturnSuccess, { 0, 0 }
+        InfernoMetalService::Idle, IMTL_OK, kIOReturnSuccess, { 0, 0 }, 0
     };
     bool closing_ = false;
 };

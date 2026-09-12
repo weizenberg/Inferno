@@ -20,7 +20,7 @@
 
 #include "metal.h"
 
-#define INFERNO_METAL_USER_VERSION 3U
+#define INFERNO_METAL_USER_VERSION 4U
 #define INFERNO_METAL_USER_SUBMIT_HEADER_SIZE 192U
 #define INFERNO_METAL_USER_CAPABILITIES_SIZE 32U
 #define INFERNO_METAL_USER_STATUS_SIZE 32U
@@ -61,7 +61,7 @@ enum {
 
 /* Offsets within the packed submission header. All fields are uint32 except
  * sequence (uint64), and the two zero-terminated 64-byte function names.
- * Flags, options and reserved are zero in version 3. No native C struct is the
+ * Flags, options and reserved are zero in version 4. No native C struct is the
  * ABI.
  */
 enum {
@@ -84,7 +84,7 @@ enum {
 };
 
 /* Capabilities: eight uint32 fields, all little endian. Opcode mask uses
- * bit (1U << opcode). Flags are zero in version 3.
+ * bit (1U << opcode). Flags are zero in version 4.
  */
 enum {
     INFERNO_METAL_USER_CAP_VERSION_OFFSET = 0,
@@ -98,7 +98,7 @@ enum {
 };
 
 /* Status: uint32 fields except sequence (uint64). Timer error encodes the
- * 32-bit IOReturn bit pattern. Reserved is zero. Only the owning connection's
+ * 32-bit IOReturn bit pattern. Only the owning connection's
  * completion sequence/error may appear here.
  */
 enum {
@@ -108,7 +108,12 @@ enum {
     INFERNO_METAL_USER_STATUS_TIMER_OFFSET = 12,
     INFERNO_METAL_USER_STATUS_SEQUENCE_OFFSET = 16,
     INFERNO_METAL_USER_STATUS_ERROR_OFFSET = 24,
-    INFERNO_METAL_USER_STATUS_RESERVED_OFFSET = 28,
+    INFERNO_METAL_USER_STATUS_PROGRESS_OFFSET = 28,
+};
+
+enum {
+    INFERNO_METAL_USER_PROGRESS_SCHEDULED = 1U << 0,
+    INFERNO_METAL_USER_PROGRESS_MASK = INFERNO_METAL_USER_PROGRESS_SCHEDULED,
 };
 
 enum {

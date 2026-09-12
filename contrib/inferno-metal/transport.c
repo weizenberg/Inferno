@@ -171,6 +171,20 @@ ImtlResult imtl_poll(ImtlTransport *t, ImtlCompletion *completion)
     return IMTL_OK;
 }
 
+ImtlResult imtl_progress(ImtlTransport *t, uint32_t *flags)
+{
+    if (!t || !flags ||
+        (t->phase != IMTL_SUBMITTED && t->phase != IMTL_COMPLETED)) {
+        return IMTL_BAD_ARGUMENT;
+    }
+    uint32_t value = read_reg(t, INFERNO_METAL_REG_PROGRESS);
+    if (value & ~INFERNO_METAL_PROGRESS_MASK) {
+        return IMTL_BAD_DEVICE;
+    }
+    *flags = value;
+    return IMTL_OK;
+}
+
 ImtlResult imtl_ack(ImtlTransport *t)
 {
     if (!t || t->phase != IMTL_COMPLETED) {

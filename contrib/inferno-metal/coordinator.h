@@ -18,6 +18,7 @@
 #ifndef INFERNO_METAL_COORDINATOR_H
 #define INFERNO_METAL_COORDINATOR_H
 
+#include "batch-wire.h"
 #include "compiler-client.h"
 #include <stdbool.h>
 #include <stddef.h>
@@ -67,6 +68,21 @@ typedef struct ImtlQueryReply {
     uint64_t sequence;
 } ImtlQueryReply;
 
+typedef struct ImtlBatchObserver {
+    void (*scheduled)(void *opaque, uint64_t sequence);
+    void *opaque;
+} ImtlBatchObserver;
+
+typedef struct ImtlBatchReply {
+    uint8_t *bytes;
+    size_t size;
+    ImtlBatchResult result;
+    IOReturn timer_error;
+    IOReturn cleanup_io;
+    uint64_t sequence;
+    bool scheduled_observed;
+} ImtlBatchReply;
+
 typedef struct ImtlCoordinatorError {
     uint32_t kind;
     IOReturn io;
@@ -103,8 +119,20 @@ bool imtl_coordinator_query_imageblock(ImtlCoordinator *coordinator,
                                        uint32_t height, uint32_t depth,
                                        ImtlQueryReply *out,
                                        ImtlCoordinatorError *error);
+/* True publishes a completely validated reply. timer_error or cleanup_io may
+ * still be nonzero and makes provider execution fail without image writeback.
+ * On false, scheduled_observed and sequence may describe an already accepted
+ * request, but bytes remains NULL.
+ */
+bool imtl_coordinator_execute_batch(ImtlCoordinator *coordinator,
+                                    const void *manifest, size_t manifest_size,
+                                    uint32_t buffer_count, uint32_t images_size,
+                                    const ImtlBatchObserver *observer,
+                                    ImtlBatchReply *out,
+                                    ImtlCoordinatorError *error);
 
 void imtl_query_reply_free(ImtlQueryReply *reply);
+void imtl_batch_reply_free(ImtlBatchReply *reply);
 
 /* Invalidation serializes with calls and closes the owned connection once.
  * Destroy requires the external lifetime condition above and clears *ptr.

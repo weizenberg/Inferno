@@ -79,6 +79,8 @@ ImtlResult imtl_submit(ImtlTransport *t, uint64_t descriptor_gpa,
  * ownership and requires a reset drain before releasing the buffers.
  */
 ImtlResult imtl_poll(ImtlTransport *t, ImtlCompletion *completion);
+/* Reads live batch progress without changing ownership or completion state. */
+ImtlResult imtl_progress(ImtlTransport *t, uint32_t *flags);
 ImtlResult imtl_ack(ImtlTransport *t);
 ImtlResult imtl_reset(ImtlTransport *t);
 /* Close succeeds only after all work is acknowledged or reset has drained. */

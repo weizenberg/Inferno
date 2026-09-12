@@ -329,7 +329,8 @@ IOReturn InfernoMetalUserClient::dispatchMethod(MethodRequest *request)
                   (1U << INFERNO_METAL_CLEAR) |
                   (1U << INFERNO_METAL_QUERY_LIBRARY) |
                   (1U << INFERNO_METAL_QUERY_PIPELINE) |
-                  (1U << INFERNO_METAL_QUERY_IMAGEBLOCK));
+                  (1U << INFERNO_METAL_QUERY_IMAGEBLOCK) |
+                  (1U << INFERNO_METAL_BATCH));
         put32(output + INFERNO_METAL_USER_CAP_SOURCE_OFFSET,
               INFERNO_METAL_MAX_SOURCE);
         put32(output + INFERNO_METAL_USER_CAP_INPUT_OFFSET,
@@ -423,6 +424,8 @@ IOReturn InfernoMetalUserClient::dispatchMethod(MethodRequest *request)
               status.completion.sequence);
         put32(output + INFERNO_METAL_USER_STATUS_ERROR_OFFSET,
               status.completion.error);
+        put32(output + INFERNO_METAL_USER_STATUS_PROGRESS_OFFSET,
+              status.progress);
         return copyOutput(arguments, output, capacity);
     }
     case INFERNO_METAL_USER_READ: {

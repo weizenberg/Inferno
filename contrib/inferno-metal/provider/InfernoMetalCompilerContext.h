@@ -72,6 +72,19 @@ NS_ASSUME_NONNULL_BEGIN
         : (MTLComputePipelineReflection *_Nullable *_Nullable)reflection error
         : (NSError **)error;
 
+    -(nullable id<MTLBuffer>)newBufferWithLength : (NSUInteger)length options
+        : (MTLResourceOptions)options;
+    -(nullable id<MTLBuffer>)newBufferWithBytes : (const void *)pointer length
+        : (NSUInteger)length options : (MTLResourceOptions)options;
+    -(nullable id<MTLBuffer>)newBufferWithBytesNoCopy : (void *)pointer length
+        : (NSUInteger)length options : (MTLResourceOptions)options deallocator
+        : (nullable void (^)(void *pointer, NSUInteger length))deallocator;
+    -(nullable id<MTLCommandQueue>)newCommandQueue;
+    -(nullable id<MTLCommandQueue>)newCommandQueueWithMaxCommandBufferCount
+        : (NSUInteger)count;
+    -(nullable id<MTLCommandQueue>)newCommandQueueWithDescriptor
+        : (MTLCommandQueueDescriptor *)descriptor;
+
     -(void)invalidate;
 
     @end

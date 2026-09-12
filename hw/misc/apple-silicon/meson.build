@@ -23,4 +23,5 @@ system_ss.add(when: 'CONFIG_APPLE_SOC', if_true: files(
 system_ss.add(when: 'CONFIG_APPLE_SPMI_PMU', if_true: files('spmi-pmu.c'))
 system_ss.add(when: 'CONFIG_APPLE_SPMI_BASEBAND', if_true: files('spmi-baseband.c'))
 system_ss.add(when: [inferno_metal, 'CONFIG_APPLE_SOC'],
-              if_true: [files('metal-bridge.c', 'metal-backend.m'), inferno_metal])
+              if_true: [files('metal-batch.c', 'metal-bridge.c',
+                              'metal-backend.m'), inferno_metal])

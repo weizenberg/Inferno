@@ -41,6 +41,7 @@ IOReturn imtl_iokit_submit(ImtlIokitTransport *t,
                            const void *source, const void *input,
                            bool interrupt);
 ImtlResult imtl_iokit_poll(ImtlIokitTransport *t, ImtlCompletion *completion);
+ImtlResult imtl_iokit_progress(ImtlIokitTransport *t, uint32_t *flags);
 /* Copy from successful completed output only. On failure nothing is copied.
  * Use a kernel destination; an OS user client must implement its own copyout.
  */

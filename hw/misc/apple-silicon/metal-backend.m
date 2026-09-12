@@ -18,7 +18,9 @@
 #include "qemu/osdep.h"
 #include "hw/misc/apple-silicon/metal-bridge.h"
 #include "qemu/bswap.h"
+#include "qemu/thread.h"
 #include "qemu/timer.h"
+#include "metal-batch.h"
 #include "trace.h"
 
 #import <Metal/Metal.h>
@@ -255,8 +257,8 @@ static NSArray *metal_sorted_constants(NSDictionary *dictionary,
             MTLFunctionConstant *other = [result objectAtIndex:insertion];
             if ([constant index] < [other index] ||
                 ([constant index] == [other index] &&
-                 [[constant name]
-                     compare:[other name]] == NSOrderedAscending)) {
+                 [[constant name] compare:[other name]] ==
+                     NSOrderedAscending)) {
                 break;
             }
             insertion++;
@@ -524,8 +526,8 @@ bool inferno_metal_backend_query(InfernoMetalBackend *backend,
         NSArray *pipeline_key = nil;
         id<MTLComputePipelineState> pipeline = nil;
         NSError *pipeline_warning = nil;
-        NSData *library_key = [NSData dataWithBytes:source
-                                             length:c->source_size];
+        NSData *library_key =
+            [NSData dataWithBytes:source length:c->source_size];
         if (c->opcode == INFERNO_METAL_QUERY_PIPELINE ||
             c->opcode == INFERNO_METAL_QUERY_IMAGEBLOCK) {
             function_name = [NSString stringWithUTF8String:c->function];
@@ -901,8 +903,8 @@ bool inferno_metal_backend_execute(InfernoMetalBackend *backend,
                                                cached_pipeline != nil,
                                                [backend->pipeline_keys count]);
             if (!cached_pipeline) {
-                NSData *library_key = [NSData dataWithBytes:source
-                                                     length:c->source_size];
+                NSData *library_key =
+                    [NSData dataWithBytes:source length:c->source_size];
                 library = metal_library_lookup(backend, library_key,
                                                &library_warning);
                 if (!library) {
@@ -1089,5 +1091,535 @@ bool inferno_metal_backend_execute(InfernoMetalBackend *backend,
         }
         metal_phase(c, "readback", &phase_start);
         return true;
+    }
+}
+
+static void metal_batch_initialize(const InfernoMetalCommand *c,
+                                   uint8_t *output)
+{
+    memset(output, 0, c->output_size);
+    stl_le_p(output + INFERNO_METAL_BATCH_RESULT_VERSION_OFFSET,
+             INFERNO_METAL_VERSION);
+    stl_le_p(output + INFERNO_METAL_BATCH_RESULT_OPCODE_OFFSET,
+             INFERNO_METAL_BATCH);
+    stq_le_p(output + INFERNO_METAL_BATCH_RESULT_SEQUENCE_OFFSET, c->sequence);
+    stl_le_p(output + INFERNO_METAL_BATCH_RESULT_FAILED_KIND_OFFSET,
+             INFERNO_METAL_BATCH_RECORD_UNKNOWN);
+    stl_le_p(output + INFERNO_METAL_BATCH_RESULT_FAILED_INDEX_OFFSET,
+             INFERNO_METAL_BATCH_FAILED_INDEX_UNKNOWN);
+}
+
+static bool metal_batch_finish(const InfernoMetalCommand *c, uint8_t *output,
+                               uint32_t outcome, uint32_t phase,
+                               uint32_t record_kind, uint32_t record_index,
+                               NSError *error, NSString *explanation,
+                               bool scheduled)
+{
+    uint32_t flags = scheduled ? INFERNO_METAL_BATCH_FLAG_SCHEDULED : 0;
+
+    stl_le_p(output + INFERNO_METAL_BATCH_RESULT_OUTCOME_OFFSET, outcome);
+    stl_le_p(output + INFERNO_METAL_BATCH_RESULT_PHASE_OFFSET, phase);
+    stl_le_p(output + INFERNO_METAL_BATCH_RESULT_FAILED_KIND_OFFSET,
+             record_kind);
+    stl_le_p(output + INFERNO_METAL_BATCH_RESULT_FAILED_INDEX_OFFSET,
+             record_index);
+    if (error) {
+        int64_t code = (int64_t)[error code];
+        uint32_t domain_length = metal_query_string(
+            output, INFERNO_METAL_BATCH_RESULT_DOMAIN_OFFSET,
+            INFERNO_METAL_COMPILER_DOMAIN_SIZE, [error domain],
+            INFERNO_METAL_BATCH_FLAG_DOMAIN_TRUNCATED, &flags);
+        uint32_t description_length = metal_query_string(
+            output, INFERNO_METAL_BATCH_RESULT_DESCRIPTION_OFFSET,
+            INFERNO_METAL_COMPILER_DESCRIPTION_SIZE,
+            [error localizedDescription],
+            INFERNO_METAL_BATCH_FLAG_DESCRIPTION_TRUNCATED, &flags);
+
+        stq_le_p(output + INFERNO_METAL_BATCH_RESULT_ERROR_CODE_OFFSET,
+                 (uint64_t)code);
+        stl_le_p(output + INFERNO_METAL_BATCH_RESULT_DOMAIN_LENGTH_OFFSET,
+                 domain_length);
+        stl_le_p(output + INFERNO_METAL_BATCH_RESULT_DESCRIPTION_LENGTH_OFFSET,
+                 description_length);
+    } else {
+        flags |= INFERNO_METAL_BATCH_FLAG_NO_NSERROR;
+        if (explanation) {
+            uint32_t description_length = metal_query_string(
+                output, INFERNO_METAL_BATCH_RESULT_DESCRIPTION_OFFSET,
+                INFERNO_METAL_COMPILER_DESCRIPTION_SIZE, explanation,
+                INFERNO_METAL_BATCH_FLAG_DESCRIPTION_TRUNCATED, &flags);
+            stl_le_p(output +
+                         INFERNO_METAL_BATCH_RESULT_DESCRIPTION_LENGTH_OFFSET,
+                     description_length);
+        }
+    }
+    stl_le_p(output + INFERNO_METAL_BATCH_RESULT_FLAGS_OFFSET, flags);
+    trace_inferno_metal_batch_outcome(c->sequence, outcome, phase,
+                                      record_index);
+    return true;
+}
+
+static bool metal_batch_failure(const InfernoMetalCommand *c, uint8_t *output,
+                                const InfernoMetalBatchView *view,
+                                uint32_t outcome, uint32_t phase, uint32_t kind,
+                                uint32_t index, NSError *error,
+                                NSString *explanation)
+{
+    if (view) {
+        stl_le_p(output + INFERNO_METAL_BATCH_RESULT_BUFFER_COUNT_OFFSET,
+                 view->buffer_count);
+        stl_le_p(output + INFERNO_METAL_BATCH_RESULT_IMAGES_SIZE_OFFSET,
+                 view->images_size);
+    }
+    return metal_batch_finish(c, output, outcome, phase, kind, index, error,
+                              explanation, false);
+}
+
+static id<MTLComputePipelineState>
+metal_batch_pipeline(InfernoMetalBackend *backend, const InfernoMetalCommand *c,
+                     const InfernoMetalBatchView *view, uint32_t index,
+                     uint8_t *output, bool *delivered, char *message,
+                     size_t message_size)
+{
+    const uint8_t *record = inferno_metal_batch_pipeline(view, index);
+    uint32_t source_offset =
+        ldl_le_p(record + INFERNO_METAL_BATCH_PIPELINE_SOURCE_OFFSET);
+    uint32_t source_size =
+        ldl_le_p(record + INFERNO_METAL_BATCH_PIPELINE_SOURCE_SIZE_OFFSET);
+    const uint8_t *source = view->bytes + view->source_offset + source_offset;
+    NSString *name = [NSString
+        stringWithUTF8String:(const char *)record +
+                             INFERNO_METAL_BATCH_PIPELINE_NAME_OFFSET];
+    NSData *source_data = [NSData dataWithBytes:source length:source_size];
+    NSArray *key = @[ @(INFERNO_METAL_COMPUTE), source_data, name, @"" ];
+    NSError *warning = nil;
+    id<MTLComputePipelineState> pipeline =
+        metal_pipeline_lookup(backend, key, &warning);
+
+    trace_inferno_metal_pipeline_cache(c->sequence, INFERNO_METAL_BATCH,
+                                       pipeline != nil,
+                                       [backend->pipeline_keys count]);
+    if (pipeline) {
+        return pipeline;
+    }
+    NSError *library_error = nil;
+    id<MTLLibrary> library =
+        metal_library_lookup(backend, source_data, &library_error);
+    if (!library) {
+        NSString *text =
+            [[[NSString alloc] initWithBytes:source
+                                      length:source_size
+                                    encoding:NSUTF8StringEncoding] autorelease];
+        library =
+            [[backend->device newLibraryWithSource:text
+                                           options:nil
+                                             error:&library_error] autorelease];
+        if (library) {
+            metal_library_insert(backend, source_data, library, library_error);
+        }
+    }
+    if (!library) {
+        *delivered = metal_batch_failure(
+            c, output, view, INFERNO_METAL_BATCH_OUTCOME_COMPILE_FAILED,
+            INFERNO_METAL_BATCH_PHASE_LIBRARY,
+            INFERNO_METAL_BATCH_RECORD_PIPELINE, index, library_error,
+            @"Metal returned no library and no NSError");
+        return nil;
+    }
+    id<MTLFunction> function = [[library newFunctionWithName:name] autorelease];
+    if (!function) {
+        *delivered = metal_batch_failure(
+            c, output, view, INFERNO_METAL_BATCH_OUTCOME_FUNCTION_NOT_FOUND,
+            INFERNO_METAL_BATCH_PHASE_FUNCTION,
+            INFERNO_METAL_BATCH_RECORD_PIPELINE, index, nil,
+            @"library has no function with the requested name");
+        return nil;
+    }
+    uint32_t type;
+    if (!metal_function_type(&type, [function functionType])) {
+        snprintf(message, message_size, "function has unknown Metal type");
+        return nil;
+    }
+    if (type != INFERNO_METAL_FUNCTION_TYPE_KERNEL) {
+        *delivered = metal_batch_failure(
+            c, output, view, INFERNO_METAL_BATCH_OUTCOME_FUNCTION_TYPE_MISMATCH,
+            INFERNO_METAL_BATCH_PHASE_FUNCTION,
+            INFERNO_METAL_BATCH_RECORD_PIPELINE, index, nil,
+            @"requested function is not a compute kernel");
+        return nil;
+    }
+    if (metal_function_has_constants(function)) {
+        *delivered = metal_batch_failure(
+            c, output, view,
+            INFERNO_METAL_BATCH_OUTCOME_SPECIALIZATION_REQUIRED,
+            INFERNO_METAL_BATCH_PHASE_FUNCTION,
+            INFERNO_METAL_BATCH_RECORD_PIPELINE, index, nil,
+            @"compute function requires specialization");
+        return nil;
+    }
+    NSError *pipeline_error = nil;
+    pipeline = [[backend->device
+        newComputePipelineStateWithFunction:function
+                                      error:&pipeline_error] autorelease];
+    if (!pipeline) {
+        *delivered = metal_batch_failure(
+            c, output, view, INFERNO_METAL_BATCH_OUTCOME_COMPILE_FAILED,
+            INFERNO_METAL_BATCH_PHASE_PIPELINE,
+            INFERNO_METAL_BATCH_RECORD_PIPELINE, index, pipeline_error,
+            @"Metal returned no pipeline and no NSError");
+        return nil;
+    }
+    if (![pipeline maxTotalThreadsPerThreadgroup] ||
+        [pipeline maxTotalThreadsPerThreadgroup] > UINT32_MAX ||
+        ![pipeline threadExecutionWidth] ||
+        [pipeline threadExecutionWidth] > UINT32_MAX ||
+        [pipeline staticThreadgroupMemoryLength] > UINT32_MAX) {
+        snprintf(message, message_size,
+                 "compute pipeline limits are outside the v4 wire range");
+        return nil;
+    }
+    metal_pipeline_insert(backend, key, pipeline,
+                          pipeline_error ?: library_error);
+    return pipeline;
+}
+
+static bool metal_product_within(uint32_t a, uint32_t b, uint32_t d,
+                                 NSUInteger limit)
+{
+    if (!a || !b || !d || a > limit || b > limit / a) {
+        return false;
+    }
+    NSUInteger ab = (NSUInteger)a * b;
+    return d <= limit / ab;
+}
+
+@interface InfernoMetalScheduledObserver : NSObject {
+  @public
+    QemuMutex lock;
+    InfernoMetalProgressFn callback;
+    void *opaque;
+    bool armed;
+    bool scheduled;
+    dispatch_semaphore_t completed;
+}
+- (instancetype)initWithCallback:(InfernoMetalProgressFn)callback
+                          opaque:(void *)opaque;
+@end
+
+@implementation InfernoMetalScheduledObserver
+- (instancetype)initWithCallback:(InfernoMetalProgressFn)new_callback
+                          opaque:(void *)new_opaque
+{
+    self = [super init];
+    if (self) {
+        qemu_mutex_init(&lock);
+        completed = dispatch_semaphore_create(0);
+        if (!completed) {
+            [self release];
+            return nil;
+        }
+        callback = new_callback;
+        opaque = new_opaque;
+        armed = true;
+    }
+    return self;
+}
+
+- (void)dealloc
+{
+    g_assert(!armed);
+    g_assert(!callback);
+    g_assert(!opaque);
+    qemu_mutex_destroy(&lock);
+    if (completed)
+        dispatch_release(completed);
+    [super dealloc];
+}
+@end
+
+bool inferno_metal_backend_batch(InfernoMetalBackend *backend,
+                                 const InfernoMetalCommand *c,
+                                 const uint8_t *input, uint8_t *output,
+                                 InfernoMetalProgressFn progress, void *opaque,
+                                 char *message, size_t message_size)
+{
+    @autoreleasepool {
+        InfernoMetalBatchView view;
+        InfernoMetalBatchParseError parse_error;
+        metal_batch_initialize(c, output);
+        if (!inferno_metal_batch_parse(input, c->input_size, c->output_size,
+                                       &view, &parse_error)) {
+            return metal_batch_finish(
+                c, output, INFERNO_METAL_BATCH_OUTCOME_MALFORMED,
+                INFERNO_METAL_BATCH_PHASE_PARSE, parse_error.record_kind,
+                parse_error.record_index, nil, @"malformed batch manifest",
+                false);
+        }
+        if (![backend->device supportsFamily:MTLGPUFamilyApple1]) {
+            return metal_batch_failure(
+                c, output, &view, INFERNO_METAL_BATCH_OUTCOME_UNSUPPORTED_HOST,
+                INFERNO_METAL_BATCH_PHASE_VALIDATE,
+                INFERNO_METAL_BATCH_RECORD_HEADER, 0, nil,
+                @"host GPU family does not support the batch alignment policy");
+        }
+        NSMutableArray *pipelines =
+            [NSMutableArray arrayWithCapacity:view.pipeline_count];
+        for (uint32_t i = 0; i < view.pipeline_count; i++) {
+            bool delivered = false;
+            id pipeline =
+                metal_batch_pipeline(backend, c, &view, i, output, &delivered,
+                                     message, message_size);
+            if (!pipeline) {
+                return delivered;
+            }
+            [pipelines addObject:pipeline];
+        }
+        MTLSize device_max = [backend->device maxThreadsPerThreadgroup];
+        NSUInteger device_memory = [backend->device maxThreadgroupMemoryLength];
+        for (uint32_t i = 0; i < view.dispatch_count; i++) {
+            const uint8_t *d = inferno_metal_batch_dispatch(&view, i);
+            id<MTLComputePipelineState> pipeline = [pipelines
+                objectAtIndex:
+                    ldl_le_p(d + INFERNO_METAL_BATCH_DISPATCH_PIPELINE_OFFSET)];
+            uint32_t gw =
+                ldl_le_p(d + INFERNO_METAL_BATCH_DISPATCH_GROUP_WIDTH_OFFSET);
+            uint32_t gh =
+                ldl_le_p(d + INFERNO_METAL_BATCH_DISPATCH_GROUP_HEIGHT_OFFSET);
+            uint32_t gd =
+                ldl_le_p(d + INFERNO_METAL_BATCH_DISPATCH_GROUP_DEPTH_OFFSET);
+            NSUInteger maximum = [pipeline maxTotalThreadsPerThreadgroup];
+            MTLSize required = [pipeline requiredThreadsPerThreadgroup];
+            if (!metal_product_within(gw, gh, gd, maximum) ||
+                gw > device_max.width || gh > device_max.height ||
+                gd > device_max.depth ||
+                !metal_product_within(gw, gh, gd, NSUIntegerMax) ||
+                (required.width &&
+                 (gw != required.width || gh != required.height ||
+                  gd != required.depth))) {
+                return metal_batch_failure(
+                    c, output, &view,
+                    INFERNO_METAL_BATCH_OUTCOME_INVALID_DISPATCH,
+                    INFERNO_METAL_BATCH_PHASE_VALIDATE,
+                    INFERNO_METAL_BATCH_RECORD_DISPATCH, i, nil,
+                    @"threadgroup dimensions exceed pipeline or device limits");
+            }
+            uint64_t memory = [pipeline staticThreadgroupMemoryLength];
+            if (memory > device_memory) {
+                return metal_batch_failure(
+                    c, output, &view,
+                    INFERNO_METAL_BATCH_OUTCOME_INVALID_DISPATCH,
+                    INFERNO_METAL_BATCH_PHASE_VALIDATE,
+                    INFERNO_METAL_BATCH_RECORD_DISPATCH, i, nil,
+                    @"static threadgroup memory exceeds the device limit");
+            }
+            uint32_t start =
+                ldl_le_p(d + INFERNO_METAL_BATCH_DISPATCH_BINDING_START_OFFSET);
+            uint32_t count =
+                ldl_le_p(d + INFERNO_METAL_BATCH_DISPATCH_BINDING_COUNT_OFFSET);
+            for (uint32_t j = 0; j < count; j++) {
+                const uint8_t *b =
+                    inferno_metal_batch_binding(&view, start + j);
+                if (ldl_le_p(b + INFERNO_METAL_BATCH_BINDING_KIND_OFFSET) ==
+                    INFERNO_METAL_BATCH_BINDING_THREADGROUP) {
+                    memory +=
+                        ldl_le_p(b + INFERNO_METAL_BATCH_BINDING_LENGTH_OFFSET);
+                    if (memory > device_memory) {
+                        return metal_batch_failure(
+                            c, output, &view,
+                            INFERNO_METAL_BATCH_OUTCOME_INVALID_DISPATCH,
+                            INFERNO_METAL_BATCH_PHASE_VALIDATE,
+                            INFERNO_METAL_BATCH_RECORD_BINDING, start + j, nil,
+                            @"threadgroup memory exceeds the device limit");
+                    }
+                }
+            }
+        }
+
+        NSMutableArray *buffers =
+            [NSMutableArray arrayWithCapacity:view.buffer_count];
+        size_t image_cursor = 0;
+        for (uint32_t i = 0; i < view.buffer_count; i++) {
+            const uint8_t *record = inferno_metal_batch_buffer(&view, i);
+            uint32_t length =
+                ldl_le_p(record + INFERNO_METAL_BATCH_BUFFER_LENGTH_OFFSET);
+            id<MTLBuffer> buffer = [[backend->device
+                newBufferWithBytes:input + view.images_offset + image_cursor
+                            length:length
+                           options:MTLResourceStorageModeShared |
+                                   MTLResourceHazardTrackingModeTracked]
+                autorelease];
+            if (!buffer) {
+                return metal_error(message, message_size, "batch buffer", nil);
+            }
+            [buffers addObject:buffer];
+            image_cursor += length;
+        }
+        MTLCommandBufferDescriptor *descriptor =
+            [[[MTLCommandBufferDescriptor alloc] init] autorelease];
+        descriptor.errorOptions =
+            MTLCommandBufferErrorOptionEncoderExecutionStatus;
+        id<MTLCommandBuffer> command_buffer =
+            [backend->queue commandBufferWithDescriptor:descriptor];
+        if (!command_buffer) {
+            return metal_error(message, message_size, "batch command buffer",
+                               nil);
+        }
+        for (uint32_t i = 0; i < view.dispatch_count; i++) {
+            const uint8_t *d = inferno_metal_batch_dispatch(&view, i);
+            id<MTLComputeCommandEncoder> encoder = [command_buffer
+                computeCommandEncoderWithDispatchType:MTLDispatchTypeSerial];
+            if (!encoder) {
+                return metal_error(message, message_size,
+                                   "batch compute encoder", nil);
+            }
+            encoder.label =
+                [NSString stringWithFormat:@"Inferno dispatch %u", i];
+            uint32_t pipeline_id =
+                ldl_le_p(d + INFERNO_METAL_BATCH_DISPATCH_PIPELINE_OFFSET);
+            [encoder
+                setComputePipelineState:[pipelines objectAtIndex:pipeline_id]];
+            uint32_t start =
+                ldl_le_p(d + INFERNO_METAL_BATCH_DISPATCH_BINDING_START_OFFSET);
+            uint32_t count =
+                ldl_le_p(d + INFERNO_METAL_BATCH_DISPATCH_BINDING_COUNT_OFFSET);
+            for (uint32_t j = 0; j < count; j++) {
+                const uint8_t *b =
+                    inferno_metal_batch_binding(&view, start + j);
+                uint32_t kind =
+                    ldl_le_p(b + INFERNO_METAL_BATCH_BINDING_KIND_OFFSET);
+                uint32_t index =
+                    ldl_le_p(b + INFERNO_METAL_BATCH_BINDING_INDEX_OFFSET);
+                uint32_t resource =
+                    ldl_le_p(b + INFERNO_METAL_BATCH_BINDING_RESOURCE_OFFSET);
+                uint32_t length =
+                    ldl_le_p(b + INFERNO_METAL_BATCH_BINDING_LENGTH_OFFSET);
+                uint64_t binding_offset =
+                    ldq_le_p(b + INFERNO_METAL_BATCH_BINDING_OFFSET_OFFSET);
+                if (kind == INFERNO_METAL_BATCH_BINDING_BUFFER) {
+                    [encoder setBuffer:[buffers objectAtIndex:resource]
+                                offset:(NSUInteger)binding_offset
+                               atIndex:index];
+                } else if (kind == INFERNO_METAL_BATCH_BINDING_INLINE) {
+                    [encoder setBytes:input + view.inline_offset + resource
+                               length:length
+                              atIndex:index];
+                } else {
+                    [encoder setThreadgroupMemoryLength:length atIndex:index];
+                }
+            }
+            MTLSize grid = MTLSizeMake(
+                ldl_le_p(d + INFERNO_METAL_BATCH_DISPATCH_GRID_WIDTH_OFFSET),
+                ldl_le_p(d + INFERNO_METAL_BATCH_DISPATCH_GRID_HEIGHT_OFFSET),
+                ldl_le_p(d + INFERNO_METAL_BATCH_DISPATCH_GRID_DEPTH_OFFSET));
+            MTLSize group = MTLSizeMake(
+                ldl_le_p(d + INFERNO_METAL_BATCH_DISPATCH_GROUP_WIDTH_OFFSET),
+                ldl_le_p(d + INFERNO_METAL_BATCH_DISPATCH_GROUP_HEIGHT_OFFSET),
+                ldl_le_p(d + INFERNO_METAL_BATCH_DISPATCH_GROUP_DEPTH_OFFSET));
+            if (ldl_le_p(d + INFERNO_METAL_BATCH_DISPATCH_MODE_OFFSET) ==
+                INFERNO_METAL_BATCH_DISPATCH_THREADS) {
+                [encoder dispatchThreads:grid threadsPerThreadgroup:group];
+            } else {
+                [encoder dispatchThreadgroups:grid threadsPerThreadgroup:group];
+            }
+            [encoder endEncoding];
+        }
+
+        InfernoMetalScheduledObserver *observer =
+            [[InfernoMetalScheduledObserver alloc] initWithCallback:progress
+                                                             opaque:opaque];
+        if (!observer) {
+            return metal_error(message, message_size, "batch observer", nil);
+        }
+        [command_buffer addScheduledHandler:^(id<MTLCommandBuffer> ignored) {
+          (void)ignored;
+          qemu_mutex_lock(&observer->lock);
+          if (observer->armed) {
+              observer->scheduled = true;
+              if (observer->callback) {
+                  observer->callback(observer->opaque,
+                                     INFERNO_METAL_PROGRESS_SCHEDULED);
+              }
+          }
+          qemu_mutex_unlock(&observer->lock);
+        }];
+        [command_buffer addCompletedHandler:^(id<MTLCommandBuffer> ignored) {
+          (void)ignored;
+          dispatch_semaphore_signal(observer->completed);
+        }];
+        [command_buffer commit];
+        [command_buffer waitUntilCompleted];
+        dispatch_semaphore_wait(observer->completed, DISPATCH_TIME_FOREVER);
+        qemu_mutex_lock(&observer->lock);
+        bool scheduled = observer->scheduled;
+        observer->armed = false;
+        observer->callback = NULL;
+        observer->opaque = NULL;
+        qemu_mutex_unlock(&observer->lock);
+        [observer release];
+
+        MTLCommandBufferStatus status = command_buffer.status;
+        stl_le_p(output + INFERNO_METAL_BATCH_RESULT_BUFFER_COUNT_OFFSET,
+                 view.buffer_count);
+        stl_le_p(output + INFERNO_METAL_BATCH_RESULT_IMAGES_SIZE_OFFSET,
+                 view.images_size);
+        stl_le_p(output + INFERNO_METAL_BATCH_RESULT_HOST_STATUS_OFFSET,
+                 status);
+        if (status != MTLCommandBufferStatusCompleted) {
+            uint32_t failed_index = INFERNO_METAL_BATCH_FAILED_INDEX_UNKNOWN;
+            NSArray *infos = [command_buffer.error.userInfo
+                objectForKey:MTLCommandBufferEncoderInfoErrorKey];
+            for (unsigned pass = 0;
+                 pass < 2 &&
+                 failed_index == INFERNO_METAL_BATCH_FAILED_INDEX_UNKNOWN;
+                 pass++) {
+                MTLCommandEncoderErrorState wanted =
+                    pass ? MTLCommandEncoderErrorStateAffected :
+                           MTLCommandEncoderErrorStateFaulted;
+                for (id info in infos) {
+                    if ([info errorState] != wanted) {
+                        continue;
+                    }
+                    NSString *label = [info label];
+                    if ([label hasPrefix:@"Inferno dispatch "]) {
+                        unsigned long value =
+                            strtoul([[label substringFromIndex:17] UTF8String],
+                                    NULL, 10);
+                        if (value < view.dispatch_count) {
+                            failed_index = (uint32_t)value;
+                        }
+                    }
+                    break;
+                }
+            }
+            return metal_batch_finish(
+                c, output, INFERNO_METAL_BATCH_OUTCOME_EXECUTION_FAILED,
+                INFERNO_METAL_BATCH_PHASE_EXECUTE,
+                failed_index == INFERNO_METAL_BATCH_FAILED_INDEX_UNKNOWN ?
+                    INFERNO_METAL_BATCH_RECORD_UNKNOWN :
+                    INFERNO_METAL_BATCH_RECORD_DISPATCH,
+                failed_index, command_buffer.error,
+                @"Metal execution failed without an NSError", scheduled);
+        }
+        if (!scheduled) {
+            return metal_error(message, message_size,
+                               "batch completed without scheduled observation",
+                               nil);
+        }
+        image_cursor = 0;
+        for (uint32_t i = 0; i < view.buffer_count; i++) {
+            id<MTLBuffer> buffer = [buffers objectAtIndex:i];
+            uint32_t length =
+                ldl_le_p(inferno_metal_batch_buffer(&view, i) +
+                         INFERNO_METAL_BATCH_BUFFER_LENGTH_OFFSET);
+            memcpy(output + INFERNO_METAL_BATCH_RESULT_IMAGES_OFFSET +
+                       image_cursor,
+                   [buffer contents], length);
+            image_cursor += length;
+        }
+        return metal_batch_finish(c, output, INFERNO_METAL_BATCH_OUTCOME_OK,
+                                  INFERNO_METAL_BATCH_PHASE_EXECUTE,
+                                  INFERNO_METAL_BATCH_RECORD_UNKNOWN,
+                                  INFERNO_METAL_BATCH_FAILED_INDEX_UNKNOWN, nil,
+                                  nil, true);
     }
 }
