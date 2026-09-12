@@ -20,7 +20,7 @@
 
 #include "metal.h"
 
-#define INFERNO_METAL_USER_VERSION 2U
+#define INFERNO_METAL_USER_VERSION 3U
 #define INFERNO_METAL_USER_SUBMIT_HEADER_SIZE 192U
 #define INFERNO_METAL_USER_CAPABILITIES_SIZE 32U
 #define INFERNO_METAL_USER_STATUS_SIZE 32U
@@ -61,7 +61,7 @@ enum {
 
 /* Offsets within the packed submission header. All fields are uint32 except
  * sequence (uint64), and the two zero-terminated 64-byte function names.
- * Flags, options and reserved are zero in version 2. No native C struct is the
+ * Flags, options and reserved are zero in version 3. No native C struct is the
  * ABI.
  */
 enum {
@@ -84,7 +84,7 @@ enum {
 };
 
 /* Capabilities: eight uint32 fields, all little endian. Opcode mask uses
- * bit (1U << opcode). Flags are zero in version 2.
+ * bit (1U << opcode). Flags are zero in version 3.
  */
 enum {
     INFERNO_METAL_USER_CAP_VERSION_OFFSET = 0,

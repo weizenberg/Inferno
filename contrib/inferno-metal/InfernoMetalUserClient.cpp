@@ -328,7 +328,8 @@ IOReturn InfernoMetalUserClient::dispatchMethod(MethodRequest *request)
               (1U << INFERNO_METAL_COMPUTE) | (1U << INFERNO_METAL_RENDER) |
                   (1U << INFERNO_METAL_CLEAR) |
                   (1U << INFERNO_METAL_QUERY_LIBRARY) |
-                  (1U << INFERNO_METAL_QUERY_PIPELINE));
+                  (1U << INFERNO_METAL_QUERY_PIPELINE) |
+                  (1U << INFERNO_METAL_QUERY_IMAGEBLOCK));
         put32(output + INFERNO_METAL_USER_CAP_SOURCE_OFFSET,
               INFERNO_METAL_MAX_SOURCE);
         put32(output + INFERNO_METAL_USER_CAP_INPUT_OFFSET,

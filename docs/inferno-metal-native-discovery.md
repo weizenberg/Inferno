@@ -57,10 +57,10 @@ cleans up that state; a subclass must not free those base allocations again.
 The inherited `initWorkarounds` is a no-op. Limits and feature initialization
 depend on `featureProfile`. The actual `initLimits` entry calls that selector
 and immediately compares its 64-bit return against small integer constants;
-it is a scalar profile selector, not an Objective-C object. Its canonical type,
-valid values and truthful mapping for the bridge remain unresolved. The family
-initializer passes it to a helper before replacing a 24-byte region of base
-state; that helper still needs verification.
+it is a scalar profile selector, not an Objective-C object. Its recovered type is a 64-bit unsigned scalar; valid values and a truthful
+mapping for the bridge remain unresolved. The family initializer passes it to a
+helper that builds dynamically allocated family storage before replacing a
+24-byte region of base state.
 
 Installed SDK headers provide no declaration of this private profile. Public
 `MTLGPUFamily` and `MTLFeatureSet` values describe different capability
@@ -80,8 +80,8 @@ that Inferno already implements argument buffers.
 The feature-query path uses a class cluster. Allocation of
 `MTLDeviceFeatureQueries` selects the concrete `_MTLDeviceFeatureQueries`, then
 calls `initWithDevice:` and stores the result. The concrete `validate` method is
-a no-op on this build. The concrete initializer's required device queries still
-need verification. The base initializer returns nil; normal allocation selects
+a no-op on this build. The concrete initializer's 231 device queries are now
+identified; their inheritance and valid capability answers still need review. The base initializer returns nil; normal allocation selects
 the concrete subclass before initialization.
 
 An empty family array makes the inherited family-membership query return false;
@@ -103,33 +103,28 @@ The remaining dependencies are the concrete accelerator subclass and link
 bindings, final service packaging, `_MTLDevice` capability initialization, and
 a provider that owns real Metal resource and command objects.
 Library and pipeline creation must compile and return errors synchronously.
-The implemented v2 compiler-query path now supplies bounded function inventories,
-actual compute limits and structured compiler errors before execution. Its
-application helpers and ARM transport are verified; the native provider still
-needs to call those helpers and construct the corresponding Metal objects.
-The public native objects need more information than the current compiler
-queries return. `MTLFunction` exposes function constants, patch information,
-attributes and options. `MTLComputePipelineState` also exposes allocation size,
-imageblock sizing, resource identifiers, shader validation and required
-threadgroup dimensions. These values must come from host metadata or a verified
-implementation contract. A successful three-field pipeline query does not prove
-that every required native object getter can return a correct value. Exporting a
-host resource identifier also requires an ownership policy that survives cache
-eviction; the current source-key cache supplies no persistent guest handle.
+The implemented v3 compiler-query path supplies complete bounded function
+metadata, library type and nullable install name, pipeline limits/allocation,
+imageblock sizing and structured compiler errors before execution. A serialized
+C coordinator and ARC library/function/compute-pipeline objects now consume those
+validated replies. SDK builds, sanitized fixtures and freestanding TCG/HVF tests
+pass; native device integration is still missing.
 
 A direct macOS 26.5 public-API probe on the host observed executable libraries
 with `installName == "default.metallib"`, ordinary kernels with
 `patchControlPointCount == -1`, nullable attribute arrays, and attributed vertex
 functions with concrete vertex and stage-input records. Function constants
 reported their real names, types, indices and required flags. These are measured
-examples, not defaults for arbitrary shaders. The planned v3 metadata extension
-will serialize the host values, including library type and nullable install name.
+examples, not defaults for arbitrary shaders. The v3 metadata extension
+serializes the host values. All 14 captured guest replies passed the production
+decoder and the native host metadata comparison.
 
-Fable's native-object plan has been reviewed and assigned to Sol. It adds a
-serialized compiler coordinator and ARC library/function/compute-pipeline
-objects. Unsupported resource-dependent selectors remain explicit. Host metadata
-and SDK checks do not establish that these objects initialize on the iOS runtime;
-native admission and device initialization remain separate prerequisites.
+Sol implemented the native-object component from the reviewed Fable plan.
+Unsupported resource-dependent selectors remain explicit. Exporting a host GPU
+resource identifier requires an ownership policy that survives cache eviction;
+the current source-key cache supplies no persistent guest handle. SDK and
+macOS object tests do not establish that these objects initialize on the iOS
+runtime; native driver startup and device initialization remain prerequisites.
 
 The final registration block also needs instruction-level verification; its
 current decompilation is insufficient to settle optional wrapping behavior.
@@ -181,3 +176,27 @@ are in `metal-argument-buffer-source-CF5M1n7A/findings.md` and
 `metal-compiler-api-source-Zmm1FCHK/findings.md` under that evidence root.
 These target-specific observations are not a stable public plugin API or
 proof of compatibility with another iOS release.
+
+
+## Concrete feature-query initializer
+
+The concrete `_MTLDeviceFeatureQueries` initializer calls `featureProfile` and
+231 distinct capability selectors on the supplied device. Full-cache selector
+resolution closed the gap left by the extracted Metal image, which does not
+include the shared selector strings. The coordinator checked all 231 call targets
+against the saved BL instruction bytes and sampled the resolved strings from
+the full cache. Only 12 of those selectors appear in the public iPhoneOS 26.5
+Metal headers. Their declarations do not establish private base behavior.
+
+The initializer stores its device argument using a runtime-loaded ivar offset
+whose cache value is 5792. A plain store does not establish retained ownership.
+It also creates capability descriptions with constant names/tags and dynamic
+query results. Descriptor-to-query pairing currently relies on decompiler
+dataflow; tag meanings and a valid Inferno capability profile remain unresolved.
+The next check maps the initialization-time queries to inherited `_MTLDevice`
+implementations and identifies which require concrete provider overrides.
+
+This investigation ran through the authorized DeepSeek Flash retry, followed by
+the user's selected Kimi K3 fallback for the missing full-cache selector data.
+No native driver-loading operation was retried. Evidence is retained under
+`kimi-feature-query-selectors-gq3rxr09/`, including `root-verification.json`.

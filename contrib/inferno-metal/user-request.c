@@ -67,8 +67,8 @@ bool imtl_user_decode(const void *packet, size_t size, ImtlUserRequest *result)
     r.command.depth = get32(p + INFERNO_METAL_USER_DEPTH_OFFSET);
     r.command.options = get32(p + INFERNO_METAL_USER_OPTIONS_OFFSET);
     if (r.command.opcode < INFERNO_METAL_COMPUTE ||
-        r.command.opcode > INFERNO_METAL_QUERY_PIPELINE || r.command.options ||
-        r.command.source_size > INFERNO_METAL_MAX_SOURCE ||
+        r.command.opcode > INFERNO_METAL_QUERY_IMAGEBLOCK ||
+        r.command.options || r.command.source_size > INFERNO_METAL_MAX_SOURCE ||
         r.command.input_size > INFERNO_METAL_MAX_BUFFER ||
         !r.command.output_size ||
         r.command.output_size > INFERNO_METAL_MAX_BUFFER) {
@@ -93,12 +93,18 @@ bool imtl_user_decode(const void *packet, size_t size, ImtlUserRequest *result)
     }
     if (r.command.opcode >= INFERNO_METAL_QUERY_LIBRARY) {
         bool library = r.command.opcode == INFERNO_METAL_QUERY_LIBRARY;
+        bool imageblock = r.command.opcode == INFERNO_METAL_QUERY_IMAGEBLOCK;
 
         if (!r.command.source_size || r.command.input_size ||
-            r.command.width != 1 || r.command.height != 1 ||
-            r.command.depth != 1 ||
+            (!imageblock && (r.command.width != 1 || r.command.height != 1 ||
+                             r.command.depth != 1)) ||
+            (imageblock && (!r.command.width || r.command.width > 65536 ||
+                            !r.command.height || r.command.height > 65536 ||
+                            !r.command.depth || r.command.depth > 65536)) ||
             r.command.output_size < INFERNO_METAL_COMPILER_MIN_OUTPUT ||
             r.command.output_size > INFERNO_METAL_COMPILER_MAX_OUTPUT ||
+            (!library &&
+             r.command.output_size != INFERNO_METAL_COMPILER_MIN_OUTPUT) ||
             !allZero((const uint8_t *)r.command.fragment,
                      sizeof(r.command.fragment)) ||
             (library ? !allZero((const uint8_t *)r.command.function,

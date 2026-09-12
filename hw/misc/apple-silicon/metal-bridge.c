@@ -196,13 +196,20 @@ static bool metal_decode_command(const uint8_t *raw, InfernoMetalCommand *c)
         return false;
     }
     if (c->opcode >= INFERNO_METAL_QUERY_LIBRARY &&
-        c->opcode <= INFERNO_METAL_QUERY_PIPELINE) {
+        c->opcode <= INFERNO_METAL_QUERY_IMAGEBLOCK) {
         bool library = c->opcode == INFERNO_METAL_QUERY_LIBRARY;
+        bool imageblock = c->opcode == INFERNO_METAL_QUERY_IMAGEBLOCK;
 
         if (!c->source_size || c->source_size > INFERNO_METAL_MAX_SOURCE ||
-            c->input_size || c->width != 1 || c->height != 1 || c->depth != 1 ||
+            c->input_size ||
+            (!imageblock &&
+             (c->width != 1 || c->height != 1 || c->depth != 1)) ||
+            (imageblock &&
+             (!c->width || c->width > 65536 || !c->height ||
+              c->height > 65536 || !c->depth || c->depth > 65536)) ||
             c->output_size < INFERNO_METAL_COMPILER_MIN_OUTPUT ||
-            c->output_size > INFERNO_METAL_COMPILER_MAX_OUTPUT) {
+            c->output_size > INFERNO_METAL_COMPILER_MAX_OUTPUT ||
+            (!library && c->output_size != INFERNO_METAL_COMPILER_MIN_OUTPUT)) {
             return false;
         }
         for (unsigned i = 0; i < sizeof(c->fragment); i++) {

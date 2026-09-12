@@ -91,7 +91,8 @@ static uint32_t knownOpcodeMask(void)
 {
     return (1U << INFERNO_METAL_COMPUTE) | (1U << INFERNO_METAL_RENDER) |
            (1U << INFERNO_METAL_CLEAR) | (1U << INFERNO_METAL_QUERY_LIBRARY) |
-           (1U << INFERNO_METAL_QUERY_PIPELINE);
+           (1U << INFERNO_METAL_QUERY_PIPELINE) |
+           (1U << INFERNO_METAL_QUERY_IMAGEBLOCK);
 }
 
 static IOReturn fetchCaps(io_connect_t connection, ImtlUserCaps *out)
@@ -119,7 +120,8 @@ static IOReturn fetchCaps(io_connect_t connection, ImtlUserCaps *out)
     };
     uint32_t known_opcodes = knownOpcodeMask();
     uint32_t query_opcodes = (1U << INFERNO_METAL_QUERY_LIBRARY) |
-                             (1U << INFERNO_METAL_QUERY_PIPELINE);
+                             (1U << INFERNO_METAL_QUERY_PIPELINE) |
+                             (1U << INFERNO_METAL_QUERY_IMAGEBLOCK);
     if (caps.version != INFERNO_METAL_USER_VERSION ||
         get32(reply + INFERNO_METAL_USER_CAP_SIZE_OFFSET) != sizeof(reply) ||
         !caps.opcode_mask || (caps.opcode_mask & ~known_opcodes) ||
@@ -249,7 +251,7 @@ IOReturn imtl_user_client_submit(ImtlUserClient *client,
         return kIOReturnBadArgument;
     }
     if (request->opcode < INFERNO_METAL_COMPUTE ||
-        request->opcode > INFERNO_METAL_QUERY_PIPELINE || request->options) {
+        request->opcode > INFERNO_METAL_QUERY_IMAGEBLOCK || request->options) {
         return kIOReturnBadArgument;
     }
     if (!(client->caps.opcode_mask & (1U << request->opcode)) ||
@@ -272,12 +274,18 @@ IOReturn imtl_user_client_submit(ImtlUserClient *client,
     }
     if (request->opcode >= INFERNO_METAL_QUERY_LIBRARY) {
         bool library = request->opcode == INFERNO_METAL_QUERY_LIBRARY;
+        bool imageblock = request->opcode == INFERNO_METAL_QUERY_IMAGEBLOCK;
 
         if (!request->source_size || request->input_size ||
-            request->width != 1 || request->height != 1 ||
-            request->depth != 1 ||
+            (!imageblock && (request->width != 1 || request->height != 1 ||
+                             request->depth != 1)) ||
+            (imageblock && (!request->width || request->width > 65536 ||
+                            !request->height || request->height > 65536 ||
+                            !request->depth || request->depth > 65536)) ||
             request->output_size < INFERNO_METAL_COMPILER_MIN_OUTPUT ||
             request->output_size > INFERNO_METAL_COMPILER_MAX_OUTPUT ||
+            (!library &&
+             request->output_size != INFERNO_METAL_COMPILER_MIN_OUTPUT) ||
             !allZero(request->fragment, sizeof(request->fragment)) ||
             (library ? !allZero(request->function, sizeof(request->function)) :
                        !request->function[0]) ||

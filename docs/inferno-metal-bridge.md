@@ -1,4 +1,4 @@
-# Inferno Metal bridge, protocol version 2
+# Inferno Metal bridge, protocol version 3
 
 This experimental device executes bounded guest requests on the host Metal GPU.
 It is available in Darwin builds with the Metal framework and is disabled by
@@ -11,7 +11,7 @@ The Apple DeviceTree node `arm-io/inferno-metal` has compatible
 `inferno,metal-v1`, child address `0xfff00000`, size `0x10000`, AIC parent
 `0x20`, and interrupt `0x200`. Its physical interval is
 `[0x2fff00000, 0x2fff10000)`. This does not replace the native AGX nodes.
-The `inferno,metal-v1` binding name remains unchanged; the MMIO register negotiates protocol version 2.
+The `inferno,metal-v1` binding name remains unchanged; the MMIO register negotiates protocol version 3.
 
 For freestanding ARM tests, `virt` also accepts
 `-device inferno-metal-bridge,addr=0x0b000000`. Its generated FDT supplies the
@@ -27,7 +27,7 @@ access sizes, and read/write directions fail the bus transaction.
 | Offset | Access | Meaning |
 | --- | --- | --- |
 | `0x00` | R | Magic `0x4c544d49` |
-| `0x04` | R | Protocol version, 2 |
+| `0x04` | R | Protocol version, 3 |
 | `0x08` | R | State: IDLE 0, BUSY 1, DONE 2, FAILED 3 |
 | `0x0c` | R | Error: success 0, bad descriptor 1, bad memory 2, backend 3 |
 | `0x10`, `0x14` | RW | Descriptor physical address, low/high halves |
@@ -58,8 +58,8 @@ All integers are little endian. Addresses are guest physical addresses.
 
 | Byte offset | Type | Meaning |
 | --- | --- | --- |
-| 0 | u32 | Version, 2 |
-| 4 | u32 | Operation: compute 1, triangle render 2, clear 3, library query 4, pipeline query 5 |
+| 0 | u32 | Version, 3 |
+| 4 | u32 | Operation: compute 1, triangle render 2, clear 3, library query 4, pipeline query 5, imageblock query 6 |
 | 8 | u64 | Guest sequence identifier |
 | 16 | u64 | Shader source address |
 | 24 | u32 | Shader source byte length |
@@ -105,70 +105,92 @@ translation invalidation.
 
 ## Compiler queries
 
-Library query (4) and compute-pipeline query (5) compile exact UTF-8 source with
-Metal's default options. They use the existing asynchronous transport slot but
-never create or commit a GPU command buffer. Both require 1..65536 source bytes,
-zero input bytes, dimensions 1/1/1, empty fragment name, and zero options. Library
-query requires an empty function name; pipeline query requires a kernel name of
-at most 63 UTF-8 bytes. Output capacity is 16592..278736 bytes.
+Library query (4), compute-pipeline query (5), and imageblock-size query (6)
+compile exact UTF-8 source with Metal's default options. They use the existing
+asynchronous transport slot without creating or committing a GPU command buffer.
+All require 1..65536 source bytes, zero input bytes, empty fragment name, and
+zero options. Library query requires an empty function name; pipeline and
+imageblock queries require a kernel name of at most 63 UTF-8 bytes. Library and
+pipeline dimensions are 1/1/1. Imageblock dimensions are independently 1..65536.
+
+Library output capacity is 17168..1368848 bytes. Pipeline and imageblock outputs
+are exactly 17168 bytes. Capacity is a byte count, including fixed metadata and
+all variable records; it is not a function count.
 
 A compiler rejection is a successfully delivered result: device state DONE,
 error zero, with a non-success outcome in the output envelope. A transport or
 backend fault still fails without output writeback. Consumers must check both
 transport completion and the typed outcome before creating a native object.
-
-All envelope integers are little endian; the complete output allocation is
-zero-filled before fields are written.
+All integers are little endian; the complete output allocation is zero-filled.
 
 | Offset | Type | Meaning |
 | --- | --- | --- |
-| 0, 4 | u32 each | Protocol version 2, query opcode echo |
+| 0, 4 | u32 each | Protocol version 3, query opcode echo |
 | 8 | u64 | Sequence echo |
 | 16, 20, 24 | u32 each | Outcome, phase, flags |
 | 28, 32 | u32 each | Function count, selected function type |
 | 36, 40, 44 | u32 each | Maximum threads, execution width, static threadgroup bytes |
-| 48 | byte[16] | Reserved, zero |
+| 48, 52 | u32 each | Required output size on capacity failure, metadata sub-record count |
+| 56 | byte[8] | Reserved, zero |
 | 64 | i64 | Signed NSError code |
 | 72, 76 | u32 each | Error domain and description lengths in bytes |
 | 80 | byte[128] | UTF-8 error domain, terminated and zero-padded |
 | 208 | byte[16384] | UTF-8 description, terminated and zero-padded |
-| 16592 | records | Complete function inventory, if successful library query |
+| 16592 | byte[64] | Pipeline metadata on successful pipeline/imageblock query |
+| 16656 | byte[512] | Library metadata on successful library query |
+| 17168 | variable records | Complete function inventory on successful library query |
 
-Each 256-byte function record contains a u32 type, u32 name length, and 248-byte
-UTF-8 name field. Names are nonempty, at most 247 bytes, terminated and padded
-with zeroes. At most 1024 records are supported. Function type values are vertex
-1, fragment 2, kernel 3, visible 5, intersection 6, mesh 7 and object 8.
+Pipeline metadata carries u64 allocation size and three u64 required threadgroup
+dimensions, i64 shader-validation value, u64 imageblock byte length, and a u32
+flag for indirect-command-buffer support. The last 12 bytes are reserved zero.
+Imageblock length is populated only for opcode 6. These are actual host values;
+no persistent GPU resource identifier is transported.
+
+Library metadata carries u32 library type, u32 presence flags, u32 install-name
+length, four reserved zero bytes, and a 496-byte terminated UTF-8 install-name
+field. Bit 0 distinguishes a present install name from nil; an empty present
+string is valid. Type and install name come from the host library.
+
+Each function record has a 296-byte header followed by 128-byte metadata
+sub-records. The header carries function type/name, patch type, signed 64-bit
+patch control-point count, 64-bit options, attribute-presence flags, constant and
+attribute counts, and the complete record size. Its 248-byte name field holds at
+most 247 UTF-8 bytes. Nil attribute arrays remain distinct from empty arrays.
+Sub-records carry kind, data type, 64-bit index, flags and a 104-byte name field
+(maximum 103 UTF-8 bytes). Constants precede vertex attributes, then stage-input
+attributes. Constant flags identify required values; attribute flags identify
+active, patch-data and patch-control-point-data values. The portable header
+defines every field offset. Limits are 1024 functions and 8192 sub-records.
 
 Outcomes are OK 0, COMPILE_FAILED 1, FUNCTION_NOT_FOUND 2,
-FUNCTION_TYPE_MISMATCH 3, INVENTORY_UNSUPPORTED 4 and OUTPUT_TOO_SMALL 5.
-Phases are NONE 0, LIBRARY 1, INVENTORY 2, FUNCTION 3 and PIPELINE 4.
-Flags mark truncated description (bit 0), truncated domain (bit 1), absent
-NSError (bit 2), and a nonfatal warning accompanying success (bit 3).
+FUNCTION_TYPE_MISMATCH 3, INVENTORY_UNSUPPORTED 4, OUTPUT_TOO_SMALL 5 and
+SPECIALIZATION_REQUIRED 6. Phases are NONE 0, LIBRARY 1, INVENTORY 2, FUNCTION 3
+and PIPELINE 4. Flags mark truncated description (bit 0), truncated domain
+(bit 1), absent NSError (bit 2), and a warning accompanying success (bit 3).
 Diagnostic truncation preserves UTF-8 boundaries. Bridge explanations do not
 invent Apple error codes.
 
-An inventory is complete or absent. Unsupported count, name, duplicate or type
-cannot produce a partial successful inventory. The two inventory failures carry
-the actual count and zero records, including when the count exceeds capacity or
-1024. A successful library can have zero functions. A pipeline result carries
-actual host pipeline limits: maximum threads and execution width are positive;
-static threadgroup memory may be zero. These values do not add arbitrary
-threadgroup control to the existing compute execution operation.
+An inventory is complete or absent. Unrepresentable metadata produces an
+explicit failure rather than a partial successful inventory. A successful
+library can have zero functions. Capacity failures report the required complete
+size, allowing a bounded retry after acknowledgement with a fresh sequence.
+Pipeline maximum threads and execution width must be positive; static
+threadgroup memory and required dimensions may be zero. These metadata queries
+do not add arbitrary threadgroup control to compute execution.
 
-Unspecialized function constants are unsupported. They are rejected before
-compute pipeline creation, because the native API can abort for that input
-instead of returning an error object. Specialization requires a future options
-and identity contract.
+Unspecialized function constants are rejected before compute pipeline creation,
+because the native API can abort for that input instead of returning NSError.
+Queries report SPECIALIZATION_REQUIRED; ordinary compute retains its backend
+failure without output. Specialization requires a future options/identity
+contract.
 
-Pipeline queries use the same exact-source/function cache key as compute
-execution. Reset preserves immutable cached pipelines and discards stale query
-output and interrupts through the existing generation check. No persistent host
-resource handle is exposed.
-
-The hardware and user protocols both require version 2. Old/new transport pairs
-fail at open; old descriptors fail validation. Old/new application/kernel pairs
-fail capability negotiation and close the new connection. No v1 fallback is
-provided. A v2 service advertises queries only after opening a v2 host.
+Pipeline queries share the exact-source/function key with compute execution.
+The library and pipeline caches retain warning diagnostics. Reset preserves
+immutable cached objects and discards stale query output and interrupts through
+the existing generation check. No persistent host resource handle is exposed.
+Both hardware and application protocols require version 3. Older transports
+fail at open, old descriptors fail validation, and application/kernel mismatches
+fail capability negotiation. There is no version fallback.
 
 ## Reset and lifetime
 
@@ -184,7 +206,7 @@ driver that never completes can therefore delay shutdown. Buffers and textures
 are per-request. Each device retains up to eight compute/render pipelines,
 evicting the least recently used entry on insertion. Keys contain the opcode,
 an owned copy of the exact shader bytes, and both applicable entrypoint names.
-Protocol v2 fixes the remaining pipeline state, including BGRA8Unorm; future
+Protocol v3 fixes the remaining pipeline state, including BGRA8Unorm; future
 configurable state must extend the key. Failed compilation, function validation,
 or pipeline creation is never cached. A later encoding or execution failure
 still reports an error even when the valid pipeline is retained.
@@ -396,7 +418,7 @@ and may be smaller than their backing descriptor, but never larger. The adapter
 retains no user pointer, descriptor or staging allocation after the synchronous
 call, and the service makes its own DMA copy before submit returns.
 
-Capabilities advertise compute, render, clear, library query and pipeline query
+Capabilities advertise compute, render, clear, library, pipeline and imageblock queries
 as opcode bits 1 through 5. Status state and transport results use explicit stable wire mappings;
 the timer error is the 32-bit `IOReturn` pattern, and completion sequence/error
 come only from the connection's session snapshot. Unknown internal enum values
@@ -457,7 +479,7 @@ The source compiles and links with the actual iPhoneOS 26.5 userspace SDK and
 macOS 26.5 SDK. These checks do not establish native iOS driver startup, a
 successful application connection, or Metal device discovery.
 
-The v2 independent host fixture passes 1,020 ASan/UBSan checks. It substitutes public
+The historical v2 independent host fixture passed 1,020 ASan/UBSan checks. It substitutes public
 IOKit calls and uses the production kernel decoder as an independent packet
 oracle. Coverage includes maximum requests and reads, lower negotiated limits,
 malformed replies, partial failed writes, raw errors and balanced allocation
@@ -470,11 +492,12 @@ results are in `metal-v2-fixtures-rjBLw1CQ/` and
 
 ## Application-side compiler helpers
 
-`contrib/inferno-metal/compiler-client.[ch]` builds typed library and pipeline
-requests and validates full result envelopes. Compile it with `user-client.c`
+`contrib/inferno-metal/compiler-client.[ch]` builds typed library, pipeline and
+imageblock requests and validates full result envelopes. Compile it with `user-client.c`
 and link IOKit and CoreFoundation. The caller supplies exact source bytes and
-sequence; the library query also takes an inventory capacity. Zero capacity
-permits an initial count probe. Pipeline names longer than 63 UTF-8 bytes and
+sequence; the library query also takes an output byte capacity. The minimum
+capacity permits an initial size probe. The output-size helper accepts function
+and metadata capacities; zero/zero computes that minimum. Pipeline names longer than 63 UTF-8 bytes and
 unsupported compile options cannot be silently shortened or ignored.
 
 The result decoder checks the complete supplied output, including unused
@@ -486,7 +509,9 @@ result unchanged.
 The helpers do not wait, acknowledge, reset or close automatically. The caller
 serializes client operations, polls existing status until matching completion,
 checks transport errors, reads the complete output allocation, then decodes and
-copies the result before acknowledging. A timeout alone does not retire a
+validates the private reply before acknowledging. Decoded views remain valid
+while that private buffer remains alive and unchanged; ACK does not free it.
+A timeout alone does not retire a
 request; the existing reset/drain and close ownership rules still apply.
 
 This layer supplies the future provider's compilation contract. It does not
@@ -508,3 +533,77 @@ kernel-service fixture passes 985 checks. Userspace sources compile and link
 with iPhoneOS 26.5 and macOS 26.5 SDKs; kernel sources compile and partially link
 for arm64e iOS using the nearby macOS kernel SDK, which still does not establish
 the target iOS kernel ABI or native driver loading.
+
+
+## Native compilation objects and coordinator
+
+The v3 provider component is in `contrib/inferno-metal/provider/`, with the
+synchronous C policy layer in `coordinator.[ch]`. It constructs ARC objects for
+`MTLLibrary`, `MTLFunction` and `MTLComputePipelineState` from validated host
+metadata. SDK builds, sanitized object tests and the recursive protocol audit
+pass for this component. It does not create or register the native iOS Metal
+device.
+
+The compiler context accepts an existing service and a real device owner. It
+holds the owner weakly to avoid a device/context cycle; operations take strong
+owner snapshots and returned objects retain the device. Libraries retain exact
+immutable source, functions retain their library, and pipelines retain their
+function. Labels use the public API's ownership semantics. Derived queries
+recreate host objects from immutable source identity after cache eviction.
+
+Only source compilation with nil options and basic compute-pipeline creation
+are supported. Specialization, library data/default libraries, descriptors,
+reflection-dependent creation and additional linking are explicit unsupported
+operations. Resource-dependent argument encoders and GPU resource IDs raise the
+provider's unsupported exception. A protocol object answering its selectors is
+not evidence of complete Metal functionality, native iOS admission or rendering.
+
+The coordinator exclusively owns its client connection and serializes calls.
+It polls status, accepts only matching successful completions, reads and
+validates the full allocation, then acknowledges. A submitted status has no
+sequence echo; the final completion does. Uncertain IPC submission is resolved
+through the exclusively owned session rather than blindly resubmitted. Timer
+and cleanup diagnostics are retained separately from the primary result.
+
+Polling, capacity growth and recovery use a configurable monotonic timeout.
+Synchronous IOKit calls cannot be interrupted by this layer, so it does not
+promise a hard wall-clock bound for blocked IPC or lock contention. Timeout
+starts reset/drain or connection cleanup; it never proves DMA retirement.
+Invalidation closes the connection once. Final destruction requires callers to
+stop admitting work and let all existing calls finish before freeing the handle.
+The provider keeps its context alive through asynchronous operations and invokes
+completion handlers outside coordinator locks.
+
+Host SDK construction of the three public metadata subclasses has passed; their
+initialization on the target iOS 23F84 runtime is still unverified. The native
+`_MTLDevice` capability initialization and accelerator class binding requirements
+remain recorded in [native discovery](inferno-metal-native-discovery.md).
+
+The final v3 source passed 26 SDK compilation/link stages, including arm64e
+userspace iPhoneOS 26.5 and arm64 macOS 26.5 builds. Compile the provider's six
+Objective-C implementation files with ARC and blocks, together with
+`user-client.c`, `compiler-client.c` and `coordinator.c`; link Foundation, Metal,
+IOKit and CoreFoundation. Kernel partial linking still uses nearby macOS headers
+for an iOS target and does not verify the target kernel ABI.
+
+The independent ASan/UBSan fixtures passed 2,410 application/compiler/coordinator
+checks and 994 kernel-service checks. They substitute IOKit, clocks and kernel
+objects. The macOS provider suite uses the actual ARC implementation with a
+scripted coordinator; it passed metadata, error, asynchronous callback, lifetime
+and local rejection checks. Its recursive audit reports no missing required
+selectors, including inherited NSObject and MTLAllocation requirements. Sequence
+exhaustion is source-reviewed because the opaque coordinator exposes no test
+sequence setter.
+
+The final signed QEMU binary passed all freestanding ARM guest assertions under
+TCG and HVF, with 29 serial lines each. Coverage includes compute/render/clear,
+compiler errors, attributes/constants, imageblock sizing, strict v1/v2 descriptor
+rejection, query cache reuse, and reset/recovery with no stale output or
+completion. All 14 captured envelopes passed the actual application decoder
+under ASan/UBSan and the native host metadata comparison. These tests use
+isolated RAM guests; they are not iOS boot or driver-loading evidence.
+
+Exact source hashes, commands, results and remaining limitations are retained in
+`~/InfernoData/ios26/gpu-display-20260911/metal-native-objects-root-checks-4e2zun6d/acceptance.json`.
+The independent C/kernel fixtures are in `metal-v3-fixtures-4esdlng_/` under the
+same evidence root. Older v1/v2 fixture results above remain historical evidence.
