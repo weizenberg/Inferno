@@ -220,3 +220,49 @@ This investigation ran through the authorized DeepSeek Flash retry, followed by
 the user's selected Kimi K3 fallback for the missing full-cache selector data.
 No native driver-loading operation was retried. Evidence is retained under
 `kimi-feature-query-selectors-gq3rxr09/`, including `root-verification.json`.
+
+### Concrete getter dataflow correction
+
+A focused follow-up verified three concrete `familySupports*` getters. Each
+loads the stored device from query+5792, then asks that device for the result:
+
+| Concrete query method | Device call | Verified consequence |
+| --- | --- | --- |
+| `familySupportsBufferlessClientStorageTexture` | `supportsFamily:0` | Result comes from live family membership. |
+| `familySupports2DLinearTexArraySPI` | `supportsFamily:1005` | Result comes from live membership; the public SDK names tag 1005 `MTLGPUFamilyApple5`. |
+| `familySupports32BitMSAA` | `isMsaa32bSupported` | The base device implementation returns NO; concrete devices may override it. |
+
+The verified `supportsFamily:` helper checks the device's family vector. These
+getters do not read the constructor's Boolean records, so the earlier model
+claim that later YES answers necessarily require construction-time `supportsX`
+overrides is withdrawn for these methods. Three checked tails do not classify
+all 231 methods or establish a valid Inferno family/profile. Advertising Apple5
+would still require its actual capability contract.
+
+Kimi's quota-limited follow-up produced no findings; the user later reported
+restored availability and one bounded retry completed. Root checked the decisive
+selrefs, immediates, branches and base constant-NO predicate. Evidence is in
+`kimi-feature-query-selectors-gq3rxr09/findings-getter-dataflow.md` and
+`root-getter-dataflow-verification.json` under the existing evidence root.
+
+### Verified baseline profile families
+
+The profile-to-family builder's signed jump table at cache VA `0x18612b3f8`
+and its target immediates establish two baseline cases:
+
+| Private profile | Family vector | Public SDK names |
+| --- | --- | --- |
+| `0` | `[1001, 3001]` | Apple1, Common1 |
+| `1` | `[1002, 1001, 3001]` | Apple2, Apple1, Common1 |
+
+Profile zero therefore advertises real GPU families; it is not a neutral
+unsupported value. The empty vectors for cases 2 and 3 do not establish a
+usable device either: independent initialization limits still require positive
+values. No profile has been selected for Inferno.
+
+DeepSeek Flash's larger returned table contained incorrect prefixes and omitted
+fallthrough tails, so it is not accepted as a complete mapping. The verified
+baseline cases and remaining contradictions are recorded in
+`metal-profile-family-map-de62tgtz/coordinator-review.md` and
+`root-verification.json`. Buffer and command implementation can proceed while
+the native device capability contract remains unresolved.

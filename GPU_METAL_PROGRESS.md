@@ -102,6 +102,27 @@ service shutdown. They use substitute OS objects, so native iOS behavior still
 needs runtime verification. The compile uses nearby macOS kernel headers for an
 iOS target; matching the actual iOS kernel interface is still outstanding.
 
+## Current work
+
+The next implementation is reusable shared buffers and ordered compute command
+buffers. Source/API review confirmed that the existing single-operation path
+cannot preserve arbitrary bindings, aliases or dependent dispatches. Fable’s
+plan and revision have been reviewed, and Sol is implementing the bounded batch
+protocol and native queue/command/encoder objects. An independent fixture pass
+is preparing malformed-packet and lifecycle checks. The execution scheduler must
+capture shared-buffer bytes after preceding GPU writeback, including work
+already queued by the application.
+
+The separate capability-getter investigation hit Kimi's weekly quota limit.
+After availability was restored, one bounded retry completed. Three concrete
+getters are now verified to query the device live, correcting the earlier
+cached-answer interpretation. Full capability/profile mapping and native device
+initialization remain unresolved.
+DeepSeek’s restored pass also confirmed that private profile 0 advertises
+Apple1 and Common1; it is not a neutral unsupported profile. Parts of its broader
+mapping were incorrect and remain unaccepted. No profile has been selected.
+The resource/command implementation proceeds independently.
+
 ## What remains for the full goal
 
 | Remaining work | What will count as done |
