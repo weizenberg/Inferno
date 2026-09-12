@@ -7,11 +7,12 @@ Last updated: 12 September 2026.
 **The host GPU bridge works in test guests. Native Metal acceleration inside
 the iOS 26 guest is not working yet.**
 
-The driver connection and its application-side C client are implemented. The
-new client compiles and links with the iPhoneOS 26.5 and macOS 26.5 SDKs; its
-independent fault-injection fixture passes 815 sanitizer checks. The kernel connection's
-existing 940 sanitizer checks passed. The next major gap is making iOS discover
-and use a native Metal device.
+The driver connection, application-side C client, and shader compiler-query
+layer are implemented. Compiler queries now return function inventories,
+compilation errors, and real compute-pipeline limits. The new code passed SDK
+builds, 1,020 application/compiler checks, 985 kernel-service checks, and real
+ARM guest tests under both TCG and HVF. Native iOS device discovery and the
+Metal provider are still missing.
 
 Target: iOS 26 applications use GPU/Metal rendering, and Settings identifies
 the emulated panel as a **virtual display**.
@@ -28,8 +29,9 @@ Development branch: [gpu-metal-bridge](https://github.com/weizenberg/Inferno/tre
 | Guest transport | Encodes and submits commands with explicit size limits. | Real ARM guest transport passed under TCG and HVF. |
 | Driver memory ownership | Copies application data into driver-owned buffers and keeps active GPU memory alive until work retires. | Earlier owner and service lifecycle tests passed. |
 | Per-connection sessions | Keeps independent connections' results separate; disconnect starts cleanup without freeing active GPU memory early. | Earlier 443-check session fixture passed. |
-| Driver connection | Implements capability, submit, status, read, acknowledge and reset calls, including large buffers. | Kernel SDK compile/partial link and the combined 940-check fixture passed against the dedicated branch. |
-| Application-side C client | Opens an existing service, negotiates limits, encodes requests, validates replies and closes its connection exactly once. | Actual iPhoneOS 26.5 and macOS 26.5 userspace compilation and linking passed; 815 independent ASan/UBSan checks passed. |
+| Driver connection | Implements capability, submit, status, read, acknowledge and reset calls, including large buffers. | Kernel SDK compile/partial link and the combined 985-check fixture passed against the dedicated branch. |
+| Application-side C client | Opens an existing service, negotiates limits, encodes requests, validates replies and closes its connection exactly once. | Actual iPhoneOS 26.5 and macOS 26.5 userspace compilation and linking passed; 1,020 independent ASan/UBSan application/compiler checks passed. |
+| Compiler queries | Returns complete function inventories, signed compiler errors and actual pipeline limits; compiled pipelines are reused by compute execution. | TCG/HVF tests passed for compilation, failure reporting, limits, cache reuse and query reset; captured results match direct host Metal. |
 | Isolated publication build | GPU/Metal code builds on its own dedicated branch. | QEMU build passed; that exact binary passed TCG/HVF transport tests. |
 
 These results prove the components described above. They do not prove native
@@ -40,8 +42,11 @@ iOS app acceleration or a working Metal display.
 - [x] Implement the kernel application-to-driver connection.
 - [x] Implement its application-side C client using the approved Opus plan and Sol.
 - [x] Compile and link the client with the actual iPhoneOS and macOS SDKs.
-- [x] Pass 815 independent client checks with address and undefined-behavior sanitizers.
-- [x] Pass 940 combined service, connection, buffer-copy and cleanup checks.
+- [x] Pass 1,020 independent application/compiler checks with address and undefined-behavior sanitizers.
+- [x] Pass 985 combined service, connection, buffer-copy and cleanup checks.
+- [x] Implement library and compute-pipeline queries using a reviewed Fable plan and Sol.
+- [x] Verify compiler queries and their reset/recovery behavior under TCG and HVF.
+- [x] Verify old v1 transport peers are rejected explicitly.
 - [x] Build the isolated branch and pass the TCG/HVF transport tests.
 - [x] Trace the real iOS Metal service selection and plugin construction path.
 - [x] Verify the accelerator class hierarchy and key Metal base-class lifecycle requirements.
@@ -60,13 +65,19 @@ service. The application-side IOKit client is now implemented. It accepts an
 existing service and supplies the future provider's application-to-driver calls.
 It does not yet create or register a native Metal device.
 
-The capability investigation also confirms that Metal consumes a scalar
-private profile. Its correct value and the required supported features for
-Inferno remain unresolved; the current bridge cannot claim a complete Apple
-GPU family based on the host GPU.
+The capability investigation confirms the private profile's type, the limits
+that must be positive, and the factory that creates the concrete feature-query
+object. The correct capability mapping for Inferno and the concrete initializer's
+required device queries still need verification. The current bridge cannot
+claim a complete Apple GPU family based on the host GPU.
 
-The existing kernel connection tests cover large requests, short and failed copies, independent
-connections, disconnect during outstanding work, reset failures and cleanup after
+The compiler-query layer is now implemented and tested. It reports actual
+function names and types, pipeline limits, and errors at library or pipeline
+creation. Its application helpers validate complete responses. Wiring those
+helpers into native iOS Metal objects remains part of provider implementation.
+
+The existing kernel connection tests cover large requests, short and failed
+copies, independent connections, disconnect during outstanding work, reset failures and cleanup after
 service shutdown. They use substitute OS objects, so native iOS behavior still
 needs runtime verification. The compile uses nearby macOS kernel headers for an
 iOS target; matching the actual iOS kernel interface is still outstanding.
@@ -77,6 +88,7 @@ iOS target; matching the actual iOS kernel interface is still outstanding.
 | --- | --- |
 | Verify the real iOS driver interface and startup | The new driver starts on the target iOS build and an application opens its connection successfully. |
 | Native Metal device discovery | Stock `MTLCreateSystemDefaultDevice()` returns the Inferno device instead of `nil`. |
+| Library and pipeline creation | Wire the verified compiler queries into native creation calls, returning validated iOS objects or errors before command submission. |
 | Native application execution | An iOS application creates a Metal queue, submits work and receives correct results through the real driver connection. |
 | General resource and command support | Reusable buffers/textures and ordered commands work beyond the current single-operation bridge; required compiled-shader support is established. |
 | Native presentation | Metal drawables reach the iOS compositor and display, with correct synchronization. |
@@ -104,3 +116,8 @@ Combined fixture: `~/InfernoData/ios26/gpu-display-20260911/metal-userclient-fix
 
 Application client SDK evidence: `~/InfernoData/ios26/gpu-display-20260911/metal-native-client-build-el7fjj7_/`.
 Application client fixture: `~/InfernoData/ios26/gpu-display-20260911/metal-native-client-fixture-WFRaYum4/`.
+
+Compiler-query SDK, QEMU and runtime evidence:
+`~/InfernoData/ios26/gpu-display-20260911/metal-compiler-root-checks-8dib4nyj/`.
+Current application/kernel fixtures:
+`~/InfernoData/ios26/gpu-display-20260911/metal-v2-fixtures-rjBLw1CQ/`.

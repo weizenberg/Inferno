@@ -75,6 +75,7 @@ void imtl_encode(uint8_t raw[INFERNO_METAL_DESCRIPTOR_SIZE],
         raw[64 + i] = (uint8_t)c->function[i];
         raw[128 + i] = (uint8_t)c->fragment[i];
     }
+    put32(raw + INFERNO_METAL_DESCRIPTOR_OPTIONS_OFFSET, c->options);
 }
 
 ImtlResult imtl_open(ImtlTransport *t, volatile void *registers, size_t size)

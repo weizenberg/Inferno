@@ -49,6 +49,7 @@ typedef struct ImtlUserSubmit {
     uint32_t width;
     uint32_t height;
     uint32_t depth;
+    uint32_t options;
     char function[64];
     char fragment[64];
     const void *source;

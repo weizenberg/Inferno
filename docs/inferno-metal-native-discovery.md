@@ -69,6 +69,27 @@ host GPU's capabilities. Some individual queries also need more implementation:
 `MTLArgumentBuffersTier`, for example, has no unsupported value. Zero-filled
 answers cannot stand in for a verified capability contract.
 
+The base `limits` getter returns the structure at `self + 8`. Its initializer
+requires positive color-attachment and indirect-buffer, texture, sampler, and
+per-device sampler limits. Its ordinary return precedes the separate
+`argumentBuffersSupport` method; a merged decompilation had incorrectly combined
+them. The inherited indirect-capability mask defaults to zero, which selects
+Tier 1. That is a concrete baseline answer, not an abstract method or a claim
+that Inferno already implements argument buffers.
+
+The feature-query path uses a class cluster. Allocation of
+`MTLDeviceFeatureQueries` selects the concrete `_MTLDeviceFeatureQueries`, then
+calls `initWithDevice:` and stores the result. The concrete `validate` method is
+a no-op on this build. The concrete initializer's required device queries still
+need verification. The base initializer returns nil; normal allocation selects
+the concrete subclass before initialization.
+
+An empty family array makes the inherited family-membership query return false;
+this alone does not establish successful limits initialization. The recovered
+family builder owns dynamically allocated storage through a vector-shaped
+container. A conditional family flag uses the main executable's linked SDK via
+`dyld_program_sdk_at_least`, so it must not be interpreted as a host-GPU check.
+
 ## What this means for Inferno
 
 The published `InfernoMetalService` and type-0 user client provide a private
@@ -81,6 +102,11 @@ plugin properties to an ordinary service has not been shown to satisfy the
 The remaining dependencies are the concrete accelerator subclass and link
 bindings, final service packaging, `_MTLDevice` capability initialization, and
 a provider that owns real Metal resource and command objects.
+Library and pipeline creation must compile and return errors synchronously.
+The implemented v2 compiler-query path now supplies bounded function inventories,
+actual compute limits and structured compiler errors before execution. Its
+application helpers and ARM transport are verified; the native provider still
+needs to call those helpers and construct the corresponding Metal objects.
 The final registration block also needs instruction-level verification; its
 current decompilation is insufficient to settle optional wrapping behavior.
 
@@ -125,5 +151,9 @@ against the original image before analysis.
 The scalar profile verification and source capability limits are recorded in
 `metal-feature-profile-hyhddo34/coordinator-review.md` and
 `metal-feature-profile-source-bFkjagLr/findings.md` under the same evidence root.
+Additional method types, allocation and limits evidence is in
+`metal-profile-contract-7rd7xfxx/coordinator-review.md`; source API requirements
+are in `metal-argument-buffer-source-CF5M1n7A/findings.md` and
+`metal-compiler-api-source-Zmm1FCHK/findings.md` under that evidence root.
 These target-specific observations are not a stable public plugin API or
 proof of compatibility with another iOS release.

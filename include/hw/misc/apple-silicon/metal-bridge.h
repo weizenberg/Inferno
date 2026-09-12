@@ -32,5 +32,9 @@ bool inferno_metal_backend_execute(InfernoMetalBackend *backend,
                                    const uint8_t *source, const uint8_t *input,
                                    uint8_t *output, char *message,
                                    size_t message_size);
+bool inferno_metal_backend_query(InfernoMetalBackend *backend,
+                                 const InfernoMetalCommand *command,
+                                 const uint8_t *source, uint8_t *output,
+                                 char *message, size_t message_size);
 
 #endif

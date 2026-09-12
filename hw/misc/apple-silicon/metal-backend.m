@@ -123,6 +123,328 @@ static void metal_phase(const InfernoMetalCommand *command, const char *phase,
     *start = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
 }
 
+static bool metal_function_has_constants(id<MTLFunction> function)
+{
+    NSDictionary *constants = [function functionConstantsDictionary];
+
+    return constants && [constants count] != 0;
+}
+
+static bool metal_function_type(uint32_t *result, MTLFunctionType type)
+{
+    switch (type) {
+    case MTLFunctionTypeVertex:
+        *result = INFERNO_METAL_FUNCTION_TYPE_VERTEX;
+        return true;
+    case MTLFunctionTypeFragment:
+        *result = INFERNO_METAL_FUNCTION_TYPE_FRAGMENT;
+        return true;
+    case MTLFunctionTypeKernel:
+        *result = INFERNO_METAL_FUNCTION_TYPE_KERNEL;
+        return true;
+    case MTLFunctionTypeVisible:
+        *result = INFERNO_METAL_FUNCTION_TYPE_VISIBLE;
+        return true;
+    case MTLFunctionTypeIntersection:
+        *result = INFERNO_METAL_FUNCTION_TYPE_INTERSECTION;
+        return true;
+    case MTLFunctionTypeMesh:
+        *result = INFERNO_METAL_FUNCTION_TYPE_MESH;
+        return true;
+    case MTLFunctionTypeObject:
+        *result = INFERNO_METAL_FUNCTION_TYPE_OBJECT;
+        return true;
+    default:
+        return false;
+    }
+}
+
+static uint32_t metal_query_string(uint8_t *output, uint32_t offset,
+                                   uint32_t capacity, NSString *string,
+                                   uint32_t truncated_flag, uint32_t *flags)
+{
+    NSData *data = [string dataUsingEncoding:NSUTF8StringEncoding];
+    const uint8_t *bytes = [data bytes];
+    NSUInteger full_length = [data length];
+    NSUInteger length = full_length;
+
+    if (length >= capacity) {
+        length = capacity - 1;
+        while (length && (bytes[length] & 0xc0) == 0x80) {
+            length--;
+        }
+        *flags |= truncated_flag;
+    }
+    if (length) {
+        memcpy(output + offset, bytes, length);
+    }
+    return length;
+}
+
+static void metal_query_initialize(const InfernoMetalCommand *c,
+                                   uint8_t *output)
+{
+    memset(output, 0, c->output_size);
+    stl_le_p(output + INFERNO_METAL_COMPILER_VERSION_OFFSET,
+             INFERNO_METAL_VERSION);
+    stl_le_p(output + INFERNO_METAL_COMPILER_OPCODE_OFFSET, c->opcode);
+    stq_le_p(output + INFERNO_METAL_COMPILER_SEQUENCE_OFFSET, c->sequence);
+}
+
+static bool metal_query_finish(const InfernoMetalCommand *c, uint8_t *output,
+                               uint32_t outcome, uint32_t phase, NSError *error,
+                               NSString *explanation, bool warning)
+{
+    uint32_t flags = 0;
+
+    stl_le_p(output + INFERNO_METAL_COMPILER_OUTCOME_OFFSET, outcome);
+    stl_le_p(output + INFERNO_METAL_COMPILER_PHASE_OFFSET, phase);
+    if (error) {
+        int64_t code = (int64_t)[error code];
+        uint32_t domain_length = metal_query_string(
+            output, INFERNO_METAL_COMPILER_DOMAIN_OFFSET,
+            INFERNO_METAL_COMPILER_DOMAIN_SIZE, [error domain],
+            INFERNO_METAL_COMPILER_FLAG_DOMAIN_TRUNCATED, &flags);
+        uint32_t description_length = metal_query_string(
+            output, INFERNO_METAL_COMPILER_DESCRIPTION_OFFSET,
+            INFERNO_METAL_COMPILER_DESCRIPTION_SIZE,
+            [error localizedDescription],
+            INFERNO_METAL_COMPILER_FLAG_DESCRIPTION_TRUNCATED, &flags);
+
+        stq_le_p(output + INFERNO_METAL_COMPILER_ERROR_CODE_OFFSET,
+                 (uint64_t)code);
+        stl_le_p(output + INFERNO_METAL_COMPILER_DOMAIN_LENGTH_OFFSET,
+                 domain_length);
+        stl_le_p(output + INFERNO_METAL_COMPILER_DESCRIPTION_LENGTH_OFFSET,
+                 description_length);
+        if (warning) {
+            flags |= INFERNO_METAL_COMPILER_FLAG_WARNING;
+        }
+    } else {
+        flags |= INFERNO_METAL_COMPILER_FLAG_NO_NSERROR;
+        if (explanation) {
+            uint32_t description_length = metal_query_string(
+                output, INFERNO_METAL_COMPILER_DESCRIPTION_OFFSET,
+                INFERNO_METAL_COMPILER_DESCRIPTION_SIZE, explanation,
+                INFERNO_METAL_COMPILER_FLAG_DESCRIPTION_TRUNCATED, &flags);
+            stl_le_p(output + INFERNO_METAL_COMPILER_DESCRIPTION_LENGTH_OFFSET,
+                     description_length);
+        }
+    }
+    stl_le_p(output + INFERNO_METAL_COMPILER_FLAGS_OFFSET, flags);
+    trace_inferno_metal_backend_query(c->sequence, c->opcode, outcome, phase);
+    return true;
+}
+
+static bool metal_query_pipeline_limits(const InfernoMetalCommand *c,
+                                        id<MTLComputePipelineState> pipeline,
+                                        uint8_t *output, char *message,
+                                        size_t message_size)
+{
+    NSUInteger maximum = [pipeline maxTotalThreadsPerThreadgroup];
+    NSUInteger width = [pipeline threadExecutionWidth];
+    NSUInteger memory = [pipeline staticThreadgroupMemoryLength];
+
+    if (!maximum || maximum > UINT32_MAX || !width || width > UINT32_MAX ||
+        memory > UINT32_MAX) {
+        snprintf(message, message_size,
+                 "compute pipeline limits are outside the v2 wire range");
+        return false;
+    }
+    stl_le_p(output + INFERNO_METAL_COMPILER_FUNCTION_TYPE_OFFSET,
+             INFERNO_METAL_FUNCTION_TYPE_KERNEL);
+    stl_le_p(output + INFERNO_METAL_COMPILER_MAX_TOTAL_THREADS_OFFSET, maximum);
+    stl_le_p(output + INFERNO_METAL_COMPILER_THREAD_EXECUTION_WIDTH_OFFSET,
+             width);
+    stl_le_p(output + INFERNO_METAL_COMPILER_STATIC_THREADGROUP_MEMORY_OFFSET,
+             memory);
+    return true;
+}
+
+bool inferno_metal_backend_query(InfernoMetalBackend *backend,
+                                 const InfernoMetalCommand *c,
+                                 const uint8_t *source, uint8_t *output,
+                                 char *message, size_t message_size)
+{
+    @autoreleasepool {
+        int64_t phase_start = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+        NSError *library_error = nil;
+        NSString *text =
+            [[[NSString alloc] initWithBytes:source
+                                      length:c->source_size
+                                    encoding:NSUTF8StringEncoding] autorelease];
+
+        if (!text) {
+            return metal_error(message, message_size, "UTF-8 shader", nil);
+        }
+        metal_query_initialize(c, output);
+
+        NSString *function_name = nil;
+        NSArray *pipeline_key = nil;
+        id<MTLComputePipelineState> pipeline = nil;
+        if (c->opcode == INFERNO_METAL_QUERY_PIPELINE) {
+            function_name = [NSString stringWithUTF8String:c->function];
+            if (!function_name) {
+                return metal_error(message, message_size, "UTF-8 function name",
+                                   nil);
+            }
+            pipeline_key = @[
+                @(INFERNO_METAL_COMPUTE),
+                [NSData dataWithBytes:source length:c->source_size],
+                function_name, @""
+            ];
+            pipeline = metal_pipeline_lookup(backend, pipeline_key);
+            trace_inferno_metal_pipeline_cache(c->sequence, c->opcode,
+                                               pipeline != nil,
+                                               [backend->pipeline_keys count]);
+            if (pipeline) {
+                if (!metal_query_pipeline_limits(c, pipeline, output, message,
+                                                 message_size)) {
+                    return false;
+                }
+                metal_phase(c, "query-pipeline", &phase_start);
+                return metal_query_finish(
+                    c, output, INFERNO_METAL_COMPILER_OUTCOME_OK,
+                    INFERNO_METAL_COMPILER_PHASE_PIPELINE, nil, nil, false);
+            }
+        }
+
+        id<MTLLibrary> library =
+            [[backend->device newLibraryWithSource:text
+                                           options:nil
+                                             error:&library_error] autorelease];
+        if (!library) {
+            metal_phase(c, "query-library", &phase_start);
+            return metal_query_finish(
+                c, output, INFERNO_METAL_COMPILER_OUTCOME_COMPILE_FAILED,
+                INFERNO_METAL_COMPILER_PHASE_LIBRARY, library_error,
+                @"Metal returned no library and no NSError", false);
+        }
+        metal_phase(c, "query-library", &phase_start);
+
+        if (c->opcode == INFERNO_METAL_QUERY_LIBRARY) {
+            NSArray<NSString *> *names = [library functionNames];
+            NSUInteger count = [names count];
+
+            if (count > UINT32_MAX) {
+                return metal_error(message, message_size,
+                                   "function inventory count exceeds uint32",
+                                   nil);
+            }
+            stl_le_p(output + INFERNO_METAL_COMPILER_FUNCTION_COUNT_OFFSET,
+                     count);
+            uint32_t capacity =
+                (c->output_size - INFERNO_METAL_COMPILER_MIN_OUTPUT) /
+                INFERNO_METAL_COMPILER_FUNCTION_RECORD_SIZE;
+            if (count > INFERNO_METAL_COMPILER_MAX_FUNCTIONS) {
+                return metal_query_finish(
+                    c, output,
+                    INFERNO_METAL_COMPILER_OUTCOME_INVENTORY_UNSUPPORTED,
+                    INFERNO_METAL_COMPILER_PHASE_INVENTORY, nil,
+                    @"function inventory exceeds the v2 maximum", false);
+            }
+            if (count > capacity) {
+                return metal_query_finish(
+                    c, output, INFERNO_METAL_COMPILER_OUTCOME_OUTPUT_TOO_SMALL,
+                    INFERNO_METAL_COMPILER_PHASE_INVENTORY, nil,
+                    @"output has insufficient function-record capacity", false);
+            }
+
+            NSMutableSet<NSString *> *seen =
+                [NSMutableSet setWithCapacity:count];
+            for (NSUInteger i = 0; i < count; i++) {
+                NSString *name = [names objectAtIndex:i];
+                NSData *name_data =
+                    [name dataUsingEncoding:NSUTF8StringEncoding];
+                NSUInteger name_length = [name_data length];
+                id<MTLFunction> function =
+                    [[library newFunctionWithName:name] autorelease];
+                uint32_t type;
+
+                if (!name || !name_data || !name_length ||
+                    name_length >= INFERNO_METAL_COMPILER_FUNCTION_NAME_SIZE ||
+                    [seen containsObject:name] || !function ||
+                    !metal_function_type(&type, [function functionType])) {
+                    memset(output + INFERNO_METAL_COMPILER_FUNCTIONS_OFFSET, 0,
+                           c->output_size -
+                               INFERNO_METAL_COMPILER_FUNCTIONS_OFFSET);
+                    return metal_query_finish(
+                        c, output,
+                        INFERNO_METAL_COMPILER_OUTCOME_INVENTORY_UNSUPPORTED,
+                        INFERNO_METAL_COMPILER_PHASE_INVENTORY, nil,
+                        @"function inventory contains unsupported metadata",
+                        false);
+                }
+                [seen addObject:name];
+                uint8_t *record =
+                    output + INFERNO_METAL_COMPILER_FUNCTIONS_OFFSET +
+                    i * INFERNO_METAL_COMPILER_FUNCTION_RECORD_SIZE;
+                stl_le_p(record + INFERNO_METAL_COMPILER_RECORD_TYPE_OFFSET,
+                         type);
+                stl_le_p(record +
+                             INFERNO_METAL_COMPILER_RECORD_NAME_LENGTH_OFFSET,
+                         name_length);
+                memcpy(record + INFERNO_METAL_COMPILER_RECORD_NAME_OFFSET,
+                       [name_data bytes], name_length);
+            }
+            metal_phase(c, "query-inventory", &phase_start);
+            return metal_query_finish(c, output,
+                                      INFERNO_METAL_COMPILER_OUTCOME_OK,
+                                      INFERNO_METAL_COMPILER_PHASE_INVENTORY,
+                                      library_error, nil, library_error != nil);
+        }
+
+        id<MTLFunction> function =
+            [[library newFunctionWithName:function_name] autorelease];
+        if (!function) {
+            return metal_query_finish(
+                c, output, INFERNO_METAL_COMPILER_OUTCOME_FUNCTION_NOT_FOUND,
+                INFERNO_METAL_COMPILER_PHASE_FUNCTION, nil,
+                @"library has no function with the requested name", false);
+        }
+        uint32_t type;
+        if (!metal_function_type(&type, [function functionType])) {
+            return metal_error(message, message_size,
+                               "function has an unknown Metal type", nil);
+        }
+        if (type != INFERNO_METAL_FUNCTION_TYPE_KERNEL) {
+            stl_le_p(output + INFERNO_METAL_COMPILER_FUNCTION_TYPE_OFFSET,
+                     type);
+            return metal_query_finish(
+                c, output,
+                INFERNO_METAL_COMPILER_OUTCOME_FUNCTION_TYPE_MISMATCH,
+                INFERNO_METAL_COMPILER_PHASE_FUNCTION, nil,
+                @"requested function is not a compute kernel", false);
+        }
+        if (metal_function_has_constants(function)) {
+            return metal_error(message, message_size,
+                               "compute function requires specialization", nil);
+        }
+
+        NSError *pipeline_error = nil;
+        pipeline = [[backend->device
+            newComputePipelineStateWithFunction:function
+                                          error:&pipeline_error] autorelease];
+        if (!pipeline) {
+            metal_phase(c, "query-pipeline", &phase_start);
+            return metal_query_finish(
+                c, output, INFERNO_METAL_COMPILER_OUTCOME_COMPILE_FAILED,
+                INFERNO_METAL_COMPILER_PHASE_PIPELINE, pipeline_error,
+                @"Metal returned no pipeline and no NSError", false);
+        }
+        if (!metal_query_pipeline_limits(c, pipeline, output, message,
+                                         message_size)) {
+            return false;
+        }
+        metal_pipeline_insert(backend, pipeline_key, pipeline);
+        metal_phase(c, "query-pipeline", &phase_start);
+        NSError *diagnostic = pipeline_error ?: library_error;
+        return metal_query_finish(c, output, INFERNO_METAL_COMPILER_OUTCOME_OK,
+                                  INFERNO_METAL_COMPILER_PHASE_PIPELINE,
+                                  diagnostic, nil, diagnostic != nil);
+    }
+}
+
 bool inferno_metal_backend_execute(InfernoMetalBackend *backend,
                                    const InfernoMetalCommand *c,
                                    const uint8_t *source, const uint8_t *input,
@@ -165,7 +487,7 @@ bool inferno_metal_backend_execute(InfernoMetalBackend *backend,
                 return metal_error(message, message_size, "UTF-8 shader", nil);
             }
             /* Copy exact source bytes; never retain a guest or work pointer.
-             * Protocol v1 fixes all other pipeline state (including BGRA8).
+             * Protocol v2 fixes all other pipeline state (including BGRA8).
              */
             pipeline_key = @[
                 @(c->opcode),
@@ -177,9 +499,9 @@ bool inferno_metal_backend_execute(InfernoMetalBackend *backend,
                                                cached_pipeline != nil,
                                                [backend->pipeline_keys count]);
             if (!cached_pipeline) {
-                library = [[device newLibraryWithSource:text
-                                                options:nil
-                                                  error:&error] autorelease];
+                library =
+                    [[device newLibraryWithSource:text options:nil error:&error]
+                        autorelease];
                 if (!library) {
                     return metal_error(message, message_size, "shader library",
                                        error);
@@ -207,12 +529,25 @@ bool inferno_metal_backend_execute(InfernoMetalBackend *backend,
                     return metal_error(message, message_size,
                                        "compute function", nil);
                 }
+                if (metal_function_has_constants(function)) {
+                    return metal_error(
+                        message, message_size,
+                        "compute function requires specialization", nil);
+                }
                 pipeline = [[device newComputePipelineStateWithFunction:function
                                                                   error:&error]
                     autorelease];
                 if (!pipeline) {
                     return metal_error(message, message_size,
                                        "compute pipeline", error);
+                }
+                if (![pipeline maxTotalThreadsPerThreadgroup] ||
+                    [pipeline maxTotalThreadsPerThreadgroup] > UINT32_MAX ||
+                    ![pipeline threadExecutionWidth] ||
+                    [pipeline threadExecutionWidth] > UINT32_MAX ||
+                    [pipeline staticThreadgroupMemoryLength] > UINT32_MAX) {
+                    return metal_error(message, message_size,
+                                       "compute pipeline limits", nil);
                 }
                 metal_pipeline_insert(backend, pipeline_key, pipeline);
             }

@@ -123,9 +123,15 @@ static void *metal_worker(void *opaque)
 {
     InfernoMetalWork *work = opaque;
 
-    work->success = inferno_metal_backend_execute(
-        work->device->backend, &work->command, work->source, work->input,
-        work->output, work->message, sizeof(work->message));
+    if (work->command.opcode >= INFERNO_METAL_QUERY_LIBRARY) {
+        work->success = inferno_metal_backend_query(
+            work->device->backend, &work->command, work->source, work->output,
+            work->message, sizeof(work->message));
+    } else {
+        work->success = inferno_metal_backend_execute(
+            work->device->backend, &work->command, work->source, work->input,
+            work->output, work->message, sizeof(work->message));
+    }
     qemu_bh_schedule(work->device->completion_bh);
     return NULL;
 }
@@ -174,16 +180,46 @@ static bool metal_decode_command(const uint8_t *raw, InfernoMetalCommand *c)
     c->width = ldl_le_p(raw + 52);
     c->height = ldl_le_p(raw + 56);
     c->depth = ldl_le_p(raw + 60);
+    c->options = ldl_le_p(raw + INFERNO_METAL_DESCRIPTOR_OPTIONS_OFFSET);
     memcpy(c->function, raw + 64, sizeof(c->function));
     memcpy(c->fragment, raw + 128, sizeof(c->fragment));
 
-    if (ldl_le_p(raw) != INFERNO_METAL_VERSION || !c->output_size ||
-        c->output_size > INFERNO_METAL_MAX_BUFFER ||
+    for (unsigned i = 0; i < INFERNO_METAL_DESCRIPTOR_RESERVED_SIZE; i++) {
+        if (raw[INFERNO_METAL_DESCRIPTOR_RESERVED_OFFSET + i]) {
+            return false;
+        }
+    }
+    if (ldl_le_p(raw) != INFERNO_METAL_VERSION || c->options ||
+        !c->output_size || c->output_size > INFERNO_METAL_MAX_BUFFER ||
         c->input_size > INFERNO_METAL_MAX_BUFFER || !c->width || !c->height ||
         !c->depth) {
         return false;
     }
-    if (c->opcode == INFERNO_METAL_COMPUTE) {
+    if (c->opcode >= INFERNO_METAL_QUERY_LIBRARY &&
+        c->opcode <= INFERNO_METAL_QUERY_PIPELINE) {
+        bool library = c->opcode == INFERNO_METAL_QUERY_LIBRARY;
+
+        if (!c->source_size || c->source_size > INFERNO_METAL_MAX_SOURCE ||
+            c->input_size || c->width != 1 || c->height != 1 || c->depth != 1 ||
+            c->output_size < INFERNO_METAL_COMPILER_MIN_OUTPUT ||
+            c->output_size > INFERNO_METAL_COMPILER_MAX_OUTPUT) {
+            return false;
+        }
+        for (unsigned i = 0; i < sizeof(c->fragment); i++) {
+            if (c->fragment[i]) {
+                return false;
+            }
+        }
+        if (library) {
+            for (unsigned i = 0; i < sizeof(c->function); i++) {
+                if (c->function[i]) {
+                    return false;
+                }
+            }
+            return true;
+        }
+        return c->function[0] && memchr(c->function, 0, sizeof(c->function));
+    } else if (c->opcode == INFERNO_METAL_COMPUTE) {
         if (c->width > INFERNO_METAL_MAX_THREADS ||
             c->height > INFERNO_METAL_MAX_THREADS / c->width ||
             c->depth > INFERNO_METAL_MAX_THREADS / c->width / c->height) {

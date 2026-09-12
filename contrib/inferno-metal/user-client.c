@@ -90,7 +90,8 @@ static bool knownResult(uint32_t result)
 static uint32_t knownOpcodeMask(void)
 {
     return (1U << INFERNO_METAL_COMPUTE) | (1U << INFERNO_METAL_RENDER) |
-           (1U << INFERNO_METAL_CLEAR);
+           (1U << INFERNO_METAL_CLEAR) | (1U << INFERNO_METAL_QUERY_LIBRARY) |
+           (1U << INFERNO_METAL_QUERY_PIPELINE);
 }
 
 static IOReturn fetchCaps(io_connect_t connection, ImtlUserCaps *out)
@@ -117,6 +118,8 @@ static IOReturn fetchCaps(io_connect_t connection, ImtlUserCaps *out)
             get32(reply + INFERNO_METAL_USER_CAP_REQUEST_OFFSET),
     };
     uint32_t known_opcodes = knownOpcodeMask();
+    uint32_t query_opcodes = (1U << INFERNO_METAL_QUERY_LIBRARY) |
+                             (1U << INFERNO_METAL_QUERY_PIPELINE);
     if (caps.version != INFERNO_METAL_USER_VERSION ||
         get32(reply + INFERNO_METAL_USER_CAP_SIZE_OFFSET) != sizeof(reply) ||
         !caps.opcode_mask || (caps.opcode_mask & ~known_opcodes) ||
@@ -128,7 +131,10 @@ static IOReturn fetchCaps(io_connect_t connection, ImtlUserCaps *out)
         !caps.max_output_size ||
         caps.max_output_size > INFERNO_METAL_MAX_BUFFER ||
         caps.max_request_size < INFERNO_METAL_USER_SUBMIT_HEADER_SIZE ||
-        caps.max_request_size > INFERNO_METAL_USER_MAX_REQUEST) {
+        caps.max_request_size > INFERNO_METAL_USER_MAX_REQUEST ||
+        ((caps.opcode_mask & query_opcodes) &&
+         (caps.max_output_size < INFERNO_METAL_COMPILER_MIN_OUTPUT ||
+          caps.max_request_size < INFERNO_METAL_USER_SUBMIT_HEADER_SIZE + 1))) {
         return kIOReturnBadMessageID;
     }
     *out = caps;
@@ -182,6 +188,60 @@ static size_t nameSize(const char name[64])
     return end ? (size_t)(end - name) + 1 : 0;
 }
 
+static bool allZero(const void *bytes, size_t size)
+{
+    const uint8_t *p = bytes;
+
+    for (size_t i = 0; i < size; i++) {
+        if (p[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool validUtf8(const uint8_t *p, size_t size)
+{
+    size_t i = 0;
+
+    while (i < size) {
+        uint32_t value;
+        unsigned extra;
+
+        if (p[i] < 0x80) {
+            i++;
+            continue;
+        }
+        if (p[i] >= 0xc2 && p[i] <= 0xdf) {
+            value = p[i] & 0x1f;
+            extra = 1;
+        } else if (p[i] >= 0xe0 && p[i] <= 0xef) {
+            value = p[i] & 0x0f;
+            extra = 2;
+        } else if (p[i] >= 0xf0 && p[i] <= 0xf4) {
+            value = p[i] & 0x07;
+            extra = 3;
+        } else {
+            return false;
+        }
+        if (extra > size - i - 1) {
+            return false;
+        }
+        for (unsigned j = 1; j <= extra; j++) {
+            if ((p[i + j] & 0xc0) != 0x80) {
+                return false;
+            }
+            value = (value << 6) | (p[i + j] & 0x3f);
+        }
+        if ((extra == 2 && value < 0x800) || (extra == 3 && value < 0x10000) ||
+            (value >= 0xd800 && value <= 0xdfff) || value > 0x10ffff) {
+            return false;
+        }
+        i += extra + 1;
+    }
+    return true;
+}
+
 IOReturn imtl_user_client_submit(ImtlUserClient *client,
                                  const ImtlUserSubmit *request)
 {
@@ -189,7 +249,7 @@ IOReturn imtl_user_client_submit(ImtlUserClient *client,
         return kIOReturnBadArgument;
     }
     if (request->opcode < INFERNO_METAL_COMPUTE ||
-        request->opcode > INFERNO_METAL_CLEAR) {
+        request->opcode > INFERNO_METAL_QUERY_PIPELINE || request->options) {
         return kIOReturnBadArgument;
     }
     if (!(client->caps.opcode_mask & (1U << request->opcode)) ||
@@ -209,6 +269,21 @@ IOReturn imtl_user_client_submit(ImtlUserClient *client,
         request->input_size > SIZE_MAX - INFERNO_METAL_USER_SUBMIT_HEADER_SIZE -
                                   request->source_size) {
         return kIOReturnBadArgument;
+    }
+    if (request->opcode >= INFERNO_METAL_QUERY_LIBRARY) {
+        bool library = request->opcode == INFERNO_METAL_QUERY_LIBRARY;
+
+        if (!request->source_size || request->input_size ||
+            request->width != 1 || request->height != 1 ||
+            request->depth != 1 ||
+            request->output_size < INFERNO_METAL_COMPILER_MIN_OUTPUT ||
+            request->output_size > INFERNO_METAL_COMPILER_MAX_OUTPUT ||
+            !allZero(request->fragment, sizeof(request->fragment)) ||
+            (library ? !allZero(request->function, sizeof(request->function)) :
+                       !request->function[0]) ||
+            !validUtf8(request->source, request->source_size)) {
+            return kIOReturnBadArgument;
+        }
     }
     size_t packet_size = INFERNO_METAL_USER_SUBMIT_HEADER_SIZE +
                          request->source_size + request->input_size;
@@ -233,6 +308,7 @@ IOReturn imtl_user_client_submit(ImtlUserClient *client,
     put32(packet + INFERNO_METAL_USER_WIDTH_OFFSET, request->width);
     put32(packet + INFERNO_METAL_USER_HEIGHT_OFFSET, request->height);
     put32(packet + INFERNO_METAL_USER_DEPTH_OFFSET, request->depth);
+    put32(packet + INFERNO_METAL_USER_OPTIONS_OFFSET, request->options);
     memcpy(packet + INFERNO_METAL_USER_FUNCTION_OFFSET, request->function,
            function_size);
     memcpy(packet + INFERNO_METAL_USER_FRAGMENT_OFFSET, request->fragment,

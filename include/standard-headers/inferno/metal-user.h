@@ -20,8 +20,8 @@
 
 #include "metal.h"
 
-#define INFERNO_METAL_USER_VERSION 1U
-#define INFERNO_METAL_USER_SUBMIT_HEADER_SIZE 176U
+#define INFERNO_METAL_USER_VERSION 2U
+#define INFERNO_METAL_USER_SUBMIT_HEADER_SIZE 192U
 #define INFERNO_METAL_USER_CAPABILITIES_SIZE 32U
 #define INFERNO_METAL_USER_STATUS_SIZE 32U
 #define INFERNO_METAL_USER_INLINE_MAX 4096U
@@ -31,7 +31,7 @@
 
 /* Synchronous methods; GPU execution itself is asynchronous. Wire structures
  * are little endian and contain neither user pointers nor physical addresses.
- * Submit: [176-byte header][source_size bytes][input_size bytes].
+ * Submit: [192-byte header][source_size bytes][input_size bytes].
  * Read: one uint64 scalar byte offset, variable bounded structure output.
  * Capabilities/status: no input, fixed-size structure output. ACK/reset: none.
  */
@@ -61,7 +61,8 @@ enum {
 
 /* Offsets within the packed submission header. All fields are uint32 except
  * sequence (uint64), and the two zero-terminated 64-byte function names.
- * Flags and reserved are zero in version 1. No native C struct is the ABI.
+ * Flags, options and reserved are zero in version 2. No native C struct is the
+ * ABI.
  */
 enum {
     INFERNO_METAL_USER_VERSION_OFFSET = 0,
@@ -77,10 +78,13 @@ enum {
     INFERNO_METAL_USER_FRAGMENT_OFFSET = 104,
     INFERNO_METAL_USER_FLAGS_OFFSET = 168,
     INFERNO_METAL_USER_RESERVED_OFFSET = 172,
+    INFERNO_METAL_USER_OPTIONS_OFFSET = 176,
+    INFERNO_METAL_USER_V2_RESERVED_OFFSET = 180,
+    INFERNO_METAL_USER_V2_RESERVED_SIZE = 12,
 };
 
 /* Capabilities: eight uint32 fields, all little endian. Opcode mask uses
- * bit (1U << opcode). Flags are zero in version 1.
+ * bit (1U << opcode). Flags are zero in version 2.
  */
 enum {
     INFERNO_METAL_USER_CAP_VERSION_OFFSET = 0,

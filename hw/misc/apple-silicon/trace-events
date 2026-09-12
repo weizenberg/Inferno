@@ -72,3 +72,4 @@ inferno_metal_complete(uint64_t sequence, uint32_t error) "sequence=%" PRIu64 " 
 inferno_metal_error(uint64_t sequence, const char *message) "sequence=%" PRIu64 " %s"
 inferno_metal_backend_phase(uint64_t sequence, uint32_t opcode, const char *phase, int64_t elapsed_ns) "sequence=%" PRIu64 " opcode=%u phase=%s elapsed_ns=%" PRId64
 inferno_metal_pipeline_cache(uint64_t sequence, uint32_t opcode, bool hit, uint32_t entries) "sequence=%" PRIu64 " opcode=%u hit=%d entries=%u"
+inferno_metal_backend_query(uint64_t sequence, uint32_t opcode, uint32_t outcome, uint32_t phase) "sequence=%" PRIu64 " opcode=%u outcome=%u phase=%u"

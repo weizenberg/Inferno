@@ -31,6 +31,16 @@ static uint64_t get64(const uint8_t *p)
     return get32(p) | ((uint64_t)get32(p + 4) << 32);
 }
 
+static bool allZero(const uint8_t *p, size_t size)
+{
+    for (size_t i = 0; i < size; i++) {
+        if (p[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
 bool imtl_user_decode(const void *packet, size_t size, ImtlUserRequest *result)
 {
     if (!packet || !result || size < INFERNO_METAL_USER_SUBMIT_HEADER_SIZE ||
@@ -41,7 +51,9 @@ bool imtl_user_decode(const void *packet, size_t size, ImtlUserRequest *result)
     if (get32(p + INFERNO_METAL_USER_VERSION_OFFSET) !=
             INFERNO_METAL_USER_VERSION ||
         get32(p + INFERNO_METAL_USER_FLAGS_OFFSET) ||
-        get32(p + INFERNO_METAL_USER_RESERVED_OFFSET)) {
+        get32(p + INFERNO_METAL_USER_RESERVED_OFFSET) ||
+        !allZero(p + INFERNO_METAL_USER_V2_RESERVED_OFFSET,
+                 INFERNO_METAL_USER_V2_RESERVED_SIZE)) {
         return false;
     }
     ImtlUserRequest r = { 0 };
@@ -53,8 +65,9 @@ bool imtl_user_decode(const void *packet, size_t size, ImtlUserRequest *result)
     r.command.width = get32(p + INFERNO_METAL_USER_WIDTH_OFFSET);
     r.command.height = get32(p + INFERNO_METAL_USER_HEIGHT_OFFSET);
     r.command.depth = get32(p + INFERNO_METAL_USER_DEPTH_OFFSET);
+    r.command.options = get32(p + INFERNO_METAL_USER_OPTIONS_OFFSET);
     if (r.command.opcode < INFERNO_METAL_COMPUTE ||
-        r.command.opcode > INFERNO_METAL_CLEAR ||
+        r.command.opcode > INFERNO_METAL_QUERY_PIPELINE || r.command.options ||
         r.command.source_size > INFERNO_METAL_MAX_SOURCE ||
         r.command.input_size > INFERNO_METAL_MAX_BUFFER ||
         !r.command.output_size ||
@@ -77,6 +90,22 @@ bool imtl_user_decode(const void *packet, size_t size, ImtlUserRequest *result)
     }
     if (!function_end || !fragment_end) {
         return false;
+    }
+    if (r.command.opcode >= INFERNO_METAL_QUERY_LIBRARY) {
+        bool library = r.command.opcode == INFERNO_METAL_QUERY_LIBRARY;
+
+        if (!r.command.source_size || r.command.input_size ||
+            r.command.width != 1 || r.command.height != 1 ||
+            r.command.depth != 1 ||
+            r.command.output_size < INFERNO_METAL_COMPILER_MIN_OUTPUT ||
+            r.command.output_size > INFERNO_METAL_COMPILER_MAX_OUTPUT ||
+            !allZero((const uint8_t *)r.command.fragment,
+                     sizeof(r.command.fragment)) ||
+            (library ? !allZero((const uint8_t *)r.command.function,
+                                sizeof(r.command.function)) :
+                       !r.command.function[0])) {
+            return false;
+        }
     }
     r.source = r.command.source_size ?
                    p + INFERNO_METAL_USER_SUBMIT_HEADER_SIZE :
