@@ -606,6 +606,50 @@ static bool apple_dart_mirror_probe(AppleDARTDMAMirror *mirror, hwaddr addr,
     return true;
 }
 
+bool apple_dart_probe_iova(IOMMUMemoryRegion *iommu, hwaddr addr, hwaddr *pa,
+                           AddressSpace **target_as)
+{
+    AppleDARTIOMMUMemoryRegion *wrapper =
+        container_of(iommu, AppleDARTIOMMUMemoryRegion, iommu);
+    AppleDARTMapperInstance *mapper = wrapper->mapper;
+    AppleDARTState *dart = mapper->common.dart;
+    IOMMUTLBEntry entry = {
+        .target_as = dart->target_as,
+        .iova = addr,
+        .addr_mask = dart->page_bits,
+        .perm = IOMMU_NONE,
+    };
+    uint32_t sid;
+
+    if (REG_FIELD_EX32(qatomic_read(&mapper->regs.tlb_op), DART_TLB_OP, BUSY)) {
+        return false;
+    }
+
+    QEMU_LOCK_GUARD(&mapper->common.mutex);
+
+    sid = mapper->regs.sid_remap[wrapper->sid];
+
+    if (REG_FIELD_EX32(mapper->regs.sid_config[sid], DART_SID_CONFIG,
+                       TRANSLATION_ENABLE) == 0 ||
+        REG_FIELD_EX32(mapper->regs.sid_config[sid], DART_SID_CONFIG,
+                       FULL_BYPASS) != 0) {
+        return false;
+    }
+
+    if (apple_dart_mapper_ptw(mapper, sid, addr >> dart->page_shift,
+                              &entry) != 0) {
+        return false;
+    }
+
+    if ((entry.perm & IOMMU_RO) == 0) {
+        return false;
+    }
+
+    *pa = entry.translated_addr | (addr & dart->page_bits);
+    *target_as = dart->target_as;
+    return true;
+}
+
 /*
  * Re-evaluate the whole window and make the installed set match it.
  *

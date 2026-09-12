@@ -412,6 +412,13 @@ AppleDTNode *apple_boot_load_dt_file(const char *filename);
 #define APPLE_BOOT_KEEP_WLAN (1U << 0)
 #define APPLE_BOOT_KEEP_AMFM (1U << 1)
 
+/*
+ * Set by the machine before kernel patching / DT population. When false,
+ * the hactivation kernel patch is skipped and the "allow-hactivation"
+ * DeviceTree property is omitted.
+ */
+extern bool allow_hactivation;
+
 void apple_boot_populate_dt(AppleDTNode *root, AppleBootInfo *info,
                             bool auto_boot, uint32_t keep_flags);
 

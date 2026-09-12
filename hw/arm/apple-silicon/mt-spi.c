@@ -95,6 +95,9 @@ struct AppleMTSPIState {
     int16_t prev_x;
     int16_t prev_y;
     uint64_t prev_ts;
+    uint64_t prev_motion_ts; /* last report with nonzero x/y delta */
+    uint64_t report_ts;
+    uint8_t touch_frames;
     int32_t btn_state;
     int32_t prev_btn_state;
     uint32_t display_width;
@@ -125,6 +128,9 @@ static const VMStateDescription vmstate_apple_mt_spi = {
             VMSTATE_INT16(prev_x, AppleMTSPIState),
             VMSTATE_INT16(prev_y, AppleMTSPIState),
             VMSTATE_UINT64(prev_ts, AppleMTSPIState),
+            VMSTATE_UINT64(prev_motion_ts, AppleMTSPIState),
+            VMSTATE_UINT64(report_ts, AppleMTSPIState),
+            VMSTATE_UINT8(touch_frames, AppleMTSPIState),
             VMSTATE_INT32(btn_state, AppleMTSPIState),
             VMSTATE_INT32(prev_btn_state, AppleMTSPIState),
             VMSTATE_UINT32(display_width, AppleMTSPIState),
@@ -806,6 +812,17 @@ static uint32_t apple_mt_spi_transfer(SSIPeripheral *dev, uint32_t val)
     return ret;
 }
 
+static unsigned apple_mt_spi_pending_count(AppleMTSPIState *s)
+{
+    AppleMTSPILLPacket *p;
+    unsigned queued = 0;
+
+    QTAILQ_FOREACH (p, &s->pending_fw, next) {
+        queued++;
+    }
+    return queued;
+}
+
 static void apple_mt_spi_send_path_update(AppleMTSPIState *s, uint64_t ts,
                                           uint8_t path_stage)
 {
@@ -818,24 +835,33 @@ static void apple_mt_spi_send_path_update(AppleMTSPIState *s, uint64_t ts,
 
     packet = g_new0(AppleMTSPILLPacket, 1);
 
-    ts_delta = ts - s->prev_ts;
-    ts_delta = MAX(ts_delta, 1); // Prevent div-by-zero
-    s->prev_ts = ts;
-
     x_delta = s->x - s->prev_x;
     y_delta = s->y - s->prev_y;
     /*
-     * Sensor units per second. ts_delta is nanoseconds, so the obvious
-     * `ABS(delta) / ts_delta * 1000` divides first by a number in the millions
-     * and reports zero for every real gesture -- traced across a 350 ms swipe
-     * covering two thirds of the surface, every packet carried vel (0,0). Scale
-     * before dividing, in 64-bit, and clamp: a full-height flick is around
-     * 40000 units/s, which fits, but nothing stops a faster one overflowing.
+     * Velocity must use the time since the last *motion* sample, not the last
+     * report. The 120 Hz idle TOUCHING timer advances prev_ts every ~8 ms with
+     * zero delta; a following mouse step then looked like it happened in 1-8 ms
+     * and every home-swipe sample hit the vel cap (traced y_vel=50000). DHML
+     * rejects that as non-physical and go-home never commits.
      */
-    x_vel = MIN((uint64_t)ABS(x_delta) * NANOSECONDS_PER_SECOND / ts_delta,
-                UINT16_MAX);
-    y_vel = MIN((uint64_t)ABS(y_delta) * NANOSECONDS_PER_SECOND / ts_delta,
-                UINT16_MAX);
+    if (x_delta != 0 || y_delta != 0) {
+        ts_delta = ts - s->prev_motion_ts;
+        ts_delta = MAX(ts_delta, SCALE_MS);
+        x_vel = MIN((uint64_t)ABS(x_delta) * NANOSECONDS_PER_SECOND / ts_delta,
+                    50000);
+        y_vel = MIN((uint64_t)ABS(y_delta) * NANOSECONDS_PER_SECOND / ts_delta,
+                    50000);
+        s->prev_motion_ts = ts;
+    } else {
+        x_vel = 0;
+        y_vel = 0;
+        if (path_stage == PATH_STAGE_MAKE_TOUCH || s->prev_motion_ts == 0) {
+            s->prev_motion_ts = ts;
+        }
+    }
+    s->prev_ts = ts;
+    s->prev_x = s->x;
+    s->prev_y = s->y;
 
     packet->type = LL_PACKET_LOSSLESS_OUTPUT;
     apple_mt_spi_buf_ensure_capacity(&packet->buf, 9 + 27 + 20 + 2);
@@ -845,7 +871,19 @@ static void apple_mt_spi_send_path_update(AppleMTSPIState *s, uint64_t ts,
     apple_mt_spi_buf_push_byte(&packet->buf, s->frame);
     apple_mt_spi_buf_push_byte(&packet->buf, 28); // Header Len
     apple_mt_spi_buf_push_byte(&packet->buf, 0);
-    apple_mt_spi_buf_push_dword(&packet->buf, ts / SCALE_MS);
+    /*
+     * Report timestamps must be strictly monotonic: the guest derives the
+     * frame interval from them (extractHandMotion errors out with
+     * "Frame interval is zero" and kills its velocity estimate otherwise),
+     * and bottom-half batching can stamp two reports with the same virtual
+     * clock value. Clamp each report at least 1 ms past the previous one.
+     */
+    if (path_stage == PATH_STAGE_MAKE_TOUCH || ts > s->report_ts) {
+        s->report_ts = ts;
+    } else {
+        s->report_ts += SCALE_MS;
+    }
+    apple_mt_spi_buf_push_dword(&packet->buf, s->report_ts / SCALE_MS);
     apple_mt_spi_buf_push_byte(&packet->buf, 0);
     apple_mt_spi_buf_push_byte(&packet->buf, 0);
     apple_mt_spi_buf_push_byte(&packet->buf, 0);
@@ -885,8 +923,44 @@ static void apple_mt_spi_send_path_update(AppleMTSPIState *s, uint64_t ts,
     // angle = 19317;
     // angle = 90;
     apple_mt_spi_buf_push_word(&packet->buf, 19317); // angle/orientation
-    apple_mt_spi_buf_push_word(&packet->buf,
-                               100); // rad multiplier (maybe force?)
+    /*
+     * The "rad multiplier" slot is read by the guest as the digitizer
+     * pressure (Z) signal: MultitouchHID's DHML computes ZInstability from
+     * it and refuses to validate a slide while it is flat, which keeps
+     * every path in Hover with its motion ignored (proven by probing: only
+     * a varying multiplier moved ZInstability off 0.000000). Model a real
+     * press: ramp up smoothly over the first frames after contact, then
+     * breathe slowly, ease off at release. Abrupt 0-to-90 jumps read as
+     * noise (ZInstability 0.7+), so keep every step small.
+     */
+    static const int8_t pressure_wave[16] = { 0, 3, 6, 7, 8, 7, 6, 3,
+                                             0, -3, -6, -7, -8, -7, -6, -3 };
+    static const uint8_t pressure_ramp[6] = { 40, 55, 70, 82, 92, 98 };
+    uint16_t pressure;
+    if (path_stage == PATH_STAGE_MAKE_TOUCH) {
+        s->touch_frames = 0;
+    } else if (s->touch_frames < 0xFF) {
+        s->touch_frames++;
+    }
+    switch (path_stage) {
+    case PATH_STAGE_MAKE_TOUCH:
+        pressure = pressure_ramp[0];
+        break;
+    case PATH_STAGE_TOUCHING:
+        if (s->touch_frames < ARRAY_SIZE(pressure_ramp)) {
+            pressure = pressure_ramp[s->touch_frames];
+        } else {
+            pressure = 100 + pressure_wave[s->frame % 16];
+        }
+        break;
+    case PATH_STAGE_BREAK_TOUCH:
+        pressure = 70;
+        break;
+    default:
+        pressure = 0;
+        break;
+    }
+    apple_mt_spi_buf_push_word(&packet->buf, pressure);
     // let iOS calculate the contact density by itself
     // rad0 = max(maximum_radii, rad0)
     // rad1 = max(maximum_radii, rad1)
@@ -904,16 +978,8 @@ static void apple_mt_spi_send_path_update(AppleMTSPIState *s, uint64_t ts,
     }
 
     QTAILQ_INSERT_TAIL(&s->pending_fw, packet, next);
-    {
-        AppleMTSPILLPacket *p;
-        unsigned queued = 0;
-
-        QTAILQ_FOREACH (p, &s->pending_fw, next) {
-            queued++;
-        }
-        trace_apple_mt_spi_path(path_stage, s->x, s->y, x_vel, y_vel,
-                                ts / SCALE_MS, queued);
-    }
+    trace_apple_mt_spi_path(path_stage, s->x, s->y, x_vel, y_vel,
+                            ts / SCALE_MS, apple_mt_spi_pending_count(s));
     qemu_irq_lower(s->irq);
 }
 
@@ -958,13 +1024,25 @@ static void apple_mt_spi_timer_tick(void *opaque)
 
     QEMU_LOCK_GUARD(&s->lock);
 
-    if (s->prev_x != s->x || s->prev_y != s->y) {
-        apple_mt_spi_schedule_touch_update(s, PATH_STAGE_TOUCHING);
-    }
-
+    /*
+     * A real digitizer samples continuously and keeps reporting while the
+     * finger is down, even when stationary; going silent between moves
+     * reads as a dead contact to the guest's hand-motion classifier.
+     * ~120 Hz, matching real hardware.
+     *
+     * Under HVF the SPI drain cannot keep up with an unthrottled 120 Hz
+     * stream — path reports pile up (traced at 40+ queued during a single
+     * unlock end_dwell) and later taps arrive at the guest as a stale
+     * backlog. Cap the queue: skip this sample if the guest is behind,
+     * but keep the timer alive so we resume as soon as it catches up.
+     */
     if (s->btn_state & MOUSE_EVENT_LBUTTON) {
+        if (apple_mt_spi_pending_count(s) < 8) {
+            apple_mt_spi_send_path_update(
+                s, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL), PATH_STAGE_TOUCHING);
+        }
         timer_mod(s->timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
-                                NANOSECONDS_PER_SECOND / 20);
+                                NANOSECONDS_PER_SECOND / 120);
     }
 }
 
@@ -974,9 +1052,11 @@ static void apple_mt_spi_end_timer_tick(void *opaque)
 
     QEMU_LOCK_GUARD(&s->lock);
 
-    apple_mt_spi_schedule_touch_update(s, PATH_STAGE_OUT_OF_RANGE);
+    apple_mt_spi_send_path_update(s, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL),
+                                  PATH_STAGE_OUT_OF_RANGE);
 
     s->prev_ts = 0;
+    s->prev_motion_ts = 0;
     s->prev_x = 0;
     s->prev_y = 0;
 }
@@ -1005,24 +1085,49 @@ static void apple_mt_spi_mouse_event(void *opaque, int dx, int dy, int dz,
     //         s->display_height, s->display_width);
     s->y -= qemu_input_scale_axis(16, 0, s->display_height, 0,
                                   MT_SENSOR_SURFACE_HEIGHT);
+    /*
+     * Touches starting within the bottom calibration band would underflow
+     * the sensor Y coordinate (the report is consumed as unsigned, so a
+     * small negative reads as ~65k = far off-surface) and edge gestures
+     * like swipe-up-to-go-home die at the first contact. Clamp to the
+     * surface instead: a real digitizer reports edge contacts at the edge.
+     */
+    if (s->y < 0) {
+        s->y = 0;
+    }
     s->prev_btn_state = s->btn_state;
     s->btn_state = buttons_state;
     trace_apple_mt_spi_mouse(dx, dy, s->x, s->y, buttons_state);
 
     if ((s->prev_btn_state & MOUSE_EVENT_LBUTTON) == 0 &&
         (s->btn_state & MOUSE_EVENT_LBUTTON) != 0) {
-        apple_mt_spi_schedule_touch_update(s, PATH_STAGE_MAKE_TOUCH);
+        /*
+         * Emit synchronously under the lock. aio_bh deferred reports lose
+         * intermediate samples when QMP/cocoa delivers several moves before
+         * the BH runs, which collapses a swipe into one huge jump and
+         * saturates uint16 velocity — home-from-app then never commits.
+         */
+        apple_mt_spi_send_path_update(s, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL),
+                                      PATH_STAGE_MAKE_TOUCH);
 
         timer_del(s->end_timer);
         timer_mod(s->timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
-                                NANOSECONDS_PER_SECOND / 10);
+                                NANOSECONDS_PER_SECOND / 120);
     } else if ((s->prev_btn_state & MOUSE_EVENT_LBUTTON) != 0 &&
                (s->btn_state & MOUSE_EVENT_LBUTTON) == 0) {
-        apple_mt_spi_schedule_touch_update(s, PATH_STAGE_BREAK_TOUCH);
+        apple_mt_spi_send_path_update(s, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL),
+                                      PATH_STAGE_BREAK_TOUCH);
 
         timer_del(s->timer);
         timer_mod(s->end_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
                                     NANOSECONDS_PER_SECOND / 10);
+    } else if ((s->btn_state & MOUSE_EVENT_LBUTTON) != 0 &&
+               (s->x != s->prev_x || s->y != s->prev_y)) {
+        /* Finger moved: sample now, then keep the 120 Hz idle stream. */
+        apple_mt_spi_send_path_update(s, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL),
+                                      PATH_STAGE_TOUCHING);
+        timer_mod(s->timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                                NANOSECONDS_PER_SECOND / 120);
     }
 }
 static void apple_mt_spi_realize(SSIPeripheral *dev, Error **errp)
@@ -1060,6 +1165,7 @@ static void apple_mt_spi_reset_enter(Object *obj, ResetType type)
     s->x = 0;
     s->y = 0;
     s->prev_ts = 0;
+    s->prev_motion_ts = 0;
     s->frame = 0;
 
     apple_mt_spi_buf_free(&s->tx);

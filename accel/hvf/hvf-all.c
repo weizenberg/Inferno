@@ -36,8 +36,9 @@ void hvf_enable_sprr_compat(void)
     /*
      * Hypervisor.framework does not expose Apple private SPRR accesses as
      * system-register exits. Run executable pages through a one-time
-     * compatibility pass so target/arm can replace the EL0 permission write
-     * that HVF cannot execute. This only changes transient guest RAM.
+     * compatibility pass so target/arm can replace the EL0 permission
+     * accesses that HVF cannot execute. This only changes transient guest
+     * RAM.
      */
     hvf_state->sprr_compat = true;
 }
@@ -120,14 +121,19 @@ static int do_hvf_set_memory(hvf_slot *slot, hv_memory_flags_t flags)
 bool hvf_sprr_exec_fault(hwaddr physical_address, bool patch_sprr)
 {
     const uint32_t sprr_el0br0_write = 0xd51ef1a0;
-    const uint32_t sysreg_write_mask = 0xffffffe0;
+    const uint32_t sprr_el0br0_read = 0xd53ef1a0;
+    const uint32_t sysreg_access_mask = 0xffffffe0;
+    const uint32_t ldr_x_unsigned = 0xf9400000;
+    const uint32_t ldr_x_unsigned_mask = 0xffc00000;
+    const uint32_t mov_reg = 0xaa0003e0;
     const uint32_t nop = 0xd503201f;
     size_t page_size = qemu_real_host_page_size();
     hwaddr page = QEMU_ALIGN_DOWN(physical_address, page_size);
     hvf_slot *slot = hvf_find_overlap_slot(page, page_size);
     size_t page_index;
     uint8_t *host_page;
-    unsigned int patched = 0;
+    unsigned int patched_reads = 0;
+    unsigned int patched_writes = 0;
     hv_return_t ret;
 
     if (!slot || !(slot->flags & HVF_SLOT_SPRR_EXEC) ||
@@ -145,19 +151,45 @@ bool hvf_sprr_exec_fault(hwaddr physical_address, bool patch_sprr)
     if (patch_sprr) {
         for (size_t offset = 0; offset < page_size; offset += sizeof(uint32_t)) {
             uint32_t *insn = (uint32_t *)(host_page + offset);
+            uint32_t value = ldl_le_p(insn);
 
-            if ((ldl_le_p(insn) & sysreg_write_mask) ==
+            if ((value & sysreg_access_mask) ==
                 sprr_el0br0_write) {
                 stl_le_p(insn, nop);
-                patched++;
+                patched_writes++;
+            } else if ((value & sysreg_access_mask) ==
+                       sprr_el0br0_read) {
+                /*
+                 * libsystem_pthread loads the expected SPRR mode from the
+                 * commpage immediately before reading the hardware register,
+                 * then validates the readback. Since HVF does not enforce
+                 * SPRR, report that expected mode and let the helper complete
+                 * without taking its deliberate BRK failure path.
+                 */
+                uint32_t previous = offset >= sizeof(uint32_t) ?
+                    ldl_le_p(host_page + offset - sizeof(uint32_t)) : 0;
+
+                if ((previous & ldr_x_unsigned_mask) == ldr_x_unsigned) {
+                    uint32_t source = previous & 0x1f;
+                    uint32_t destination = value & 0x1f;
+
+                    stl_le_p(insn, mov_reg | (source << 16) | destination);
+                    patched_reads++;
+                } else {
+                    warn_report("HVF: unsupported SPRR read sequence in "
+                                "executable guest page 0x%" HWADDR_PRIx
+                                " offset 0x%zx", page, offset);
+                }
             }
         }
-        if (patched) {
+        if (patched_reads || patched_writes) {
             flush_idcache_range((uintptr_t)host_page,
                                 (uintptr_t)host_page, page_size);
-            info_report("HVF: replaced %u unsupported SPRR write%s in "
-                        "executable guest page 0x%" HWADDR_PRIx,
-                        patched, patched == 1 ? "" : "s", page);
+            info_report("HVF: replaced %u unsupported SPRR read%s and %u "
+                        "write%s in executable guest page 0x%" HWADDR_PRIx,
+                        patched_reads, patched_reads == 1 ? "" : "s",
+                        patched_writes, patched_writes == 1 ? "" : "s",
+                        page);
         }
     }
 

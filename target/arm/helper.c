@@ -23,6 +23,7 @@
 #include "system/cpu-timers.h"
 #include "exec/icount.h"
 #include "system/kvm.h"
+#include "system/hvf.h"
 #include "system/tcg.h"
 #include "qapi/error.h"
 #include "qemu/guest-random.h"
@@ -5181,7 +5182,14 @@ static void pauth_write_lo(CPUARMState *env, const ARMCPRegInfo *ri,
                            uint64_t value)
 {
     assert(ri->fieldoffset);
-    if (env->cp15.apctl_el1 & APCTL_AppleMode) {
+    /*
+     * AppleMode: architected key regs are written as "logical" values and the
+     * CPU XORs the per-boot M-key into the PAC unit. TCG emulates that here.
+     * Under HVF the guest MSR of APIAKEY* is handled by the hypervisor without
+     * AppleMode, so the value that lands in HW is the raw write -- skip the
+     * XOR so QEMU shadow matches what host PAC actually uses.
+     */
+    if (tcg_enabled() && (env->cp15.apctl_el1 & APCTL_AppleMode)) {
         value ^= env->keys.m.lo;
     }
     CPREG_FIELD64(env, ri) = value;
@@ -5191,7 +5199,7 @@ static void pauth_write_hi(CPUARMState *env, const ARMCPRegInfo *ri,
                            uint64_t value)
 {
     assert(ri->fieldoffset);
-    if (env->cp15.apctl_el1 & APCTL_AppleMode) {
+    if (tcg_enabled() && (env->cp15.apctl_el1 & APCTL_AppleMode)) {
         value ^= env->keys.m.hi;
     }
     CPREG_FIELD64(env, ri) = value;
@@ -5203,6 +5211,16 @@ static void apctl_write(CPUARMState *env, const ARMCPRegInfo *ri,
     assert(ri->fieldoffset);
     value &= ~APCTL_MKEYVld;
     value |= CPREG_FIELD64(env, ri) & APCTL_MKEYVld;
+    /*
+     * HVF has no per-EL key diversification: host PAC always uses the key
+     * registers as written. KernKeyEn would make EL1 PAC use APIAKEY^KERNELKEY
+     * on real silicon while EL0 uses APIAKEY alone -- without trapping ERET we
+     * cannot switch keys on EL transitions. Clear KernKeyEn so both ELs use
+     * the same HW keys (the ones the guest programs into APIAKEY*).
+     */
+    if (hvf_enabled()) {
+        value &= ~APCTL_KernKeyEn;
+    }
     CPREG_FIELD64(env, ri) = value;
 }
 

@@ -794,16 +794,16 @@ int hvf_arch_put_registers(CPUState *cpu)
             arm_feature(env, ARM_FEATURE_GXF) &&
             arm_cpu->prop_hvf_pauth_noop) {
             /*
-             * Force PAC off, mirroring what TCG already does.
+             * Force all PAC enables off on AP (hvf-pauth-noop=true, default).
              *
-             * `pauth-noop` makes every PAC and AUT instruction a no-op under TCG,
-             * so the guest never really authenticates a pointer. HVF runs the
-             * host's IMPDEF PAC for real (ID_AA64ISAR1_EL1.API = 0x5 here, so
-             * FPAC too) while Apple's key management -- APCTL_EL1,
-             * KERNELKEY_LO/HI, the per-boot M-key XOR -- lives only in QEMU's
-             * shadow state and never reaches the hardware. Clearing the SCTLR
-             * enables is the architected way to make PAC and AUT pass pointers
-             * through unchanged, which is what TCG effectively does.
+             * Measured: leaving EnIA/EnDA on (A-key only) still stalls early
+             * AP boot (~120 serial lines); full host PAC stalls the same way.
+             * Kernel PAC is not only B-key. SEP sets hvf-pauth-noop=false and
+             * runs full native PAC with HVF key-register sync.
+             *
+             * SCTLR MSRs are not trapped; hvf_force_pauth_noop() re-applies
+             * this mask every re-entry. AppleMode XOR is skipped under HVF
+             * (helper.c) so when PAC is on, shadow keys match HW.
              */
             val &= ~((uint64_t)(SCTLR_EnIA | SCTLR_EnIB |
                                 SCTLR_EnDA | SCTLR_EnDB));
@@ -830,6 +830,33 @@ static void flush_cpu_state(CPUState *cpu)
         hvf_arch_put_registers(cpu);
         cpu->vcpu_dirty = false;
     }
+}
+
+/*
+ * Re-clear all SCTLR PAC enables if the guest re-enabled them mid-quantum.
+ * Required for AP boot stability (see put_registers). SEP: prop false.
+ */
+static void hvf_force_pauth_noop(CPUState *cpu)
+{
+    ARMCPU *arm_cpu = ARM_CPU(cpu);
+    hv_return_t ret;
+    uint64_t sctlr;
+    const uint64_t pac_en =
+        (uint64_t)(SCTLR_EnIA | SCTLR_EnIB | SCTLR_EnDA | SCTLR_EnDB);
+
+    if (!arm_feature(&arm_cpu->env, ARM_FEATURE_GXF) ||
+        !arm_cpu->prop_hvf_pauth_noop) {
+        return;
+    }
+
+    ret = hv_vcpu_get_sys_reg(cpu->accel->fd, HV_SYS_REG_SCTLR_EL1, &sctlr);
+    assert_hvf_ok(ret);
+    if (!(sctlr & pac_en)) {
+        return;
+    }
+    sctlr &= ~pac_en;
+    ret = hv_vcpu_set_sys_reg(cpu->accel->fd, HV_SYS_REG_SCTLR_EL1, sctlr);
+    assert_hvf_ok(ret);
 }
 
 /* Must be called by the owning thread */
@@ -1157,6 +1184,27 @@ int hvf_arch_init_vcpu(CPUState *cpu)
     ret = hv_vcpu_set_sys_reg(cpu->accel->fd, HV_SYS_REG_ID_AA64MMFR0_EL1,
                               arm_cpu->isar.idregs[ID_AA64MMFR0_EL1_IDX]);
     assert_hvf_ok(ret);
+
+    /*
+     * Optional: hide FEAT_PAuth when forcing PAC off, so the guest is less
+     * likely to enable user PAC mid-quantum (still not a full fix for
+     * arm64e userspace which needs real A-key PAC).
+     */
+    if (arm_feature(env, ARM_FEATURE_GXF) && arm_cpu->prop_hvf_pauth_noop) {
+        uint64_t isar1;
+
+        ret = hv_vcpu_get_sys_reg(cpu->accel->fd, HV_SYS_REG_ID_AA64ISAR1_EL1,
+                                  &isar1);
+        assert_hvf_ok(ret);
+        isar1 = REG_FIELD_DP64(isar1, ID_AA64ISAR1, APA, 0);
+        isar1 = REG_FIELD_DP64(isar1, ID_AA64ISAR1, API, 0);
+        isar1 = REG_FIELD_DP64(isar1, ID_AA64ISAR1, GPA, 0);
+        isar1 = REG_FIELD_DP64(isar1, ID_AA64ISAR1, GPI, 0);
+        ret = hv_vcpu_set_sys_reg(cpu->accel->fd, HV_SYS_REG_ID_AA64ISAR1_EL1,
+                                  isar1);
+        assert_hvf_ok(ret);
+        SET_IDREG(&arm_cpu->isar, ID_AA64ISAR1, isar1);
+    }
 
     return 0;
 }
@@ -2356,9 +2404,11 @@ static int hvf_handle_exception(CPUState *cpu, hv_vcpu_exit_exception_t *excp)
          *
          * Apple machines initially map executable RAM without stage-2 execute
          * permission. On the first fetch from each page, scan EL0 pages for
-         * the exact unsupported write and replace it with a NOP before making
-         * that transient RAM page executable. HVF does not enforce SPRR
-         * permissions, so a NOP accurately preserves its effective behavior.
+         * the exact unsupported accesses before making that transient RAM
+         * page executable. Writes become NOPs and reads return the expected
+         * commpage mode loaded by libsystem_pthread. HVF does not enforce SPRR
+         * permissions, so this accurately preserves its effective behavior
+         * while satisfying the helper's readback validation.
          */
         r = hv_vcpu_get_reg(cpu->accel->fd, HV_REG_CPSR, &cpsr);
         assert_hvf_ok(r);
@@ -2446,6 +2496,9 @@ int hvf_arch_vcpu_exec(CPUState *cpu)
             hvf_inject_interrupts(cpu)) {
             return EXCP_INTERRUPT;
         }
+
+        /* Re-clear SCTLR PAC enables when hvf-pauth-noop (AP default). */
+        hvf_force_pauth_noop(cpu);
 
         bql_unlock();
         cpu_exec_start(cpu);

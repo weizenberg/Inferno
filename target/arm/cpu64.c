@@ -539,6 +539,11 @@ static Property arm_cpu_pauth_qarma5_property =
     DEFINE_PROP_BOOL("pauth-qarma5", ARMCPU, prop_pauth_qarma5, false);
 static Property arm_cpu_pauth_noop_property =
     DEFINE_PROP_BOOL("pauth-noop", ARMCPU, prop_pauth_noop, true);
+/*
+ * Default true for Apple AP: clear SCTLR PAC enables (boot stability).
+ * SEP sets false for full native PAC. Measured: A-key-only and full PAC
+ * both stall early AP boot (~120 serial lines).
+ */
 static Property arm_cpu_hvf_pauth_noop_property =
     DEFINE_PROP_BOOL("hvf-pauth-noop", ARMCPU, prop_hvf_pauth_noop, true);
 
@@ -775,11 +780,8 @@ static void aarch64_apple_gxf_initfn(Object *obj)
     set_feature(&ARM_CPU(obj)->env, ARM_FEATURE_GXF);
 
     /*
-     * Under HVF the host runs PAC for real, so pauth-noop cannot be had from
-     * the ID registers; hvf_arch_put_registers() clears the SCTLR_EL1 PAC
-     * enables instead. Registered here rather than in
-     * aarch64_add_pauth_properties() so that only the Apple CPUs are affected
-     * -- a plain HVF guest on -cpu host must keep its PAC.
+     * Apple CPUs only: hvf-pauth-noop (default true). AP needs SCTLR PAC
+     * clear for boot; SEP sets false for full native PAC. Not for -cpu host.
      */
     qdev_property_add_static(DEVICE(obj), &arm_cpu_hvf_pauth_noop_property);
 }

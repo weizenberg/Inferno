@@ -32,6 +32,8 @@
 #include "lzfse.h"
 #include "lzss.h"
 
+bool allow_hactivation = true;
+
 #if 0
 #define DINFO(fmt, ...) info_report(fmt, ##__VA_ARGS__)
 #else
@@ -620,7 +622,9 @@ void apple_boot_populate_dt(AppleDTNode *root, AppleBootInfo *info,
 
     child = apple_dt_get_node(root, "product");
     assert_nonnull(child);
-    apple_dt_set_prop_u32(child, "allow-hactivation", 1);
+    if (allow_hactivation) {
+        apple_dt_set_prop_u32(child, "allow-hactivation", 1);
+    }
 
     apple_boot_init_mem_ranges(root);
 

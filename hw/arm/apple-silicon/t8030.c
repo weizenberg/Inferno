@@ -76,6 +76,32 @@
 #include "system/system.h"
 #include "arm-powerctl.h"
 
+static uint64_t t8030_ecid_dt_from_env(AppleT8030MachineState *t8030)
+{
+    /* Optional override for the DeviceTree unique-chip-id without touching
+     * the SoC fuse ECID: INFERNO_ECID_DT=0x... makes XNU/MobileGestalt report
+     * a different ECID than the one the SEP/fuses use. */
+    const char *e = getenv("INFERNO_ECID_DT");
+    uint64_t v = 0;
+    if (e != NULL && *e != '\0') {
+        v = strtoull(e, NULL, 0);
+    }
+    return v ? v : t8030->ecid;
+}
+
+static uint64_t t8030_ecid_fuse_from_env(AppleT8030MachineState *t8030)
+{
+    /* Optional override for the SoC fuse ECID (what the SEPROM reads) without
+     * changing the DeviceTree unique-chip-id: INFERNO_ECID_FUSE=0x.... */
+    const char *e = getenv("INFERNO_ECID_FUSE");
+    uint64_t v = 0;
+    if (e != NULL && *e != '\0') {
+        v = strtoull(e, NULL, 0);
+    }
+    return v ? v : t8030->ecid;
+}
+
+
 #define PROP_VISIT_GETTER_SETTER(_type, _name)                               \
     static void t8030_get_##_name(Object *obj, Visitor *v, const char *name, \
                                   void *opaque, Error **errp)                \
@@ -391,6 +417,45 @@ static void t8030_load_kernelcache(AppleT8030MachineState *t8030,
                        t8030->sep_fw_filename);
             return;
         }
+        /*
+         * SIK (Silicon Identity Key) support for device activation: the
+         * SEPFW AppleKeyStore "osc" handler fails because the
+         * "sep sub ca key" object only exists in factory-provisioned xART
+         * stores. SEPFW has a development override: when config word
+         * 0x438F has v1 == 1 and its flag byte set, it signs the SIK
+         * certificate with the built-in dev key instead. The config
+         * records are {u32 id; u64 v1..v4; u8 flag} and sit in the SEPFW
+         * image data; the XPRT query that would overwrite them at boot is
+         * not handled on this emulator, so injected values persist. Patch
+         * the record(s) in memory only -- the firmware file on disk stays
+         * pristine.
+         */
+        for (gsize i = 0; i + 48 <= sep->sep_fw_size; i++) {
+            uint8_t *rec = (uint8_t *)sep->fw_data + i;
+            if (rec[0] != 0x8F || rec[1] != 0x43 || rec[2] != 0 ||
+                rec[3] != 0) {
+                continue;
+            }
+            bool zeroed = true;
+            for (int j = 4; j < 48; j++) {
+                if (rec[j] != 0) {
+                    zeroed = false;
+                    break;
+                }
+            }
+            if (zeroed) {
+                /*
+                 * Only the "pass" image's copy (the SIK handler's image).
+                 * Overriding the "scrd" image's copy (which sorts earlier
+                 * in the file) panics SEPOS during INIT/BOOT.
+                 *
+                 * DISABLED: even a v1-only write to this region panics
+                 * SEPOS at INIT/BOOT (0x137aa), so the area is either
+                 * integrity-checked at load or not the real config table.
+                 */
+                continue;
+            }
+        }
     }
 
     // Kernel boot args
@@ -522,7 +587,9 @@ static void t8030_memory_setup(AppleT8030MachineState *t8030)
                          MEMTXATTRS_UNSPECIFIED, (uint8_t *)seprom, fsize,
                          true);
 
-        g_free(seprom);
+        /* Keep the patched image so a later SEP reset can restore it: the
+         * guest may have reused the region as ordinary RAM by then. */
+        apple_sep_set_seprom_blob((uint8_t *)seprom, fsize);
     }
 
     nvram =
@@ -783,9 +850,9 @@ static uint64_t pmgr_unk_reg_read(void *opaque, hwaddr addr, unsigned size)
         return ((t8030->chip_revision & 0x7) << 6) |
                (((t8030->chip_revision & 0x70) >> 4) << 5) | (0 << 1);
     case 0x3D2BC300: // ECID LOW T8030
-        return extract64(t8030->ecid, 0, 32);
+        return extract64(t8030_ecid_fuse_from_env(t8030), 0, 32);
     case 0x3D2BC304: // ECID HIGH T8030
-        return extract64(t8030->ecid, 32, 32);
+        return extract64(t8030_ecid_fuse_from_env(t8030), 32, 32);
     case 0x3D2BC30C: {
         // T8030 SEP Chip Revision
         //  1 vs. not 1: TRNG/Monitor
@@ -2312,6 +2379,7 @@ static void t8030_create_sep(AppleT8030MachineState *t8030)
                               A13_MAX_CPU, true, chip_id);
     assert_nonnull(sep);
     sep->dma_target_as = sep_dma_as;
+    sep->iommu_mr = sep_iommu_mr;
 
     object_property_add_child(OBJECT(t8030), "sep", OBJECT(sep));
 
@@ -2883,6 +2951,8 @@ static bool t8030_preflight_firmware(AppleT8030MachineState *t8030,
     return true;
 }
 
+
+
 static void t8030_init(MachineState *machine)
 {
     AppleT8030MachineState *t8030;
@@ -2897,6 +2967,8 @@ static void t8030_init(MachineState *machine)
     }
 
     t8030 = APPLE_T8030(machine);
+
+    allow_hactivation = t8030->hactivation;
 
     if (!t8030_preflight_firmware(t8030, machine)) {
         return;
@@ -3071,7 +3143,8 @@ static void t8030_init(MachineState *machine)
     apple_dt_set_prop_u32(child, "certificate-production-status", 1);
     apple_dt_set_prop_u32(child, "certificate-security-mode", 1);
     apple_dt_set_prop_u32(child, "mix-n-match-prevention-status", 1);
-    apple_dt_set_prop_u64(child, "unique-chip-id", t8030->ecid);
+    apple_dt_set_prop_u64(child, "unique-chip-id",
+                          t8030_ecid_dt_from_env(t8030));
 
     // Update the display parameters
     apple_dt_set_prop_u32(child, "display-scale", 2);
@@ -3247,11 +3320,15 @@ static char *t8030_get_boot_mode(Object *obj, Error **errp)
 }
 
 PROP_VISIT_GETTER_SETTER(uint64, ecid);
+PROP_VISIT_GETTER_SETTER(uint64, ecid_dt);
+
+
 PROP_GETTER_SETTER(bool, kaslr_off);
 PROP_GETTER_SETTER(bool, force_dfu);
 PROP_GETTER_SETTER(bool, sep_dma_mirror);
 PROP_GETTER_SETTER(bool, enable_wlan);
 PROP_GETTER_SETTER(bool, wlan_amfm);
+PROP_GETTER_SETTER(bool, hactivation);
 PROP_GETTER_SETTER(int, usb_conn_type);
 PROP_STR_GETTER_SETTER(trustcache_filename);
 PROP_STR_GETTER_SETTER(ticket_filename);
@@ -3324,6 +3401,13 @@ static void t8030_class_init(ObjectClass *klass, const void *data)
     object_class_property_add_bool(klass, "force-dfu", t8030_get_force_dfu,
                                    t8030_set_force_dfu);
     object_class_property_set_description(klass, "force-dfu", "Force DFU");
+    oprop = object_class_property_add_bool(
+        klass, "hactivation", t8030_get_hactivation, t8030_set_hactivation);
+    object_property_set_default_bool(oprop, true);
+    object_class_property_set_description(
+        klass, "hactivation",
+        "Enable the development 'hactivation' bypass (kernel patch and DT "
+        "property). Set to false to require real device activation.");
     oprop = object_class_property_add_bool(klass, "sep-dma-mirror",
                                            t8030_get_sep_dma_mirror,
                                            t8030_set_sep_dma_mirror);

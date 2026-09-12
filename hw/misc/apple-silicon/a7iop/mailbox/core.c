@@ -30,12 +30,22 @@
 #include "hw/sysbus.h"
 #include "migration/vmstate.h"
 #include "qemu/bitops.h"
+#include "qemu/error-report.h"
 #include "qemu/lockable.h"
 #include "qemu/log.h"
 #include "qemu/main-loop.h"
 #include "qemu/queue.h"
+#include "system/address-spaces.h"
 
 #define MAX_MESSAGE_COUNT (15)
+
+/* Inferno debug: runtime-gated dump of SEP mailbox messages + shm payload */
+static int sep_msgtap_enabled;
+
+void apple_a7iop_sep_msgtap_set(int on)
+{
+    sep_msgtap_enabled = on;
+}
 
 #define CTRL_ENABLE BIT(0)
 #define CTRL_FULL BIT(16)
@@ -227,6 +237,12 @@ static void apple_a7iop_mailbox_send(AppleA7IOPMailbox *s,
 
     trace_apple_a7iop_mailbox_send(s->role, ldq_le_p(msg->data),
                                    ldq_le_p(msg->data + sizeof(uint64_t)));
+
+    if (sep_msgtap_enabled && strncmp(s->role, "SEP", 3) == 0) {
+        extern void apple_sep_msgtap_dump(const char *role,
+                                          const uint8_t *data);
+        apple_sep_msgtap_dump(s->role, msg->data);
+    }
 
     QTAILQ_INSERT_TAIL(&s->inbox, msg, next);
     s->count++;

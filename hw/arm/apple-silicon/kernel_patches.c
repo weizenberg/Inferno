@@ -18,6 +18,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "hw/arm/apple-silicon/boot.h"
 #include "hw/arm/apple-silicon/gxf-hvc.h"
 #include "hw/arm/apple-silicon/kernel_patches.h"
 #include "hw/arm/apple-silicon/patcher.h"
@@ -798,6 +799,173 @@ static void ck_kp_cs_patches(CKPatcherRange *range)
     }
 }
 
+/*
+ * machine_thread_state_convert_from_user(): allow a JOP-disabled (arm64)
+ * caller to set thread state on a JOP-enabled (arm64e) target. Upstream
+ * returns KERN_PROTECTION_FAILURE there, which blocks cross-process
+ * instrumentation (e.g. frida-server injecting into system daemons) on this
+ * build; with pauth disabled on AP cores the unsigned state is consistent.
+ * The patched tbnz guards the `return KERN_PROTECTION_FAILURE` block, so
+ * NOPing it makes the conversion accept the state and force
+ * __DARWIN_ARM_THREAD_STATE64_FLAGS_NO_PTRAUTH.
+ */
+static void ck_kp_thread_state_patch(CKPatcherRange *range)
+{
+    static const uint8_t pattern[] = {
+        0x88, 0xD0, 0x38, 0xD5, // mrs x8, tpidr_el1
+        0x09, 0x19, 0x54, 0x39, // ldrb w9, [x8, #0x506] (caller disable_user_jop)
+        0x09, 0x00, 0x00, 0x35, // cbnz w9, #? (to target check; NOP it)
+        0x08, 0xA1, 0x41, 0xF9, // ldr x8, [x8, #0x340]
+        0x08, 0xF5, 0x43, 0xB9, // ldr w8, [x8, #0x3f4]
+        0x08, 0x00, 0x00, 0x37, // tbnz w8, #0, #? (to the signed path)
+    };
+    static const uint8_t mask[] = {
+        0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+        0xFF, 0xFF, 0x1F, 0x00, 0x00, 0xFF,
+        0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+        0xFF, 0xFF, 0x1F, 0x00, 0x00, 0xFF,
+    };
+    QEMU_BUILD_BUG_ON(sizeof(pattern) != sizeof(mask));
+    static const uint8_t repl[] = { NOP_BYTES };
+    ck_patcher_find_replace(range, "allow cross-JOP thread state", pattern,
+                            mask, sizeof(pattern), sizeof(uint32_t), repl,
+                            NULL, 8, sizeof(repl));
+}
+
+/*
+ * Force every userspace task/thread into disable_user_jop.
+ *
+ * Under HVF, AP cores approximate TCG pauth-noop by clearing SCTLR_EL1 PAC
+ * enables on every vCPU re-entry. That is not stable: the guest can re-enable
+ * PAC mid-quantum, sign pointers, then resume with AUT as a NOP and leave PAC
+ * bits in addresses (AppStore / libswiftCore SIGSEGV at 0x7361…).
+ *
+ * The research kernelcache has no PE_parse_boot_argn("user_jop") site — only
+ * user_ts_jop / diversify_user_jop — and arm_user_jop_disabled() is a constant
+ * `return 0`. Force the task/thread flags that the rest of xnu consults so
+ * arm64e processes stay on the JOP-disabled path (unsigned shared-region
+ * fixups, no user PAC key install), matching TCG.
+ *
+ * HVF-only: TCG already no-ops PAC in the translator.
+ */
+static void ck_kp_force_disable_user_jop(CKPatcherRange *range)
+{
+    /*
+     * arm_user_jop_disabled: mov w0, #0; ret followed by the next function's
+     * pacibsp/frame setup. The short mov/ret/pacibsp triple hits ~1000 sites;
+     * include the following prologue so the match is unique.
+     */
+    {
+        static const uint8_t pattern[] = {
+            0x00, 0x00, 0x80, 0x52, // mov w0, #0
+            0xC0, 0x03, 0x5F, 0xD6, // ret
+            0x7F, 0x23, 0x03, 0xD5, // pacibsp
+            0xFF, 0x83, 0x00, 0xD1, // sub sp, sp, #0x20
+            0xFD, 0x7B, 0x01, 0xA9, // stp x29, x30, [sp, #0x10]
+            0xFD, 0x43, 0x00, 0x91, // add x29, sp, #0x10
+            0x10, 0x02, 0x00, 0x10, // adr x16, #+0x40
+        };
+        static const uint8_t repl[] = {
+            0x20, 0x00, 0x80, 0x52, // mov w0, #1
+        };
+        ck_patcher_find_replace(range, "arm_user_jop_disabled return 1",
+                                pattern, NULL, sizeof(pattern),
+                                sizeof(uint32_t), repl, NULL, 0, sizeof(repl));
+    }
+
+    /*
+     * thread inherit: copy task.disable_user_jop (+880) into thread (+0x506).
+     *   ldrb w8, [x20, #880]
+     *   strb w8, [x19, #1286]
+     * → mov w8, #1; strb …
+     */
+    {
+        static const uint8_t pattern[] = {
+            0x88, 0xC2, 0x4D, 0x39, // ldrb w8, [x20, #0x370]
+            0x68, 0x1A, 0x14, 0x39, // strb w8, [x19, #0x506]
+        };
+        static const uint8_t repl[] = {
+            0x28, 0x00, 0x80, 0x52, // mov w8, #1
+        };
+        ck_patcher_find_replace(range, "thread inherit disable_user_jop=1",
+                                pattern, NULL, sizeof(pattern),
+                                sizeof(uint32_t), repl, NULL, 0, sizeof(repl));
+    }
+
+    /*
+     * task create without parent: zero flag before strb to task+880.
+     *   mov w8, #0
+     *   str x0, [x19, #864]
+     *   movz x9, #0xfad5
+     */
+    {
+        static const uint8_t pattern[] = {
+            0x08, 0x00, 0x80, 0x52, // mov w8, #0
+            0x60, 0xB2, 0x01, 0xF9, // str x0, [x19, #864]
+            0xA9, 0x5A, 0x9F, 0xD2, // movz x9, #0xfad5
+        };
+        static const uint8_t repl[] = {
+            0x28, 0x00, 0x80, 0x52, // mov w8, #1
+        };
+        ck_patcher_find_replace(range, "task create disable_user_jop=1", pattern,
+                                NULL, sizeof(pattern), sizeof(uint32_t), repl,
+                                NULL, 0, sizeof(repl));
+    }
+
+    /*
+     * exec/spawn: derive flag from csflags bit 31 into task+880 / thread+0x506.
+     * Force both stores to write 1.
+     */
+    {
+        static const uint8_t pattern[] = {
+            0x88, 0x4A, 0x40, 0xB9, // ldr w8, [x20, #72]
+            0x08, 0x7D, 0x1F, 0x53, // lsr w8, w8, #31
+            0xA8, 0xC2, 0x0D, 0x39, // strb w8, [x21, #880]
+            0x88, 0x5E, 0x41, 0xF9, // ldr x8, [x20, #696]
+            0x89, 0x4A, 0x40, 0xB9, // ldr w9, [x20, #72]
+            0x29, 0x7D, 0x1F, 0x53, // lsr w9, w9, #31
+            0x09, 0x19, 0x14, 0x39, // strb w9, [x8, #0x506]
+        };
+        static const uint8_t repl[] = {
+            0x28, 0x00, 0x80, 0x52, // mov w8, #1
+            0x1F, 0x20, 0x03, 0xD5, // nop (was lsr)
+            0xA8, 0xC2, 0x0D, 0x39, // strb w8, [x21, #880]
+            0x88, 0x5E, 0x41, 0xF9, // ldr x8, [x20, #696]
+            0x29, 0x00, 0x80, 0x52, // mov w9, #1
+            0x1F, 0x20, 0x03, 0xD5, // nop (was lsr)
+            0x09, 0x19, 0x14, 0x39, // strb w9, [x8, #0x506]
+        };
+        ck_patcher_find_replace(range, "exec disable_user_jop=1", pattern, NULL,
+                                sizeof(pattern), sizeof(uint32_t), repl, NULL, 0,
+                                sizeof(repl));
+    }
+
+    /* Second exec/spawn variant uses x22 for the task pointer. */
+    {
+        static const uint8_t pattern[] = {
+            0x88, 0x4A, 0x40, 0xB9, // ldr w8, [x20, #72]
+            0x08, 0x7D, 0x1F, 0x53, // lsr w8, w8, #31
+            0xC8, 0xC2, 0x0D, 0x39, // strb w8, [x22, #880]
+            0x88, 0x5E, 0x41, 0xF9, // ldr x8, [x20, #696]
+            0x89, 0x4A, 0x40, 0xB9, // ldr w9, [x20, #72]
+            0x29, 0x7D, 0x1F, 0x53, // lsr w9, w9, #31
+            0x09, 0x19, 0x14, 0x39, // strb w9, [x8, #0x506]
+        };
+        static const uint8_t repl[] = {
+            0x28, 0x00, 0x80, 0x52, // mov w8, #1
+            0x1F, 0x20, 0x03, 0xD5, // nop
+            0xC8, 0xC2, 0x0D, 0x39, // strb w8, [x22, #880]
+            0x88, 0x5E, 0x41, 0xF9, // ldr x8, [x20, #696]
+            0x29, 0x00, 0x80, 0x52, // mov w9, #1
+            0x1F, 0x20, 0x03, 0xD5, // nop
+            0x09, 0x19, 0x14, 0x39, // strb w9, [x8, #0x506]
+        };
+        ck_patcher_find_replace(range, "exec disable_user_jop=1 (x22)", pattern,
+                                NULL, sizeof(pattern), sizeof(uint32_t), repl,
+                                NULL, 0, sizeof(repl));
+    }
+}
+
 static void ck_kp_pmap_cs_enforce_patch(CKPatcherRange *range)
 {
     // in pmap_enter_options_internal
@@ -920,8 +1088,25 @@ void ck_patch_kernel(MachoHeader64 *hdr)
     ck_kp_kprintf_patch(kernel_text);
     ck_kp_amx_patch(kernel_text);
     ck_kp_cs_patches(kernel_text);
+    /* ck_kp_thread_state_patch: destabilizes launchd (initproc SIGBUS
+     * minutes after boot); disabled until the boot-time cross-JOP caller is
+     * identified. */
+    if (0) {
+        ck_kp_thread_state_patch(kernel_text);
+    }
+    /*
+     * force disable_user_jop: only for the hvf-pauth-noop=true escape hatch
+     * (PAC off). With default real host PAC, arm64e needs JOP keys and auth
+     * shared-region fixups -- do not force the flag. See
+     * ck_kp_force_disable_user_jop().
+     */
+    if (0 && hvf_enabled()) {
+        ck_kp_force_disable_user_jop(kernel_text);
+    }
     kernel_const = ck_kp_get_kernel_section(hdr, "__TEXT", "__const");
-    ck_kp_hactivation_patch(kernel_const);
+    if (allow_hactivation) {
+        ck_kp_hactivation_patch(kernel_const);
+    }
 
     kernel_ppltext = ck_kp_find_section_range(hdr, "__PPLTEXT", "__text");
     if (kernel_ppltext == NULL) {

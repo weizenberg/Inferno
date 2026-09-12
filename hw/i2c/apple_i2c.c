@@ -23,10 +23,16 @@
 #include "hw/i2c/i2c.h"
 #include "hw/irq.h"
 #include "migration/vmstate.h"
+#include "qemu/error-report.h"
 #include "qemu/log.h"
 #include "qemu/module.h"
 
 // #define DEBUG_APPLE_I2C
+
+/* Always-on start/addr spam; off by default. */
+#ifndef APPLE_I2C_NOISE_TRACE
+#define APPLE_I2C_NOISE_TRACE 0
+#endif
 
 #define MMIO_SIZE (0x10000)
 
@@ -150,6 +156,10 @@ static void apple_i2c_reg_write(void *opaque, hwaddr addr, uint64_t data,
             } else {
                 s->is_recv = false;
             }
+#if APPLE_I2C_NOISE_TRACE
+            info_report("I2C-TRACE: %s start addr=0x%02x %s", dev->id, i2c_addr,
+                        s->is_recv ? "read" : "write");
+#endif
             if (i2c_start_transfer(s->bus, i2c_addr, s->is_recv) != 0) {
                 qemu_log_mask(LOG_GUEST_ERROR, "%s: can't find device @ 0x%x\n",
                               dev->id, i2c_addr);

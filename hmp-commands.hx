@@ -521,6 +521,35 @@ SRST
 ERST
 
     {
+        .name       = "sep-write",
+        .args_type  = "gpa:l,hex:s",
+        .params     = "gpa hex",
+        .help       = "write bytes into guest physical memory (Inferno debug)",
+        .cmd        = hmp_sep_write,
+    },
+    {
+        .name       = "sep-msgtap",
+        .args_type  = "on:l",
+        .params     = "on",
+        .help       = "dump SEP mailbox messages + shm payload (Inferno debug)",
+        .cmd        = hmp_sep_msgtap,
+    },
+    {
+        .name       = "sep-trace",
+        .args_type  = "seconds:l",
+        .params     = "seconds",
+        .help       = "sample SEP core PC for N seconds (Inferno debug)",
+        .cmd        = hmp_sep_trace,
+    },
+    {
+        .name       = "sep-regs",
+        .args_type  = "",
+        .params     = "",
+        .help       = "dump SEP core registers (Inferno debug)",
+        .cmd        = hmp_sep_regs,
+    },
+
+    {
         .name       = "gpa2hva",
         .args_type  = "addr:l",
         .params     = "addr",

@@ -317,6 +317,7 @@ struct AppleSEPState {
      * present in the global map -- see apple_dart_set_target_as().
      */
     AddressSpace *dma_target_as;
+    IOMMUMemoryRegion *iommu_mr;
     MemoryRegion pmgr_base_mr;
     MemoryRegion trng_regs_mr;
     MemoryRegion key_base_mr;
@@ -383,6 +384,7 @@ struct AppleSEPState {
 };
 
 void ck_sep_seprom_patches(CKPatcherRange *range);
+void apple_sep_set_seprom_blob(uint8_t *blob, size_t size);
 AppleSEPState *apple_sep_from_node(AppleDTNode *node, MemoryRegion *ool_mr,
                                    vaddr base, uint32_t cpu_id, bool modern,
                                    uint32_t chip_id);

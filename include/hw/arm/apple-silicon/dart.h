@@ -45,6 +45,14 @@ IOMMUMemoryRegion *apple_dart_instance_iommu_mr(AppleDARTState *s,
 AppleDARTState *apple_dart_from_node(AppleDTNode *node);
 
 /*
+ * Walk one IOVA with no guest-visible side effects (no error_status latch, no
+ * IRQ). For debug taps that must be invisible to the guest; see
+ * apple_dart_mirror_probe().
+ */
+bool apple_dart_probe_iova(IOMMUMemoryRegion *iommu, hwaddr addr, hwaddr *pa,
+                           AddressSpace **target_as);
+
+/*
  * Choose the AddressSpace this DART's translations resolve into. Defaults to
  * address_space_memory. A machine can point a DART at a private downstream view
  * so that the memory behind it is reachable only through translation, which is

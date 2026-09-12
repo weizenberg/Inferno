@@ -80,7 +80,13 @@ static void apple_buttons_handle_event(DeviceState *dev, QemuConsole *src,
     case Q_KEY_CODE_F5:
         button = SMC_HID_BUTTON_HOLD;
         break;
+    /*
+     * Menu / Home (go back to SpringBoard). F6 is the historical mapping;
+     * Esc and Home are easier aliases for Cocoa keyboard use.
+     */
     case Q_KEY_CODE_F6:
+    case Q_KEY_CODE_ESC:
+    case Q_KEY_CODE_HOME:
         button = SMC_HID_BUTTON_MENU;
         break;
     case Q_KEY_CODE_F7:

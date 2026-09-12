@@ -336,6 +336,42 @@ static void apple_sep_sim_control_send_ack(AppleSEPSimState *s, SEPMessage *msg,
     apple_sep_sim_message_reply(s, msg, CONTROL_OP_ACK, param, data);
 }
 
+static void apple_sep_sim_serve_art(AppleSEPSimState *s)
+{
+    char error_desc[ASN1_MAX_ERROR_DESCRIPTION_SIZE];
+    asn1_node art_defs = NULL;
+    assert_cmpuint(
+        asn1_array2tree(art_definitions_array, &art_defs, error_desc), ==,
+        ASN1_SUCCESS);
+    asn1_node art = NULL;
+    assert_cmpuint(asn1_create_element(art_defs, "ART.Header", &art), ==,
+                   ASN1_SUCCESS);
+    uint8_t val = 0;
+    asn1_write_value(art, "Version", &val, sizeof(val));
+    uint16_t val16 = 0;
+    asn1_write_value(art, "Info.Counter", &val16, sizeof(val16));
+    char byte0x20[32] = { 0 };
+    asn1_write_value(art, "Info.ManifestHash", byte0x20, 20);
+    asn1_write_value(art, "Info.SleepHash", byte0x20, 20);
+    asn1_write_value(art, "Info.Nonce", byte0x20, 0);
+    asn1_write_value(art, "InfoHMAC", byte0x20, sizeof(byte0x20));
+    char data[512];
+    int data_len = sizeof(data);
+    assert_cmpuint(asn1_der_coding(art, "", data, &data_len, error_desc), ==,
+                   ASN1_SUCCESS);
+    asn1_delete_structure(&art);
+    asn1_delete_structure(&art_defs);
+
+    if (dma_memory_write(s->dma_as, s->ool_state[EP_ART_STORAGE].out_addr,
+                         data, data_len,
+                         MEMTXATTRS_UNSPECIFIED) != MEMTX_OK) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "EP_XART_STORAGE: Failed to write ART to OOL");
+    }
+    apple_sep_sim_send_message(s, EP_ART_STORAGE, 0, ART_STORAGE_OP_INCOMING,
+                               0, 0);
+}
+
 static void apple_sep_sim_handle_control_msg(AppleSEPSimState *s,
                                              SEPMessage *msg)
 {
@@ -391,39 +427,7 @@ static void apple_sep_sim_handle_control_msg(AppleSEPSimState *s,
     case CONTROL_OP_ERASE_INSTALL: {
         qemu_log_mask(LOG_GUEST_ERROR, "EP_CONTROL: ERASE_INSTALL\n");
         apple_sep_sim_control_send_ack(s, msg, 0, 0);
-
-        char error_desc[ASN1_MAX_ERROR_DESCRIPTION_SIZE];
-        asn1_node art_defs = NULL;
-        assert_cmpuint(
-            asn1_array2tree(art_definitions_array, &art_defs, error_desc), ==,
-            ASN1_SUCCESS);
-        asn1_node art = NULL;
-        assert_cmpuint(asn1_create_element(art_defs, "ART.Header", &art), ==,
-                       ASN1_SUCCESS);
-        uint8_t val = 0;
-        asn1_write_value(art, "Version", &val, sizeof(val));
-        uint16_t val16 = 0;
-        asn1_write_value(art, "Info.Counter", &val16, sizeof(val16));
-        char byte0x20[32] = { 0 };
-        asn1_write_value(art, "Info.ManifestHash", byte0x20, 20);
-        asn1_write_value(art, "Info.SleepHash", byte0x20, 20);
-        asn1_write_value(art, "Info.Nonce", byte0x20, 0);
-        asn1_write_value(art, "InfoHMAC", byte0x20, sizeof(byte0x20));
-        char data[512];
-        int data_len = sizeof(data);
-        assert_cmpuint(asn1_der_coding(art, "", data, &data_len, error_desc),
-                       ==, ASN1_SUCCESS);
-        asn1_delete_structure(&art);
-        asn1_delete_structure(&art_defs);
-
-        if (dma_memory_write(s->dma_as, s->ool_state[EP_ART_STORAGE].out_addr,
-                             data, data_len,
-                             MEMTXATTRS_UNSPECIFIED) != MEMTX_OK) {
-            qemu_log_mask(LOG_GUEST_ERROR,
-                          "EP_XART_STORAGE: Failed to write ART to OOL");
-        }
-        apple_sep_sim_send_message(s, EP_ART_STORAGE, 0,
-                                   ART_STORAGE_OP_INCOMING, 0, 0);
+        apple_sep_sim_serve_art(s);
         break;
     }
     default:
@@ -436,6 +440,13 @@ static void apple_sep_sim_handle_control_msg(AppleSEPSimState *s,
 static void apple_sep_sim_handle_arts_msg(AppleSEPSimState *s, SEPMessage *msg)
 {
     switch (msg->op) {
+    case ART_STORAGE_OP_ART_LOAD:
+        qemu_log_mask(LOG_GUEST_ERROR, "EP_ART_STORAGE: ART_LOAD\n");
+        /* AppleSEPARTService loads the ART via the endpoint; serve the same
+         * freshly generated ART the erase-install path produces, then ack. */
+        apple_sep_sim_serve_art(s);
+        apple_sep_sim_message_reply(s, msg, ART_STORAGE_OP_RECEIVED, 0, 0);
+        break;
     case ART_STORAGE_OP_RECEIVED:
         qemu_log_mask(LOG_GUEST_ERROR, "EP_ART_STORAGE: ART_RECEIVED\n");
         break;
@@ -605,6 +616,14 @@ static void apple_sep_sim_handle_bootstrap_msg(AppleSEPSimState *s,
                                    0);
 
         apple_sep_sim_advertise_eps(s);
+        break;
+    }
+    case BOOTSTRAP_OP_LOAD_SEP_ART: {
+        qemu_log_mask(LOG_GUEST_ERROR, "EP_BOOTSTRAP: LOAD_SEP_ART\n");
+        /* seputil --erase asks for the current ART before wiping; serve the
+         * same freshly generated ART the erase-install path produces so the
+         * restore ramdisk does not panic with "SEP returned zero-length ART". */
+        apple_sep_sim_serve_art(s);
         break;
     }
     case BOOTSTRAP_OP_OPCODE_16:

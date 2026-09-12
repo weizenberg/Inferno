@@ -19,12 +19,16 @@
  */
 
 #include "qemu/osdep.h"
+#include "monitor/monitor.h"
+
+static CPUState *g_sep_monitor_cpu;
 #include "block/aio.h"
 #include "crypto/cipher.h"
 #include "exec/cputlb.h"
 #include "exec/tb-flush.h"
 #include "hw/arm/apple-silicon/a13.h"
 #include "hw/arm/apple-silicon/a9.h"
+#include "hw/arm/apple-silicon/dart.h"
 #include "hw/arm/apple-silicon/sep.h"
 #include "hw/boards.h"
 #include "hw/gpio/apple_gpio.h"
@@ -44,6 +48,7 @@
 #include "system/hw_accel.h"
 #include "system/tcg.h"
 #include "trace.h"
+#include <nettle/bignum.h>
 #include <nettle/ccm.h>
 #include <nettle/cmac.h>
 #include <nettle/ecc-curve.h>
@@ -78,10 +83,19 @@ typedef struct {
 
 #define SEP_ENABLE_HARDCODED_FIRMWARE
 // #define SEP_ENABLE_DEBUG_TRACE_MAPPING
-// #define SEP_ENABLE_TRACE_BUFFER
+#define SEP_ENABLE_TRACE_BUFFER
 // can cause conflicts with kernel and userspace, not anymore?
 // #define SEP_ENABLE_OVERWRITE_SHMBUF_OBJECTS
 // #define SEP_DISABLE_ASLR
+
+/*
+ * Always-on AESS/PKA/SEPOS/PC-sample spam (info_report). Off by default —
+ * re-enable for short bring-up windows only. Monitor "sep_pc" still works
+ * when this is 0 (explicit sampling only).
+ */
+#ifndef SEP_NOISE_TRACE
+#define SEP_NOISE_TRACE 0
+#endif
 
 // only used for SEP_ENABLE_TRACE_BUFFER and SEP_DISABLE_ASLR
 #define SEP_USE_VERSION_OVERRIDE 14
@@ -387,6 +401,10 @@ static void enable_trace_buffer(AppleSEPState *s)
     DPRINTF("SEP_PROGRESS: Enable Trace Buffer: s->shmbuf_base: "
             "0x" HWADDR_FMT_plx "\n",
             s->shmbuf_base);
+#if SEP_NOISE_TRACE
+    info_report("SEP-TRACE-ENABLE: called, shmbuf_base=0x" HWADDR_FMT_plx,
+                s->shmbuf_base);
+#endif
     if (!s->shmbuf_base) {
         return;
     }
@@ -1091,6 +1109,12 @@ static void debug_trace_reg_write(void *opaque, hwaddr addr, uint64_t data,
     uint64_t arg5 = *(uint64_t *)&s->debug_trace_regs[addr - 0x10];
     uint64_t tid = *(uint64_t *)&s->debug_trace_regs[addr - 0x08];
     uint64_t time = *(uint64_t *)&s->debug_trace_regs[addr - 0x00];
+#if SEP_NOISE_TRACE
+    info_report("SEPOS-TRACE: id=0x%" PRIX64 " tid=0x%05" PRIX64
+                " a2=0x%" PRIX64 " a3=0x%" PRIX64 " a4=0x%" PRIX64
+                " a5=0x%" PRIX64 " t=%" PRIu64,
+                trace_id, tid, arg2, arg3, arg4, arg5, time);
+#endif
     DPRINTF("\nDEBUG_TRACE: Debug:"
             " 0x%" PRIX64 " 0x%" PRIX64 " 0x%" PRIX64 " 0x%" PRIX64
             " 0x%" PRIX64 " 0x%" PRIX64 " %" PRIu64 "\n",
@@ -2619,6 +2643,10 @@ static void aess_handle_cmd(AppleAESSState *s)
     uint32_t cmd = s->command;
     uint32_t reg_0x18_keydisable = s->reg_0x18_keydisable;
 
+#if SEP_NOISE_TRACE
+    info_report("AESS-TRACE: command 0x%03x", cmd);
+#endif
+
     bool keyselect_non_gid0 = SEP_AESS_CMD_FLAG_KEYSELECT_GID1_CUSTOM(cmd) != 0;
     bool keyselect_gid1 = (cmd & SEP_AESS_CMD_FLAG_KEYSELECT_GID1) != 0;
     bool keyselect_custom = (cmd & SEP_AESS_CMD_FLAG_KEYSELECT_CUSTOM) != 0;
@@ -2842,7 +2870,22 @@ static void aess_handle_cmd(AppleAESSState *s)
     {
     }
 #endif
-    else {
+    else if (normalized_cmd == SEP_AESS_COMMAND_CREATE_KEY_FROM_SEED ||
+             normalized_cmd ==
+                 (0x10 | SEP_AESS_COMMAND_CREATE_KEY_FROM_SEED)) {
+        /*
+         * "osc"/SIK seed-key derivation: SEPFW expects a deterministic
+         * UID-key-derived wrap key, AES-256-ECB(UID0, input). SEPFW only
+         * checks the SEPD reply's status dword, not the derived bytes.
+         */
+        QCryptoCipher *cipher = qcrypto_cipher_new(
+            QCRYPTO_CIPHER_ALGO_AES_256, QCRYPTO_CIPHER_MODE_ECB,
+            (uint8_t *)AESS_UID0, 0x20, &error_abort);
+        qcrypto_cipher_encrypt(cipher, s->in_full, s->out_full, 0x20,
+                               &error_abort);
+        qcrypto_cipher_free(cipher);
+        DPRINTF("SEP AESS_BASE: %s: CREATE_KEY_FROM_SEED\n", __func__);
+    } else {
         DPRINTF("SEP AESS_BASE: %s: Unknown command 0x%02x\n", __func__, cmd);
         // valid_command = false;
     }
@@ -3317,9 +3360,15 @@ static void pka_base_reg_write(void *opaque, hwaddr addr, uint64_t data,
 #ifdef ENABLE_CPU_DUMP_STATE
     cpu_dump_state(CPU(sep->cpu), stderr, CPU_DUMP_CODE);
 #endif
+#if SEP_NOISE_TRACE
+    info_report("PKA-WRITE: [0x%02x] = 0x%" PRIx64, (unsigned)addr, data);
+#endif
     switch (addr) {
     case 0x0: // maybe command
         s->command = data;
+#if SEP_NOISE_TRACE
+        info_report("PKA-TRACE: command 0x%02x", (uint32_t)data);
+#endif
         // PKA commands get executed directly, without additional trigger
         pka_handle_cmd(s);
         // qemu_bh_schedule(s->command_bh);
@@ -3337,6 +3386,31 @@ static void pka_base_reg_write(void *opaque, hwaddr addr, uint64_t data,
         } else if (s->status0 == 0x4) {
             // ack interrupt 0xC
             // unknown
+        }
+        /*
+         * SEPD's PKA executor runs keygen by writing key parameters to
+         * regs 0x40-0x5c, reg 8 = 2, reg 0x14 = 0, then GO (reg 4 = 1),
+         * and reads the generated key from regs 0x60+. A real PKA computes
+         * an ECC keypair there; SEPFW then derives the public point in
+         * software from the scalar. Synthesize a deterministic P-256
+         * scalar: this becomes the SEP "sub-CA" issuer key backing the
+         * osc class-6 keygen (a persistent device key, so fixed is
+         * correct), and entitlement's op-20080 response validation only
+         * checks field lengths/tags.
+         */
+        if (data == 1 && ldl_le_p(&sep->pka_base_regs[0x8]) == 2) {
+            static const uint8_t osc_issuer_scalar[0x20] = {
+                0xe5, 0xc3, 0x3f, 0x16, 0xef, 0x68, 0x2e, 0xce,
+                0x2b, 0xb7, 0x52, 0x36, 0x03, 0x0b, 0x0d, 0xe8,
+                0x94, 0x58, 0x61, 0x4f, 0x9b, 0x93, 0x7e, 0xd8,
+                0xa4, 0x68, 0x39, 0x18, 0xce, 0x61, 0xc9, 0x71,
+            };
+            memcpy(&sep->pka_base_regs[0x60], osc_issuer_scalar,
+                   sizeof(osc_issuer_scalar));
+#if SEP_NOISE_TRACE
+            info_report("PKA-KEYGEN: synthesized issuer scalar into result "
+                        "regs");
+#endif
         }
 #endif
         goto jump_log;
@@ -3452,6 +3526,9 @@ static void pka_tmm_reg_write(void *opaque, hwaddr addr, uint64_t data,
 {
     AppleSEPState *s = opaque;
 
+#if SEP_NOISE_TRACE
+    info_report("PKA-TMM-WRITE: [0x%03x] = 0x%" PRIx64, (unsigned)addr, data);
+#endif
 #ifdef ENABLE_CPU_DUMP_STATE
     cpu_dump_state(CPU(s->cpu), stderr, CPU_DUMP_CODE);
 #endif
@@ -4080,6 +4157,7 @@ static void apple_sep_cpu_moni_jump(CPUState *cpu, run_on_cpu_data data)
         return;
     }
 
+
     // some specific, non currently used(?), cpu_ functions will require bql
     // BQL_LOCK_GUARD();
 
@@ -4472,6 +4550,7 @@ static void apple_sep_realize(DeviceState *dev, Error **errp)
         sc->parent_realize(dev, errp);
     }
     qdev_realize(DEVICE(s->cpu), NULL, errp);
+    g_sep_monitor_cpu = CPU(s->cpu);
     qdev_connect_gpio_out_named(DEVICE(s->mailbox), APPLE_A7IOP_SEP_CPU_IRQ, 0,
                                 qdev_get_gpio_in(DEVICE(s->cpu), ARM_CPU_IRQ));
     // mailbox irq's aren't being handled that way (anymore)
@@ -4577,6 +4656,147 @@ static void map_sepfw(AppleSEPState *s)
 #endif
 }
 
+/* The guest may reuse the SEPROM region as ordinary RAM over the course of a
+ * boot, so a SEP reset must put a pristine image back before re-entering the
+ * SEPROM, otherwise the reloaded SEPROM executes garbage and panics. */
+static uint8_t *g_seprom_blob;
+
+static uint64_t g_sep_pc_log_deadline_ms;
+static QEMUTimer *g_sep_pc_log_timer;
+
+static void apple_sep_pc_sample(void *opaque)
+{
+    CPUARMState *env;
+
+    if (g_sep_monitor_cpu == NULL) {
+        return;
+    }
+    cpu_synchronize_state(g_sep_monitor_cpu);
+    env = &ARM_CPU(g_sep_monitor_cpu)->env;
+#if SEP_NOISE_TRACE
+    info_report("SEP-PC-SAMPLE: pc=%016" PRIx64 " lr=%016" PRIx64,
+                env->pc, env->xregs[30]);
+#endif
+    if (qemu_clock_get_ms(QEMU_CLOCK_REALTIME) < g_sep_pc_log_deadline_ms) {
+        timer_mod(g_sep_pc_log_timer,
+                  qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + 20);
+    }
+}
+
+void apple_sep_monitor_write(Monitor *mon, uint64_t gpa, const char *hex)
+{
+    uint8_t buf[4096];
+    size_t n = 0;
+
+    while (hex[0] && hex[1] && n < sizeof(buf)) {
+        unsigned b;
+        if (sscanf(hex, "%2x", &b) != 1) {
+            break;
+        }
+        buf[n++] = b;
+        hex += 2;
+        while (*hex == ' ' || *hex == ':') {
+            hex++;
+        }
+    }
+    if (n == 0) {
+        monitor_printf(mon, "no bytes parsed\n");
+        return;
+    }
+    address_space_rw(&address_space_memory, gpa, MEMTXATTRS_UNSPECIFIED,
+                     buf, n, true);
+    monitor_printf(mon, "wrote %zu bytes at 0x%" PRIx64 "\n", n, gpa);
+}
+
+void apple_sep_msgtap_dump(const char *role, const uint8_t *data)
+{
+    static AppleSEPState *sep;
+    uint8_t ep = data[0], tag = data[1], op = data[2], param = data[3];
+    uint32_t d = ldl_le_p(data + 4);
+    uint64_t shm = (uint64_t)d << 12;
+    uint8_t buf[128];
+    int i;
+
+    info_report("MSGTAP %s: ep=0x%02x tag=0x%02x op=0x%02x param=0x%02x "
+                "data=0x%08x shm=0x%" PRIx64,
+                role, ep, tag, op, param, d, shm);
+    if (shm == 0) {
+        return;
+    }
+    if (sep == NULL) {
+        sep = APPLE_SEP(object_resolve_path("/machine/sep", NULL));
+    }
+    memset(buf, 0, sizeof(buf));
+    bool ok = false;
+    if (sep != NULL && sep->iommu_mr != NULL) {
+        hwaddr pa = 0;
+        AddressSpace *target_as = NULL;
+        if (apple_dart_probe_iova(sep->iommu_mr, shm, &pa, &target_as)) {
+            ok = address_space_rw(target_as, pa, MEMTXATTRS_UNSPECIFIED, buf,
+                                  sizeof(buf), false) == MEMTX_OK;
+        }
+    }
+    if (!ok) {
+        ok = address_space_rw(&address_space_memory, shm,
+                              MEMTXATTRS_UNSPECIFIED, buf, sizeof(buf),
+                              false) == MEMTX_OK;
+    }
+    if (!ok) {
+        info_report("MSGTAP %s:   shm unreadable", role);
+        return;
+    }
+    for (i = 0; i < (int)sizeof(buf); i += 16) {
+        info_report("MSGTAP %s:   +0x%02x: %02x %02x %02x %02x %02x %02x "
+                    "%02x %02x %02x %02x %02x %02x %02x %02x %02x %02x",
+                    role, i, buf[i], buf[i + 1], buf[i + 2], buf[i + 3],
+                    buf[i + 4], buf[i + 5], buf[i + 6], buf[i + 7], buf[i + 8],
+                    buf[i + 9], buf[i + 10], buf[i + 11], buf[i + 12],
+                    buf[i + 13], buf[i + 14], buf[i + 15]);
+    }
+}
+
+void apple_sep_monitor_trace(Monitor *mon, int64_t seconds)
+{
+    if (g_sep_monitor_cpu == NULL) {
+        monitor_printf(mon, "no SEP CPU\n");
+        return;
+    }
+    if (g_sep_pc_log_timer == NULL) {
+        g_sep_pc_log_timer =
+            timer_new_ms(QEMU_CLOCK_REALTIME, apple_sep_pc_sample, NULL);
+    }
+    g_sep_pc_log_deadline_ms =
+        qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + seconds * 1000;
+    timer_mod(g_sep_pc_log_timer, qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + 5);
+    monitor_printf(mon, "SEP PC sampling for %" PRId64 " s\n", seconds);
+}
+
+void apple_sep_monitor_dump_cpu(Monitor *mon)
+{
+    CPUARMState *env;
+
+    if (g_sep_monitor_cpu == NULL) {
+        monitor_printf(mon, "no SEP CPU\n");
+        return;
+    }
+    cpu_synchronize_state(g_sep_monitor_cpu);
+    env = &ARM_CPU(g_sep_monitor_cpu)->env;
+    monitor_printf(mon, "SEP pc=%016" PRIx64 " lr=%016" PRIx64
+                        " sp_el0=%016" PRIx64 " sp_el1=%016" PRIx64 "\n",
+                   env->pc, env->xregs[30], env->sp_el[0], env->sp_el[1]);
+    monitor_printf(mon, "x0=%016" PRIx64 " x1=%016" PRIx64 " x8=%016" PRIx64
+                        " x16=%016" PRIx64 "\n",
+                   env->xregs[0], env->xregs[1], env->xregs[8], env->xregs[16]);
+}
+
+static size_t g_seprom_blob_size;
+
+void apple_sep_set_seprom_blob(uint8_t *blob, size_t size)
+{
+    g_seprom_blob = blob;
+    g_seprom_blob_size = size;
+}
+
 static void apple_sep_reset_hold(Object *obj, ResetType type)
 {
     AppleSEPState *s;
@@ -4588,9 +4808,23 @@ static void apple_sep_reset_hold(Object *obj, ResetType type)
     if (sc->parent_phases.hold != NULL) {
         sc->parent_phases.hold(obj, type);
     }
+    if (g_seprom_blob != NULL) {
+        address_space_rw(&address_space_memory, 0x240000000ULL,
+                         MEMTXATTRS_UNSPECIFIED, g_seprom_blob,
+                         g_seprom_blob_size, true);
+    }
     s->key_fcfg_offset_0x14_index = 0;
     memset(s->key_fcfg_offset_0x14_values, 0,
            sizeof(s->key_fcfg_offset_0x14_values));
+#if SEP_NOISE_TRACE
+    /* Optional: sample SEP PC for 180s from boot (very noisy). */
+    if (g_sep_pc_log_timer == NULL) {
+        g_sep_pc_log_timer =
+            timer_new_ms(QEMU_CLOCK_REALTIME, apple_sep_pc_sample, NULL);
+    }
+    g_sep_pc_log_deadline_ms = qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + 180000;
+    timer_mod(g_sep_pc_log_timer, qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + 20);
+#endif
     s->pmgr_fuse_changer_bit0_was_set = false;
     s->pmgr_fuse_changer_bit1_was_set = false;
     s->manual_timer_hertz = 0;
@@ -4740,7 +4974,7 @@ static bool is_keyslot_valid(struct AppleSSCState *ssc_state,
     bool ret;
 
     if (kbkdf_index >= KBKDF_KEY_MAX_SLOTS) {
-        DPRINTF("%s: kbkdf_index over limit: %u\n", func, kbkdf_index);
+        DPRINTF("%s: kbkdf_index over limit: %u\n", __func__, kbkdf_index);
         ret = false;
     } else {
         ret = !buffer_is_zero(&ssc_state->ecc_keys[kbkdf_index],
@@ -4751,7 +4985,7 @@ static bool is_keyslot_valid(struct AppleSSCState *ssc_state,
 
     DPRINTF("%s: kbkdf_index: %d ; ecc_keys_item_size: 0x%lX ; "
             "kbkdf_keys_item_size: 0x%lX\n",
-            func, kbkdf_index, sizeof(struct ecc_scalar),
+            __func__, kbkdf_index, sizeof(struct ecc_scalar),
             sizeof(ssc_state->kbkdf_keys[kbkdf_index]));
     return ret;
 }
@@ -4954,8 +5188,10 @@ static int output_ec_pub(struct ecc_point *ecc_pub, uint8_t *pub_xy)
 
     mpz_inits(temp1, temp2, NULL);
     ecc_point_get(ecc_pub, temp1, temp2);
-    mpz_export(&pub_xy[0x00], NULL, 1, 1, 1, 0, temp1);
-    mpz_export(&pub_xy[0x00 + SHA384_DIGEST_SIZE], NULL, 1, 1, 1, 0, temp2);
+    /* P-384 coordinates are fixed-width big-endian integers on the wire. */
+    nettle_mpz_get_str_256(SHA384_DIGEST_SIZE, pub_xy, temp1);
+    nettle_mpz_get_str_256(SHA384_DIGEST_SIZE, pub_xy + SHA384_DIGEST_SIZE,
+                           temp2);
     HEXDUMP("output_ec_pub: pub_x", &pub_xy[0x00], SHA384_DIGEST_SIZE);
     HEXDUMP("output_ec_pub: pub_y", &pub_xy[0x00 + SHA384_DIGEST_SIZE],
             SHA384_DIGEST_SIZE);
@@ -5157,10 +5393,12 @@ static void answer_cmd_0x0_init1(struct AppleSSCState *ssc_state,
     ecdsa_sign(&ssc_state->ecc_key_main, &ssc_state->rctx,
                (nettle_random_func *)knuth_lfib_random, SHA384_DIGEST_SIZE,
                digest, &signature);
-    mpz_export(&response[MSG_PREFIX_LENGTH + 0x00 + 0x00], NULL, 1, 1, 1, 0,
-               signature.r);
-    mpz_export(&response[MSG_PREFIX_LENGTH + 0x00 + SHA384_DIGEST_SIZE], NULL,
-               1, 1, 1, 0, signature.s);
+    /* Preserve leading zeros in both 48-byte signature components. */
+    nettle_mpz_get_str_256(SHA384_DIGEST_SIZE, &response[MSG_PREFIX_LENGTH],
+                           signature.r);
+    nettle_mpz_get_str_256(SHA384_DIGEST_SIZE,
+                           &response[MSG_PREFIX_LENGTH + SHA384_DIGEST_SIZE],
+                           signature.s);
     dsa_signature_clear(&signature);
 jump_ret0:
     ecc_point_clear(&ecc_pub);
@@ -5272,6 +5510,8 @@ static void answer_cmd_0x3_metadata_write(struct AppleSSCState *ssc_state,
     DPRINTF("cmd_0x03_req: kbkdf_index_key: %u\n", kbkdf_index_key);
     DPRINTF("cmd_0x03_req: kbkdf_index_dataslot: %u\n", kbkdf_index_dataslot);
     DPRINTF("cmd_0x03_req: copy: %u\n", copy);
+    info_report("SSC-TRACE: cmd_0x03 metadata_write key=%u dataslot=%u copy=%u",
+                kbkdf_index_key, kbkdf_index_dataslot, copy);
     ////if (copy >= SSC_REQUEST_MAX_COPIES)
     if (copy > 0) {
         DPRINTF("%s: invalid copy: %u\n", __func__, copy);
@@ -5349,6 +5589,8 @@ static void answer_cmd_0x4_metadata_data_read(struct AppleSSCState *ssc_state,
     uint8_t copy = request[3];
     DPRINTF("cmd_0x04_req: kbkdf_index: %u\n", kbkdf_index);
     DPRINTF("cmd_0x04_req: copy: %u\n", copy);
+    info_report("SSC-TRACE: cmd_0x04 data_read index=%u copy=%u", kbkdf_index,
+                copy);
     if (copy >= SSC_REQUEST_MAX_COPIES) {
         DPRINTF("%s: invalid copy: %u\n", __func__, copy);
         do_response_prefix(request, response,
@@ -5402,6 +5644,8 @@ static void answer_cmd_0x5_metadata_data_write(struct AppleSSCState *ssc_state,
     uint8_t copy = request[3];
     DPRINTF("cmd_0x05_req: kbkdf_index: %u\n", kbkdf_index);
     DPRINTF("cmd_0x05_req: copy: %u\n", copy);
+    info_report("SSC-TRACE: cmd_0x05 data_write index=%u copy=%u", kbkdf_index,
+                copy);
     if (copy >= SSC_REQUEST_MAX_COPIES) {
         DPRINTF("%s: invalid copy: %u\n", __func__, copy);
         do_response_prefix(request, response,
@@ -5458,6 +5702,8 @@ static void answer_cmd_0x6_metadata_read(struct AppleSSCState *ssc_state,
     DPRINTF("cmd_0x06_req: kbkdf_index_key: %u\n", kbkdf_index_key);
     DPRINTF("cmd_0x06_req: kbkdf_index_dataslot: %u\n", kbkdf_index_dataslot);
     DPRINTF("cmd_0x06_req: copy: %u\n", copy);
+    info_report("SSC-TRACE: cmd_0x06 metadata_read key=%u dataslot=%u copy=%u",
+                kbkdf_index_key, kbkdf_index_dataslot, copy);
     if (copy >= SSC_REQUEST_MAX_COPIES) {
         DPRINTF("%s: invalid copy: %u\n", __func__, copy);
         do_response_prefix(request, response,

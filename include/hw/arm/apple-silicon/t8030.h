@@ -63,6 +63,7 @@ typedef struct {
     uint32_t sio_protocol;
     uint32_t build_version;
     uint64_t ecid;
+    uint64_t ecid_dt;
     Notifier init_done_notifier;
     hwaddr panic_base;
     hwaddr panic_size;
@@ -74,6 +75,7 @@ typedef struct {
     bool sep_dma_mirror;
     bool enable_wlan;
     bool wlan_amfm;
+    bool hactivation;
     uint32_t board_id;
     uint32_t chip_revision;
     USBTCPRemoteConnType usb_conn_type;

@@ -228,6 +228,37 @@ static void memory_dump(Monitor *mon, int count, int format, int wsize,
     }
 }
 
+
+
+void hmp_sep_trace(Monitor *mon, const QDict *qdict)
+{
+    extern void apple_sep_monitor_trace(Monitor *mon, int64_t seconds);
+    apple_sep_monitor_trace(mon, qdict_get_int(qdict, "seconds"));
+}
+
+
+void hmp_sep_write(Monitor *mon, const QDict *qdict)
+{
+    extern void apple_sep_monitor_write(Monitor *mon, uint64_t gpa,
+                                        const char *hex);
+    apple_sep_monitor_write(mon, qdict_get_int(qdict, "gpa"),
+                            qdict_get_str(qdict, "hex"));
+}
+
+void hmp_sep_msgtap(Monitor *mon, const QDict *qdict)
+{
+    extern void apple_a7iop_sep_msgtap_set(int on);
+    apple_a7iop_sep_msgtap_set(qdict_get_int(qdict, "on") ? 1 : 0);
+    monitor_printf(mon, "sep msgtap %s\n",
+                   qdict_get_int(qdict, "on") ? "on" : "off");
+}
+
+void hmp_sep_regs(Monitor *mon, const QDict *qdict)
+{
+    extern void apple_sep_monitor_dump_cpu(Monitor *mon);
+    apple_sep_monitor_dump_cpu(mon);
+}
+
 void hmp_memory_dump(Monitor *mon, const QDict *qdict)
 {
     int count = qdict_get_int(qdict, "count");
