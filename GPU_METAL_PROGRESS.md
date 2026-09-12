@@ -37,7 +37,15 @@ iOS app acceleration or a working Metal display.
 - [x] Implement the application-to-driver connection.
 - [x] Pass 940 combined service, connection, buffer-copy and cleanup checks.
 - [x] Build the isolated branch and pass the TCG/HVF transport tests.
-- [ ] Resolve how the real iOS Metal framework discovers and initializes its device.
+- [x] Trace the real iOS Metal service selection and plugin construction path.
+- [ ] Implement the native provider and verify its initialization inside iOS.
+
+The latest investigation established how iOS finds a GPU service, selects its
+Metal plugin, and creates its device object. It requires a subclass of Apple's
+`_MTLDevice`, both Metal protocols, and several initialization methods. The
+existing driver connection does not yet supply that userspace implementation.
+See [native discovery findings](https://github.com/weizenberg/Inferno/blob/gpu-metal-bridge/docs/inferno-metal-native-discovery.md) for the
+verified contract and its remaining unknowns.
 
 The combined tests cover large requests, short and failed copies, independent
 connections, disconnect during outstanding work, reset failures and cleanup after
@@ -58,7 +66,9 @@ iOS target; matching the actual iOS kernel interface is still outstanding.
 | End-to-end verification | Repeatable iOS boots, responsive UI, real app rendering and reset/reconnect recovery are demonstrated under TCG and HVF. |
 
 The existing iOS runtime samples still report no default Metal device.
-The precise native provider discovery contract remains unresolved. A previous
+The main selection and factory path is now known. The service match, private
+base-class behavior, final registration details and runtime integration still
+need verification. A previous
 driver-loading continuation was rejected by the platform; that operation remains
 stopped while its cause is unresolved. Independent implementation and testing
 have continued.
