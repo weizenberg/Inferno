@@ -7,9 +7,11 @@ Last updated: 12 September 2026.
 **The host GPU bridge works in test guests. Native Metal acceleration inside
 the iOS 26 guest is not working yet.**
 
-The app-to-driver connection is implemented, compiles and passes 940 automated
-checks with memory and undefined-behavior sanitizers. The next major gap is
-making iOS discover and use a native Metal device.
+The driver connection and its application-side C client are implemented. The
+new client compiles and links with the iPhoneOS 26.5 and macOS 26.5 SDKs; its
+independent fault-injection fixture passes 815 sanitizer checks. The kernel connection's
+existing 940 sanitizer checks passed. The next major gap is making iOS discover
+and use a native Metal device.
 
 Target: iOS 26 applications use GPU/Metal rendering, and Settings identifies
 the emulated panel as a **virtual display**.
@@ -26,7 +28,8 @@ Development branch: [gpu-metal-bridge](https://github.com/weizenberg/Inferno/tre
 | Guest transport | Encodes and submits commands with explicit size limits. | Real ARM guest transport passed under TCG and HVF. |
 | Driver memory ownership | Copies application data into driver-owned buffers and keeps active GPU memory alive until work retires. | Earlier owner and service lifecycle tests passed. |
 | Per-connection sessions | Keeps independent connections' results separate; disconnect starts cleanup without freeing active GPU memory early. | Earlier 443-check session fixture passed. |
-| Application connection | Implements capability, submit, status, read, acknowledge and reset calls, including large buffers. | Kernel SDK compile/partial link and the combined 940-check fixture passed against the dedicated branch. |
+| Driver connection | Implements capability, submit, status, read, acknowledge and reset calls, including large buffers. | Kernel SDK compile/partial link and the combined 940-check fixture passed against the dedicated branch. |
+| Application-side C client | Opens an existing service, negotiates limits, encodes requests, validates replies and closes its connection exactly once. | Actual iPhoneOS 26.5 and macOS 26.5 userspace compilation and linking passed; 815 independent ASan/UBSan checks passed. |
 | Isolated publication build | GPU/Metal code builds on its own dedicated branch. | QEMU build passed; that exact binary passed TCG/HVF transport tests. |
 
 These results prove the components described above. They do not prove native
@@ -34,7 +37,10 @@ iOS app acceleration or a working Metal display.
 
 ## Latest completed milestone
 
-- [x] Implement the application-to-driver connection.
+- [x] Implement the kernel application-to-driver connection.
+- [x] Implement its application-side C client using the approved Opus plan and Sol.
+- [x] Compile and link the client with the actual iPhoneOS and macOS SDKs.
+- [x] Pass 815 independent client checks with address and undefined-behavior sanitizers.
 - [x] Pass 940 combined service, connection, buffer-copy and cleanup checks.
 - [x] Build the isolated branch and pass the TCG/HVF transport tests.
 - [x] Trace the real iOS Metal service selection and plugin construction path.
@@ -50,10 +56,16 @@ verified contract and its remaining unknowns.
 
 The kernel investigation now confirms that a real accelerator subclass is
 required; changing registry properties alone will not make iOS discover the
-service. The application-side IOKit client has a reviewed implementation plan,
-but its implementation has not started.
+service. The application-side IOKit client is now implemented. It accepts an
+existing service and supplies the future provider's application-to-driver calls.
+It does not yet create or register a native Metal device.
 
-The combined tests cover large requests, short and failed copies, independent
+The capability investigation also confirms that Metal consumes a scalar
+private profile. Its correct value and the required supported features for
+Inferno remain unresolved; the current bridge cannot claim a complete Apple
+GPU family based on the host GPU.
+
+The existing kernel connection tests cover large requests, short and failed copies, independent
 connections, disconnect during outstanding work, reset failures and cleanup after
 service shutdown. They use substitute OS objects, so native iOS behavior still
 needs runtime verification. The compile uses nearby macOS kernel headers for an
@@ -89,3 +101,6 @@ complete. This file will keep the unfinished items visible as work progresses.
 Technical implementation: [Metal bridge documentation](https://github.com/weizenberg/Inferno/blob/gpu-metal-bridge/docs/inferno-metal-bridge.md).
 Local test evidence: `~/InfernoData/ios26/gpu-display-20260911/publish-gpu-metal-YOcuW48k/`.
 Combined fixture: `~/InfernoData/ios26/gpu-display-20260911/metal-userclient-fixture-2yPADzP7/`.
+
+Application client SDK evidence: `~/InfernoData/ios26/gpu-display-20260911/metal-native-client-build-el7fjj7_/`.
+Application client fixture: `~/InfernoData/ios26/gpu-display-20260911/metal-native-client-fixture-WFRaYum4/`.

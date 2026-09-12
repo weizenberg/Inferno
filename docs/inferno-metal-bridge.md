@@ -344,3 +344,53 @@ accepts only public connection type 0. It adds no private entitlement,
 authorization shortcut or shared-instance property. Native iOS admission,
 port-transfer behavior, exact target ABI and runtime still require on-device
 verification before publishing an application-accessible service.
+
+## Application-side IOKit client
+
+`contrib/inferno-metal/user-client.[ch]` provides the userspace half of the
+connection for the eventual native Metal provider. Compile the C source with
+`include/` on the header search path and link IOKit and CoreFoundation. It is
+not part of the host QEMU binary. The library does not discover a service or
+implement an `MTLDevice`; the caller supplies an existing, borrowed
+`io_service_t` to `imtl_user_client_open`.
+
+A successful open owns one type-0 connection and exposes immutable negotiated
+capabilities through `imtl_user_client_caps`. The caller must serialize every
+operation, capability access and close. `imtl_user_client_close(&client)` clears
+the handle and closes its connection exactly once, even when close returns an
+error. Do not retry the old connection. A failed open leaves the output handle
+null; failures after a successful `IOServiceOpen` close that new connection and
+preserve the original error. The supplied service reference remains caller-owned.
+
+`ImtlUserSubmit` is a native request, not the wire layout. Its source and input
+are borrowed for the synchronous submission call, and both 64-byte function
+name arrays must contain a NUL. The client validates the negotiated independent
+size limits and aggregate request bound, creates a canonical little-endian
+packet with zero flags/reserved/name tails, and frees it after the call. The
+full 64-bit sequence is preserved. Public IOKit calls handle inline and
+out-of-line marshalling; GPU execution continues asynchronously in the service.
+
+Capability and status replies must have the exact fixed size and valid version,
+reserved fields and enumerated values before the client publishes them. A read
+must return exactly its requested length. Raw IPC failures remain unchanged;
+malformed successful replies return `kIOReturnBadMessageID`, local invalid
+arguments return `kIOReturnBadArgument`, and allocation failure returns
+`kIOReturnNoMemory`. Read sets the returned byte count to zero on failure, but
+IOKit may already have modified the destination: consume no bytes unless the
+call succeeds. The client also checks offset-plus-length overflow.
+
+Submit, status, read, acknowledge and reset do not retain application buffers
+or duplicate the service's GPU state. This layer adds no polling thread or
+locking. The kernel service continues to own outstanding work after disconnect.
+The source compiles and links with the actual iPhoneOS 26.5 userspace SDK and
+macOS 26.5 SDK. These checks do not establish native iOS driver startup, a
+successful application connection, or Metal device discovery.
+
+The independent host fixture passes 815 ASan/UBSan checks. It substitutes public
+IOKit calls and uses the production kernel decoder as an independent packet
+oracle. Coverage includes maximum requests and reads, lower negotiated limits,
+malformed replies, partial failed writes, raw errors and balanced allocation
+and connection cleanup. It does not execute native IPC or GPU work. Fixture
+and build commands, source hashes and results are preserved under
+`~/InfernoData/ios26/gpu-display-20260911/metal-native-client-fixture-WFRaYum4/`
+and `metal-native-client-build-el7fjj7_/`.

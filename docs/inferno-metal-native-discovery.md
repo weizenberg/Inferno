@@ -55,14 +55,26 @@ In userspace, `_MTLDevice`'s default `initWithAcceleratorPort:` calls
 `init` performs substantive allocation and queue setup, and the base destructor
 cleans up that state; a subclass must not free those base allocations again.
 The inherited `initWorkarounds` is a no-op. Limits and feature initialization
-depend on `featureProfile`, whose representation and truthful values for the
-bridge remain unresolved. Choosing an arbitrary Apple GPU family is not a
-verified substitute for that contract.
+depend on `featureProfile`. The actual `initLimits` entry calls that selector
+and immediately compares its 64-bit return against small integer constants;
+it is a scalar profile selector, not an Objective-C object. Its canonical type,
+valid values and truthful mapping for the bridge remain unresolved. The family
+initializer passes it to a helper before replacing a 24-byte region of base
+state; that helper still needs verification.
+
+Installed SDK headers provide no declaration of this private profile. Public
+`MTLGPUFamily` and `MTLFeatureSet` values describe different capability
+contracts. The narrow bridge cannot advertise a complete family based on the
+host GPU's capabilities. Some individual queries also need more implementation:
+`MTLArgumentBuffersTier`, for example, has no unsupported value. Zero-filled
+answers cannot stand in for a verified capability contract.
 
 ## What this means for Inferno
 
 The published `InfernoMetalService` and type-0 user client provide a private
-command transport. They do not implement this userspace provider. Adding
+command transport. The application-side `user-client.[ch]` library now supplies
+capability negotiation, packet encoding and connection ownership for a future
+provider, but does not implement the provider itself. Adding
 plugin properties to an ordinary service has not been shown to satisfy the
 `IOAcceleratorES` match. `IOMatchCategory` alone is not evidence of that match.
 
@@ -110,5 +122,8 @@ Base-class and kernel interface evidence is under
 `~/InfernoData/ios26/gpu-display-20260911/metal-native-base-271dpkdu/`;
 the kernel extraction's code and data sections were checked byte-for-byte
 against the original image before analysis.
+The scalar profile verification and source capability limits are recorded in
+`metal-feature-profile-hyhddo34/coordinator-review.md` and
+`metal-feature-profile-source-bFkjagLr/findings.md` under the same evidence root.
 These target-specific observations are not a stable public plugin API or
 proof of compatibility with another iOS release.
