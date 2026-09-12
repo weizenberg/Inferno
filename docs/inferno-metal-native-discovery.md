@@ -30,7 +30,34 @@ passed this path in a running iOS guest.
 The descriptor initializer `initWithAcceleratorPort:deviceClass:` is an
 intermediate step. It is distinct from the plugin's single-argument initializer.
 `_MTLDevice` is exported by the target Metal image; its initializer, private
-state, and required overrides still need to be established before subclassing.
+state, and required overrides need to be respected when subclassing.
+
+## Base-class requirements recovered so far
+
+The target kernel registers the hierarchy
+`IOService <- IOAcceleratorES <- IOGPU`. `IOAcceleratorES` has instance size
+`0x88`, the same as `IOService`. All 168 virtual slots have matching pointer
+authentication metadata, and 165 have identical function targets. The three
+different slots are the destructor pair and the metaclass getter. Its
+meta-taking constructors forward to the `IOService` constructor and install
+the accelerator class's virtual table. Its metaclass allocator returns null;
+direct allocation of this abstract base is not a way to publish a service.
+A genuine concrete subclass and verified link bindings remain necessary.
+
+Primary IOKit/XNU source confirms that `IOServiceMatching` uses the runtime
+metaclass hierarchy. Registry names, DeviceTree `compatible` strings, and
+`IOMatchCategory` do not create that relationship. The source revision is
+XNU `12377.121.6`, compared with target `12377.122.8`; the hierarchy above was
+independently recovered from the target kernel image.
+
+In userspace, `_MTLDevice`'s default `initWithAcceleratorPort:` calls
+`doesNotRecognizeSelector:`. A provider must override it. The ordinary base
+`init` performs substantive allocation and queue setup, and the base destructor
+cleans up that state; a subclass must not free those base allocations again.
+The inherited `initWorkarounds` is a no-op. Limits and feature initialization
+depend on `featureProfile`, whose representation and truthful values for the
+bridge remain unresolved. Choosing an arbitrary Apple GPU family is not a
+verified substitute for that contract.
 
 ## What this means for Inferno
 
@@ -39,9 +66,9 @@ command transport. They do not implement this userspace provider. Adding
 plugin properties to an ordinary service has not been shown to satisfy the
 `IOAcceleratorES` match. `IOMatchCategory` alone is not evidence of that match.
 
-The remaining dependencies are the actual accelerator service matching
-contract, final service packaging, `_MTLDevice` initialization and capability
-methods, and a provider that owns real Metal resource and command objects.
+The remaining dependencies are the concrete accelerator subclass and link
+bindings, final service packaging, `_MTLDevice` capability initialization, and
+a provider that owns real Metal resource and command objects.
 The final registration block also needs instruction-level verification; its
 current decompilation is insufficient to settle optional wrapping behavior.
 
@@ -79,5 +106,9 @@ is `dispatch_sync`.
 
 Detailed local evidence is retained under
 `~/InfernoData/ios26/gpu-display-20260911/metal-provider-discovery-huk90j0y/`.
+Base-class and kernel interface evidence is under
+`~/InfernoData/ios26/gpu-display-20260911/metal-native-base-271dpkdu/`;
+the kernel extraction's code and data sections were checked byte-for-byte
+against the original image before analysis.
 These target-specific observations are not a stable public plugin API or
 proof of compatibility with another iOS release.
