@@ -73,10 +73,13 @@ It does not yet create or register a native Metal device.
 
 The capability investigation confirms the private profile's type, the limits
 that must be positive, and the factory that creates the concrete feature-query
-object. The initializer's 231 device capability queries have now been identified and
-checked against the captured calls. The correct capability mapping for Inferno
-and the base methods it can safely inherit still need verification. The current bridge cannot
-claim a complete Apple GPU family based on the host GPU.
+object. The initializer's 231 device capability queries have now been identified
+and checked against the captured calls. Their inherited implementations forward
+through the feature-query object. During construction, an initially nil object
+would yield false answers; this does not establish a valid capability profile
+or successful device initialization. The correct capability mapping for Inferno
+still needs verification. The bridge cannot claim a complete Apple GPU family
+based on the host GPU.
 
 The v3 compiler-query and object layer is implemented and tested. It preserves
 library type and nullable install name, signed patch counts, function constants

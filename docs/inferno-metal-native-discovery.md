@@ -81,7 +81,8 @@ The feature-query path uses a class cluster. Allocation of
 `MTLDeviceFeatureQueries` selects the concrete `_MTLDeviceFeatureQueries`, then
 calls `initWithDevice:` and stores the result. The concrete `validate` method is
 a no-op on this build. The concrete initializer's 231 device queries are now
-identified; their inheritance and valid capability answers still need review. The base initializer returns nil; normal allocation selects
+identified. Their inherited methods forward through the feature-query object;
+valid capability answers still need review. The base initializer returns nil; normal allocation selects
 the concrete subclass before initialization.
 
 An empty family array makes the inherited family-membership query return false;
@@ -193,8 +194,27 @@ whose cache value is 5792. A plain store does not establish retained ownership.
 It also creates capability descriptions with constant names/tags and dynamic
 query results. Descriptor-to-query pairing currently relies on decompiler
 dataflow; tag meanings and a valid Inferno capability profile remain unresolved.
-The next check maps the initialization-time queries to inherited `_MTLDevice`
-implementations and identifies which require concrete provider overrides.
+All 231 queries resolve to distinct `_MTLDevice` implementations with BOOL
+return types. Each begins with `LDR X0, [X0, #0x270]` before forwarding through a
+`familySupports*` selector trampoline. The receiver is the feature-query object,
+not the device itself. The coordinator checked every first instruction and tail
+branch, and sampled the corresponding concrete feature-query methods.
+`initFeatureQueries` stores the initializer result at that offset afterwards
+(`STR X0, [X19, #0x270]` at `0x186112c58`).
+
+For an initially nil field, the inherited calls made during construction return
+false under normal Objective-C message semantics. That conditional inference
+does not prove complete device initialization, establish all post-initialization
+answers, or justify advertising any GPU family. The concrete feature-query
+methods can depend on the profile. The base instance method table does not
+provide `featureProfile`; its concrete implementation and a truthful capability
+mapping remain required investigation. Numeric switch ranges alone are not a
+valid Inferno profile.
+
+Kimi's preliminary analysis omitted the receiver load and inferred missing
+methods on the device. Its revised mapping and the coordinator's independent
+byte checks correct that conclusion. The controlling interpretation is retained
+in `root-base-defaults-review.md` and `root-base-receiver-verification.json`.
 
 This investigation ran through the authorized DeepSeek Flash retry, followed by
 the user's selected Kimi K3 fallback for the missing full-cache selector data.
