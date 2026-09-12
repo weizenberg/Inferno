@@ -330,6 +330,10 @@ typedef struct {
     uint64_t ramdisk_size;
     hwaddr trustcache_addr;
     uint64_t trustcache_size;
+    hwaddr auxkc_addr;
+    uint64_t auxkc_size;
+    hwaddr auxkc_header_addr;
+    hwaddr auxkc_ro_addr;
     hwaddr sep_fw_addr;
     uint64_t sep_fw_size;
     hwaddr tz0_addr;
@@ -348,6 +352,9 @@ typedef struct {
     bool had_autoboot;
     AppleBootMode boot_mode;
 } AppleBootInfo;
+
+bool apple_boot_load_auxkc(const char *filename, AddressSpace *as,
+                           AppleBootInfo *info, Error **errp);
 
 MachoHeader64 *apple_boot_load_kernel(const char *filename,
                                       MachoHeader64 **secure_monitor);
@@ -411,6 +418,7 @@ AppleDTNode *apple_boot_load_dt_file(const char *filename);
 
 #define APPLE_BOOT_KEEP_WLAN (1U << 0)
 #define APPLE_BOOT_KEEP_AMFM (1U << 1)
+#define APPLE_BOOT_KEEP_GFX_PROBE (1U << 2)
 
 void apple_boot_populate_dt(AppleDTNode *root, AppleBootInfo *info,
                             bool auto_boot, uint32_t keep_flags);

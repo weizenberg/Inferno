@@ -50,6 +50,7 @@ typedef struct PlatformBusFDTData {
     int irq_start; /* index of the first IRQ usable by platform bus devices */
     const char *pbus_node_name; /* name of the platform bus node */
     PlatformBusDevice *pbus;
+    const char *intc;
 } PlatformBusFDTData;
 
 /* struct that allows to match a device and create its FDT node */
@@ -501,6 +502,23 @@ static int no_fdt_node(SysBusDevice *sbdev, void *opaque)
     return 0;
 }
 
+static int add_inferno_metal_node(SysBusDevice *sbdev, void *opaque)
+{
+    PlatformBusFDTData *data = opaque;
+    uint64_t base =
+        object_property_get_uint(OBJECT(sbdev), "addr", &error_abort);
+    int irq = platform_bus_get_irqn(data->pbus, sbdev, 0) + data->irq_start;
+    g_autofree char *name = g_strdup_printf("/inferno-metal@%" PRIx64, base);
+
+    /* This device maps its explicitly configured GPA outside platform-bus. */
+    qemu_fdt_add_subnode(data->fdt, name);
+    qemu_fdt_setprop_string(data->fdt, name, "compatible", "inferno,metal-v1");
+    qemu_fdt_setprop_sized_cells(data->fdt, name, "reg", 2, base, 2, 0x10000);
+    qemu_fdt_setprop_phandle(data->fdt, name, "interrupt-parent", data->intc);
+    qemu_fdt_setprop_cells(data->fdt, name, "interrupts", 0, irq, 4);
+    return 0;
+}
+
 /* Device type based matching */
 static bool type_match(SysBusDevice *sbdev, const BindingEntry *entry)
 {
@@ -522,6 +540,7 @@ static const BindingEntry bindings[] = {
     /* No generic DT support for smmuv3 dev. Support added for arm virt only */
     TYPE_BINDING(TYPE_ARM_SMMUV3, no_fdt_node),
     TYPE_BINDING(TYPE_RAMFB_DEVICE, no_fdt_node),
+    TYPE_BINDING("inferno-metal-bridge", add_inferno_metal_node),
     TYPE_BINDING(TYPE_UEFI_VARS_SYSBUS, add_uefi_vars_node),
     TYPE_BINDING("", NULL), /* last element */
 };
@@ -591,6 +610,7 @@ void platform_bus_add_all_fdt_nodes(void *fdt, const char *intc, hwaddr addr,
         .irq_start = irq_start,
         .pbus_node_name = node,
         .pbus = pbus,
+        .intc = intc,
     };
 
     /* Loop through all dynamic sysbus devices and create their node */

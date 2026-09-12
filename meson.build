@@ -690,6 +690,7 @@ version_res = []
 coref = []
 iokit = []
 pvg = not_found
+inferno_metal = not_found
 emulator_link_args = []
 midl = not_found
 widl = not_found
@@ -717,6 +718,8 @@ elif host_os == 'darwin'
   host_dsosuf = '.dylib'
   pvg = dependency('appleframeworks', modules: ['ParavirtualizedGraphics', 'Metal'],
                    required: get_option('pvg'))
+  inferno_metal = dependency('appleframeworks', modules: ['Foundation', 'Metal'],
+                             required: false)
 elif host_os == 'sunos'
   socket = [cc.find_library('socket'),
             cc.find_library('nsl'),

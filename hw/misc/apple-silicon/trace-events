@@ -62,3 +62,13 @@ apple_wlan_rx_buf_post(uint32_t request_id, uint64_t data_addr, uint16_t data_le
 apple_wlan_rx_buf_full(uint32_t request_id) "cannot retain rx buf req 0x%08x: pool full"
 apple_wlan_rx_too_large(size_t size, uint16_t data_len) "dropping rx frame of %zu bytes: guest buffer has %u"
 apple_wlan_rx_frame(uint32_t request_id, size_t size, uint64_t data_addr) "rx req 0x%08x len %zu -> 0x%" PRIx64
+
+# gfx-probe.c
+apple_gfx_probe_fault(const char *name, uint64_t address, unsigned size, bool write, uint64_t value) "%s address=0x%" PRIx64 " size=%u write=%d value=0x%" PRIx64 " result=MEMTX_ERROR"
+
+# metal-bridge.c
+inferno_metal_submit(uint64_t sequence, uint32_t opcode, uint32_t bytes) "sequence=%" PRIu64 " opcode=%u bytes=%u"
+inferno_metal_complete(uint64_t sequence, uint32_t error) "sequence=%" PRIu64 " error=%u"
+inferno_metal_error(uint64_t sequence, const char *message) "sequence=%" PRIu64 " %s"
+inferno_metal_backend_phase(uint64_t sequence, uint32_t opcode, const char *phase, int64_t elapsed_ns) "sequence=%" PRIu64 " opcode=%u phase=%s elapsed_ns=%" PRId64
+inferno_metal_pipeline_cache(uint64_t sequence, uint32_t opcode, bool hit, uint32_t entries) "sequence=%" PRIu64 " opcode=%u hit=%d entries=%u"

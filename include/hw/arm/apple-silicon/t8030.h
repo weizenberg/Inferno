@@ -56,6 +56,7 @@ typedef struct {
     AppleBootInfo boot_info;
     AppleVideoArgs video_args;
     char *trustcache_filename;
+    char *auxkc_filename;
     char *ticket_filename;
     char *sep_rom_filename;
     char *sep_fw_filename;
@@ -73,6 +74,8 @@ typedef struct {
     bool force_dfu;
     bool sep_dma_mirror;
     bool enable_wlan;
+    bool gfx_probe;
+    bool metal_bridge;
     bool wlan_amfm;
     uint32_t board_id;
     uint32_t chip_revision;

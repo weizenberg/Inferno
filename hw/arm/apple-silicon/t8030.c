@@ -51,6 +51,8 @@
 #include "hw/misc/apple-silicon/buttons.h"
 #include "hw/misc/apple-silicon/chestnut.h"
 #include "hw/misc/apple-silicon/fan53740.h"
+#include "hw/misc/apple-silicon/gfx-probe.h"
+#include "hw/misc/apple-silicon/metal-bridge.h"
 #include "hw/misc/apple-silicon/mic_tempsensor.h"
 #include "hw/misc/apple-silicon/roswell.h"
 #include "hw/misc/apple-silicon/smc.h"
@@ -330,6 +332,38 @@ static void t8030_load_kernelcache(AppleT8030MachineState *t8030,
     g_virt_base = kc_base + (g_virt_slide - g_phys_slide);
 
     info->trustcache_addr = vtop_slid(ro_lower) - info->trustcache_size;
+    info->auxkc_addr = 0;
+    info->auxkc_size = 0;
+    info->auxkc_header_addr = 0;
+    info->auxkc_ro_addr = 0;
+    if (t8030->auxkc_filename) {
+        MachoLoadCommand *cmd = (MachoLoadCommand *)(t8030->kernel + 1);
+
+        // The AuxKC occupies only the unused gap below the TrustCache. Do
+        // not assume that an arbitrary BootKC has no earlier RW segments.
+        for (unsigned i = 0; i < t8030->kernel->n_cmds; i++) {
+            if (cmd->cmd == LC_SEGMENT_64) {
+                MachoSegmentCommand64 *seg = (MachoSegmentCommand64 *)cmd;
+
+                if (seg->vmsize &&
+                    vtop_slid(seg->vmaddr) < info->trustcache_addr) {
+                    error_setg(
+                        &error_fatal,
+                        "AuxKC requires TrustCache below all BootKC segments");
+                    return;
+                }
+            }
+            cmd = (MachoLoadCommand *)((uint8_t *)cmd + cmd->cmd_size);
+        }
+        if (!apple_boot_load_auxkc(t8030->auxkc_filename, &address_space_memory,
+                                   info, &error_fatal)) {
+            return;
+        }
+        info_report("AuxKC Physical Base: 0x" HWADDR_FMT_plx " Size: 0x%" PRIx64
+                    " Header: 0x" HWADDR_FMT_plx,
+                    info->auxkc_addr, info->auxkc_size,
+                    info->auxkc_header_addr);
+    }
     info_report("TrustCache Physical Base: 0x" HWADDR_FMT_plx,
                 info->trustcache_addr);
 
@@ -424,8 +458,11 @@ static void t8030_load_kernelcache(AppleT8030MachineState *t8030,
     g_virt_base = kc_base;
 
     for (int i = 0; i < AMCC_PLANE_COUNT; ++i) {
-        AMCC_WREG32(t8030, AMCC_PLANE_LOWER_LIMIT(i),
-                    (info->trustcache_addr - info->dram_base) >> 14);
+        AMCC_WREG32(
+            t8030, AMCC_PLANE_LOWER_LIMIT(i),
+            ((info->auxkc_addr ? info->auxkc_ro_addr : info->trustcache_addr) -
+             info->dram_base) >>
+                14);
         AMCC_WREG32(t8030, AMCC_PLANE_UPPER_LIMIT(i),
                     (vtop_slid(ro_upper) - info->dram_base - 1) >> 14);
         AMCC_WREG32(t8030, AMCC_PLANE_LOCK(i), 1);
@@ -658,11 +695,12 @@ static void t8030_memory_setup(AppleT8030MachineState *t8030)
 
     apple_boot_allocate_segment_records(memory_map, hdr);
 
-    apple_boot_populate_dt(t8030->device_tree, info, auto_boot,
-                           (t8030->enable_wlan ? APPLE_BOOT_KEEP_WLAN : 0) |
-                               (t8030->enable_wlan && t8030->wlan_amfm ?
-                                    APPLE_BOOT_KEEP_AMFM :
-                                    0));
+    apple_boot_populate_dt(
+        t8030->device_tree, info, auto_boot,
+        (t8030->enable_wlan ? APPLE_BOOT_KEEP_WLAN : 0) |
+            (t8030->gfx_probe ? APPLE_BOOT_KEEP_GFX_PROBE : 0) |
+            (t8030->enable_wlan && t8030->wlan_amfm ? APPLE_BOOT_KEEP_AMFM :
+                                                      0));
 
     switch (hdr->file_type) {
     case MH_EXECUTE:
@@ -2460,6 +2498,120 @@ static void t8030_create_mt_spi(AppleT8030MachineState *t8030)
                                 qdev_get_gpio_in(gpio, ints[0]));
 }
 
+static void t8030_create_metal_bridge(AppleT8030MachineState *t8030)
+{
+    AppleDTNode *armio = apple_dt_get_node(t8030->device_tree, "arm-io");
+    AppleDTNode *node;
+    AppleDTNode *aic;
+    AppleDTProp *prop;
+    DeviceState *dev;
+    const uint64_t reg[] = { 0xfff00000, 0x10000 };
+    const uint32_t irq = 0x200;
+
+    if (!object_class_by_name(TYPE_INFERNO_METAL_BRIDGE)) {
+        error_setg(&error_fatal, "Metal bridge requires a Darwin Metal build");
+        return;
+    }
+    if (!armio || t8030->armio_base != 0x200000000ULL ||
+        apple_dt_get_node(armio, "inferno-metal")) {
+        error_setg(&error_fatal,
+                   "Metal bridge requires the N104 arm-io layout");
+        return;
+    }
+    prop = apple_dt_get_prop(armio, "ranges");
+    if (!prop || prop->len < 24 || ldq_le_p(prop->data) != 0 ||
+        ldq_le_p(prop->data + 8) != t8030->armio_base ||
+        ldq_le_p(prop->data + 16) < reg[0] + reg[1]) {
+        error_setg(&error_fatal, "Metal bridge is outside arm-io ranges");
+        return;
+    }
+    for (GList *child = armio->children; child; child = child->next) {
+        prop = apple_dt_get_prop(child->data, "reg");
+        if (!prop) {
+            continue;
+        }
+        if (prop->len % 16) {
+            const char *name =
+                apple_dt_get_prop_str(child->data, "name", &error_fatal);
+
+            /* N104 combo-radio platform nodes use a scalar provider ID. */
+            if (prop->len == 8 && ldq_le_p(prop->data) == 0xf &&
+                (!strcmp(name, "wlan") || !strcmp(name, "bluetooth"))) {
+                continue;
+            }
+            error_setg(&error_fatal,
+                       "Metal bridge found malformed arm-io/%s reg (%u bytes)",
+                       name, prop->len);
+            return;
+        }
+        for (uint32_t offset = 0; offset < prop->len; offset += 16) {
+            uint64_t base = ldq_le_p(prop->data + offset);
+            uint64_t size = ldq_le_p(prop->data + offset + 8);
+
+            if (size && base < reg[0] + reg[1] &&
+                (base >= reg[0] || size > reg[0] - base)) {
+                error_setg(&error_fatal, "Metal bridge overlaps arm-io reg");
+                return;
+            }
+        }
+    }
+    aic = apple_dt_get_node(armio, "aic");
+    prop = aic ? apple_dt_get_prop(aic, "ipid-mask") : NULL;
+    if (!prop || prop->len / 4 <= irq / 32 ||
+        apple_dt_get_prop_u32(aic, "AAPL,phandle", &error_fatal) != 0x20) {
+        error_setg(&error_fatal, "Metal bridge requires N104 AIC input 0x200");
+        return;
+    }
+    /* N104: unused arm-io tail below DRAM_30, and unused AIC input 0x200. */
+    node = apple_dt_node_new(armio, "inferno-metal");
+    apple_dt_set_prop_str(node, "compatible", "inferno,metal-v1");
+    apple_dt_set_prop(node, "reg", sizeof(reg), reg);
+    apple_dt_set_prop_u32(node, "interrupt-parent", 0x20);
+    apple_dt_set_prop_u32(node, "interrupts", irq);
+    apple_dt_set_prop_str(node, "model", "Inferno Metal Bridge");
+    dev = qdev_new(TYPE_INFERNO_METAL_BRIDGE);
+    qdev_prop_set_uint64(dev, "addr", t8030->armio_base + reg[0]);
+    object_property_add_child(OBJECT(t8030), "metal-bridge-device",
+                              OBJECT(dev));
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
+    sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0,
+                       qdev_get_gpio_in(DEVICE(t8030->aic), irq));
+}
+
+static void t8030_create_gfx_probe(AppleT8030MachineState *t8030)
+{
+    static const char *nodes[] = { "sgx", "gfx-asc" };
+    AppleDTNode *armio = apple_dt_get_node(t8030->device_tree, "arm-io");
+
+    if (!armio) {
+        error_setg(&error_fatal,
+                   "GPU probe requires an arm-io DeviceTree node");
+        return;
+    }
+    for (size_t i = 0; i < ARRAY_SIZE(nodes); i++) {
+        AppleDTNode *node = apple_dt_get_node(armio, nodes[i]);
+        AppleDTProp *prop = node ? apple_dt_get_prop(node, "reg") : NULL;
+        uint64_t reg[4];
+
+        if (!prop || prop->len != sizeof(reg)) {
+            error_setg(&error_fatal, "GPU probe requires two %s MMIO ranges",
+                       nodes[i]);
+            return;
+        }
+        memcpy(reg, prop->data, sizeof(reg));
+        for (size_t region = 0; region < 2; region++) {
+            g_autofree char *name =
+                g_strdup_printf("gfx-probe-%s-%zu", nodes[i], region);
+            if (reg[region * 2] > UINT64_MAX - t8030->armio_base) {
+                error_setg(&error_fatal, "GPU probe address overflow");
+                return;
+            }
+            apple_gfx_probe_map(name, t8030->armio_base + reg[region * 2],
+                                reg[region * 2 + 1]);
+        }
+    }
+}
+
 static void t8030_create_aop(AppleT8030MachineState *t8030)
 {
     uint32_t i;
@@ -2898,6 +3050,11 @@ static void t8030_init(MachineState *machine)
 
     t8030 = APPLE_T8030(machine);
 
+    if (t8030->auxkc_filename && t8030->securerom_filename) {
+        error_setg(&error_fatal, "auxkc= requires direct kernel boot");
+        return;
+    }
+
     if (!t8030_preflight_firmware(t8030, machine)) {
         return;
     }
@@ -3175,6 +3332,12 @@ static void t8030_init(MachineState *machine)
     t8030_create_lm_backlight(t8030);
     t8030_create_display_pmu(t8030);
     t8030_create_display(t8030);
+    if (t8030->metal_bridge) {
+        t8030_create_metal_bridge(t8030);
+    }
+    if (t8030->gfx_probe) {
+        t8030_create_gfx_probe(t8030);
+    }
     t8030_create_mt_spi(t8030);
     t8030_create_aop(t8030);
     t8030_create_mca(t8030);
@@ -3251,9 +3414,12 @@ PROP_GETTER_SETTER(bool, kaslr_off);
 PROP_GETTER_SETTER(bool, force_dfu);
 PROP_GETTER_SETTER(bool, sep_dma_mirror);
 PROP_GETTER_SETTER(bool, enable_wlan);
+PROP_GETTER_SETTER(bool, gfx_probe);
+PROP_GETTER_SETTER(bool, metal_bridge);
 PROP_GETTER_SETTER(bool, wlan_amfm);
 PROP_GETTER_SETTER(int, usb_conn_type);
 PROP_STR_GETTER_SETTER(trustcache_filename);
+PROP_STR_GETTER_SETTER(auxkc_filename);
 PROP_STR_GETTER_SETTER(ticket_filename);
 PROP_STR_GETTER_SETTER(sep_rom_filename);
 PROP_STR_GETTER_SETTER(sep_fw_filename);
@@ -3292,6 +3458,10 @@ static void t8030_class_init(ObjectClass *klass, const void *data)
                                   t8030_get_trustcache_filename,
                                   t8030_set_trustcache_filename);
     object_class_property_set_description(klass, "trustcache", "TrustCache");
+    object_class_property_add_str(klass, "auxkc", t8030_get_auxkc_filename,
+                                  t8030_set_auxkc_filename);
+    object_class_property_set_description(
+        klass, "auxkc", "Experimental raw auxiliary kernel collection");
     object_class_property_add_str(klass, "ticket", t8030_get_ticket_filename,
                                   t8030_set_ticket_filename);
     object_class_property_set_description(klass, "ticket", "AP Ticket");
@@ -3332,6 +3502,20 @@ static void t8030_class_init(ObjectClass *klass, const void *data)
         klass, "sep-dma-mirror",
         "Publish the SEP's resolved DART mapping as RAM under HVF "
         "(faster; no effect under TCG)");
+    oprop = object_class_property_add_bool(
+        klass, "gfx-probe", t8030_get_gfx_probe, t8030_set_gfx_probe);
+    object_property_set_default_bool(oprop, false);
+    object_class_property_set_description(
+        klass, "gfx-probe",
+        "Expose native GPU nodes and trace faulting MMIO accesses "
+        "(diagnostic only; no GPU emulation)");
+    oprop = object_class_property_add_bool(
+        klass, "metal-bridge", t8030_get_metal_bridge, t8030_set_metal_bridge);
+    object_property_set_default_bool(oprop, false);
+    object_class_property_set_description(
+        klass, "metal-bridge",
+        "Expose the Inferno host Metal bridge (requires a matching guest "
+        "driver)");
     oprop = object_class_property_add_bool(
         klass, "enable-wlan", t8030_get_enable_wlan, t8030_set_enable_wlan);
     object_property_set_default_bool(oprop, false);

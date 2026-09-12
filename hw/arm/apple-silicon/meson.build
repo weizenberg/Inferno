@@ -6,6 +6,7 @@ arm_common_ss.add(when: 'CONFIG_APPLE_SOC', if_true: files(
     'a13.c',
     'a13_gxf.c',
     'a9.c',
+    'auxkc.c',
     'boot.c',
     'dt.c',
     'mem.c',

@@ -158,6 +158,7 @@ static const char *KEEP_COMP[] = {
     // WiFi endpoint; when the t8030 `enable-wlan` property is off the node is
     // still dropped by REM_NAMES, so keeping this entry unconditional is safe.
     "wlan-pcie,bcm4378\0$",
+    "inferno,metal-v1\0$",
 };
 
 static const char *REM_NAMES[] = {
@@ -268,7 +269,9 @@ static void apple_boot_process_dt_node(AppleDTNode *node, AppleDTNode *parent,
 
     if ((prop = apple_dt_get_prop(node, "compatible")) != NULL) {
         assert_nonnull(prop->data);
-        found = false;
+        found = (keep_flags & APPLE_BOOT_KEEP_GFX_PROBE) != 0 &&
+                prop->len == sizeof("gpu,t8030") &&
+                memcmp(prop->data, "gpu,t8030", sizeof("gpu,t8030")) == 0;
         for (i = 0; i < ARRAY_SIZE(KEEP_COMP); i++) {
             if (memcmp(prop->data, KEEP_COMP[i],
                        MIN(prop->len, sstrlen(KEEP_COMP[i]))) == 0) {
@@ -291,6 +294,10 @@ static void apple_boot_process_dt_node(AppleDTNode *node, AppleDTNode *parent,
         assert_nonnull(prop->data);
         for (i = 0; i < ARRAY_SIZE(REM_NAMES); i++) {
             uint64_t size = MIN(prop->len, sstrlen(REM_NAMES[i]));
+            if ((keep_flags & APPLE_BOOT_KEEP_GFX_PROBE) != 0 &&
+                g_str_equal(REM_NAMES[i], "gfx-asc")) {
+                continue;
+            }
             // The WiFi endpoint/params nodes (and optionally the AMFM
             // combo-chip power controller) stay when enabled.
             if (((keep_flags & APPLE_BOOT_KEEP_WLAN) != 0 &&
@@ -534,6 +541,8 @@ static void apple_boot_init_mem_ranges(AppleDTNode *root)
 
     apple_dt_set_prop(child, "RAMDisk", 16, NULL);
     apple_dt_set_prop(child, "TrustCache", 16, NULL);
+    apple_dt_set_prop(child, "AuxKC", 16, NULL);
+    apple_dt_set_prop(child, "AuxKC-mach_header", 16, NULL);
     apple_dt_set_prop(child, "SEPFW", 16, NULL);
     apple_dt_set_prop(child, "BootArgs", 16, NULL);
     apple_dt_set_prop(child, "DeviceTree", 16, NULL);
@@ -668,6 +677,9 @@ void apple_boot_finalise_dt(AppleDTNode *root, AddressSpace *as,
     set_memory_range(root, "RAMDisk", info->ramdisk_addr, info->ramdisk_size);
     set_memory_range(root, "TrustCache", info->trustcache_addr,
                      info->trustcache_size);
+    set_memory_range(root, "AuxKC", info->auxkc_addr, info->auxkc_size);
+    set_memory_range(root, "AuxKC-mach_header", info->auxkc_header_addr,
+                     info->auxkc_header_addr ? sizeof(MachoHeader64) : 0);
     set_memory_range(root, "SEPFW", info->sep_fw_addr, info->sep_fw_size);
     set_memory_range(root, "BootArgs", info->kern_boot_args_addr,
                      info->kern_boot_args_size);
