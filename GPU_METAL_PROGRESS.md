@@ -266,6 +266,17 @@ Inferno argument-buffer implementation yet. Evidence:
 `metal-argument-function-reflection-85dm68sf/root-review.json` and the retained
 failed alternative `metal-argument-pipeline-debug-q9r6hpre`.
 
+A further native argument-buffer test verifies backing-byte copies. A buffer
+that was never selected as an encoder destination executes after receiving a
+CPU copy of the encoded bytes. Re-encoding the original buffer leaves the copy
+unchanged; editing only the copy's constant changes its next result. All three
+commands complete and all 268 output/input/texture bytes match independent CPU
+checks. This is one compiled shader on the M5 Pro Tier2 host, with all CPU writes
+before the affected command's bindings. It does not prove a universal Tier1
+contract. Public-source review supports treating this as a Tier2 compatibility
+boundary; it does not by itself require Tier2 copying in the next Tier1 milestone.
+Evidence: `metal-argument-backing-copy-8_99rbs_/root-review.json`.
+
 DeepSeek Flash also located the native base initializer's allocation and cleanup
 of the internal storage used by the optional initialization method. Root verified
 the captured instructions against the original cache. The provider must preserve
