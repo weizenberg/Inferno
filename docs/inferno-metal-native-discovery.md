@@ -107,6 +107,30 @@ The implemented v2 compiler-query path now supplies bounded function inventories
 actual compute limits and structured compiler errors before execution. Its
 application helpers and ARM transport are verified; the native provider still
 needs to call those helpers and construct the corresponding Metal objects.
+The public native objects need more information than the current compiler
+queries return. `MTLFunction` exposes function constants, patch information,
+attributes and options. `MTLComputePipelineState` also exposes allocation size,
+imageblock sizing, resource identifiers, shader validation and required
+threadgroup dimensions. These values must come from host metadata or a verified
+implementation contract. A successful three-field pipeline query does not prove
+that every required native object getter can return a correct value. Exporting a
+host resource identifier also requires an ownership policy that survives cache
+eviction; the current source-key cache supplies no persistent guest handle.
+
+A direct macOS 26.5 public-API probe on the host observed executable libraries
+with `installName == "default.metallib"`, ordinary kernels with
+`patchControlPointCount == -1`, nullable attribute arrays, and attributed vertex
+functions with concrete vertex and stage-input records. Function constants
+reported their real names, types, indices and required flags. These are measured
+examples, not defaults for arbitrary shaders. The planned v3 metadata extension
+will serialize the host values, including library type and nullable install name.
+
+Fable's native-object plan has been reviewed and assigned to Sol. It adds a
+serialized compiler coordinator and ARC library/function/compute-pipeline
+objects. Unsupported resource-dependent selectors remain explicit. Host metadata
+and SDK checks do not establish that these objects initialize on the iOS runtime;
+native admission and device initialization remain separate prerequisites.
+
 The final registration block also needs instruction-level verification; its
 current decompilation is insufficient to settle optional wrapping behavior.
 

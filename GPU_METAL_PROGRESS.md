@@ -73,8 +73,17 @@ claim a complete Apple GPU family based on the host GPU.
 
 The compiler-query layer is now implemented and tested. It reports actual
 function names and types, pipeline limits, and errors at library or pipeline
-creation. Its application helpers validate complete responses. Wiring those
-helpers into native iOS Metal objects remains part of provider implementation.
+creation. Its application helpers validate complete responses. The native objects need
+additional function and pipeline metadata. The next Fable plan has been reviewed
+and assigned to Sol: extend the protocol to carry that metadata, add a serialized
+compiler coordinator, and construct the library, function and compute-pipeline
+objects. This work is in progress and has not passed acceptance checks yet.
+
+Direct host measurements confirmed that metadata cannot be replaced with empty
+values: executable libraries report an install name, ordinary kernels use a
+signed patch count of `-1`, and attributed functions expose real attribute lists.
+The new implementation must preserve these distinctions. GPU resource IDs and
+argument encoders still require resource ownership and layout support.
 
 The existing kernel connection tests cover large requests, short and failed
 copies, independent connections, disconnect during outstanding work, reset failures and cleanup after
