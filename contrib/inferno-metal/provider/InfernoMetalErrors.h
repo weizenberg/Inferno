@@ -60,6 +60,11 @@ NS_ASSUME_NONNULL_BEGIN
         InfernoMetalErrorInvalidDispatch = 14,
         InfernoMetalErrorMalformedBatch = 15,
         InfernoMetalErrorUnsupportedHost = 16,
+        InfernoMetalErrorUnsupportedState = 17,
+        InfernoMetalErrorResourceCreation = 18,
+        InfernoMetalErrorLibraryNotFound = 19,
+        InfernoMetalErrorPayloadTooLarge = 20,
+        InfernoMetalErrorLocalRead = 21,
     };
 
     FOUNDATION_EXPORT NSError *InfernoMetalMakeError(InfernoMetalErrorCode code,
@@ -70,5 +75,7 @@ NS_ASSUME_NONNULL_BEGIN
         const ImtlCoordinatorError *error);
     FOUNDATION_EXPORT NSError *InfernoMetalErrorFromBatchResult(
         const ImtlBatchResult *result, IOReturn timerIO, IOReturn cleanupIO);
+    FOUNDATION_EXPORT NSError *InfernoMetalErrorFromBatch5Result(
+        const ImtlBatch5Result *result, IOReturn timerIO, IOReturn cleanupIO);
 
 NS_ASSUME_NONNULL_END

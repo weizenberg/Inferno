@@ -145,10 +145,49 @@ its wrapper behavior; no corresponding implementation or runtime is proven.
 
 The separate optional call before dispatch is now identified: a nonzero return
 from CoreFoundation's `__CFMZEnabled` triggers
-`allowLibrariesFromOtherPlatforms` on the original device. Only the call
-identity is established; predicate and method semantics are unresolved and this
-does not establish cross-platform compiled-library support. The runtime wrapper
-callback identity/value and complete byref ownership also remain unverified.
+`allowLibrariesFromOtherPlatforms` on the original device. Its inherited body
+at `0x1861e1a84` clears the byte at `[[self+0x1a8]+0x28]`, calls the device's
+`compiler` getter, then tail-sends `allowLibrariesFromOtherPlatforms` to the
+returned compiler. The inherited getter at `0x1861e6880` returns nil; when it is
+not overridden, the forwarded message therefore does nothing. A subclass may
+override the getter, so this is conditional, not a concrete-device guarantee.
+Root verified the instructions and selectors and corrected a missed tail call
+and an incorrect optimized-selector interpretation in the two DeepSeek Flash
+reports. Evidence: `metal-native-optional-method-1pp5se_v/coordinator-review.md`
+and `root-verification.json` under the local evidence root.
+
+The ordinary base `init` at `0x18610a018` requests 56 bytes, calls the
+constructor with that pointer and self, and stores it at `self+0x1a8`.
+Base deallocation loads the pointer, conditionally calls a destruction helper,
+then the tagged release entry with the same allocation tag. This establishes
+the base lifecycle's ownership; the future provider should use superclass
+initialization and cleanup instead of replacing or freeing this storage.
+Root matched 160 captured instruction items against the original cache bytes.
+The constructor and destruction helper's internals remain unexamined.
+Evidence: `metal-native-base-storage-infrkawg/coordinator-review.md` and
+`root-verification.json` under the local evidence root.
+
+The predicate's semantics/runtime value, native initialization, and the runtime
+wrapper callback identity/value remain unverified. This method analysis does
+not establish cross-platform compiled-library support.
+
+The byref helper contract is now narrower than the initial model report claimed.
+Copy helper `0x18610acfc` passes the object at cell+40 and flags `0x83` to
+`_Block_object_assign`; dispose helper `0x18610edac` loads the current cell+40
+and passes the same flags to `_Block_object_dispose`. Full-cache authenticated
+import slots resolve both calls to the actual libsystem_blocks exports. The
+constant cell flags are `0x52000000`, with size 48, corresponding to an
+unretained layout with copy/dispose helpers in Apple's public Blocks headers.
+Apple's pinned libclosure-96 runtime performs an unretained pointer assignment
+and no disposal action for `0x83`. The model's retain/release inference is
+therefore rejected; cell lifetime, object-slot lifetime and the separately
+observed device-list retain/release must remain distinct. Exact matching of the
+closed target runtime and whether this synchronous dispatch copies the cell in
+a particular run remain unverified. The corrected report and reproducible cache
+checks are in `metal-registration-byref-deygksoe/root-review.md`; pinned source
+and its review are in `libclosure-block-byref-source-upzt2txc/` under the local
+evidence root.
+
 See `metal-registration-defaults-w04w61p9/coordinator-review.md` under the local
 evidence root for verified partial-query evidence and the model's length-limit
 failure. Static registration does not prove

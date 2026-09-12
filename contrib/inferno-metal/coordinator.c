@@ -185,8 +185,10 @@ IOReturn imtl_coordinator_create(ImtlUserClient *client,
 
 static bool queryLocked(ImtlCoordinator *c, uint32_t opcode, const void *source,
                         size_t source_size, const char *name, uint32_t width,
-                        uint32_t height, uint32_t depth, ImtlQueryReply *out,
-                        ImtlCoordinatorError *error, uint64_t deadline)
+                        uint32_t height, uint32_t depth,
+                        const void *typed_manifest, size_t typed_manifest_size,
+                        ImtlQueryReply *out, ImtlCoordinatorError *error,
+                        uint64_t deadline)
 {
     if (!c->client) {
         return fail(error, IMTL_COORDINATOR_ERROR_CLOSED, kIOReturnNotOpen,
@@ -196,9 +198,10 @@ static bool queryLocked(ImtlCoordinator *c, uint32_t opcode, const void *source,
         return false;
     }
     const ImtlUserCaps *caps = imtl_user_client_caps(c->client);
-    uint32_t output_size = opcode == INFERNO_METAL_QUERY_LIBRARY ?
-                               c->config.initial_output_bytes :
-                               INFERNO_METAL_COMPILER_MIN_OUTPUT;
+    bool library = opcode == INFERNO_METAL_QUERY_LIBRARY ||
+                   opcode == INFERNO_METAL_QUERY_LIBRARY_TYPED;
+    uint32_t output_size = library ? c->config.initial_output_bytes :
+                                     INFERNO_METAL_COMPILER_MIN_OUTPUT;
     if (output_size > caps->max_output_size) {
         output_size = caps->max_output_size;
     }
@@ -217,10 +220,14 @@ static bool queryLocked(ImtlCoordinator *c, uint32_t opcode, const void *source,
         } else if (opcode == INFERNO_METAL_QUERY_PIPELINE) {
             io = imtl_compiler_submit_pipeline(c->client, sequence, source,
                                                source_size, name);
-        } else {
+        } else if (opcode == INFERNO_METAL_QUERY_IMAGEBLOCK) {
             io = imtl_compiler_submit_imageblock(c->client, sequence, source,
                                                  source_size, name, width,
                                                  height, depth);
+        } else {
+            io = imtl_compiler_submit_typed_query(
+                c->client, sequence, opcode, typed_manifest,
+                typed_manifest_size, output_size, width, height, depth);
         }
         bool uncertain = io != kIOReturnSuccess;
         uint64_t delay = 100000;
@@ -362,7 +369,7 @@ static bool query(ImtlCoordinator *c, uint32_t opcode, const void *source,
     pthread_mutex_lock(&c->mutex);
     bool result = monotonicNS() < deadline &&
                   queryLocked(c, opcode, source, source_size, name, width,
-                              height, depth, out, error, deadline);
+                              height, depth, NULL, 0, out, error, deadline);
     if (!result && error && error->kind == IMTL_COORDINATOR_ERROR_NONE) {
         fail(error, IMTL_COORDINATOR_ERROR_TIMEOUT, kIOReturnTimeout, NULL, 0,
              0);
@@ -396,6 +403,80 @@ bool imtl_coordinator_query_imageblock(ImtlCoordinator *c, const void *source,
 {
     return query(c, INFERNO_METAL_QUERY_IMAGEBLOCK, source, size, name, width,
                  height, depth, out, error);
+}
+
+static bool queryTyped(ImtlCoordinator *c, uint32_t opcode,
+                       const ImtlTypedQueryManifest *manifest, uint32_t width,
+                       uint32_t height, uint32_t depth, ImtlQueryReply *out,
+                       ImtlCoordinatorError *error)
+{
+    clearError(error);
+    bool imageblock = opcode == INFERNO_METAL_QUERY_IMAGEBLOCK_TYPED;
+    if (!c || !manifest || !out ||
+        (opcode != INFERNO_METAL_QUERY_LIBRARY_TYPED &&
+         opcode != INFERNO_METAL_QUERY_PIPELINE_TYPED &&
+         opcode != INFERNO_METAL_QUERY_RENDER_PIPELINE && !imageblock) ||
+        (imageblock ? (!width || width > 65536 || !height || height > 65536 ||
+                       !depth || depth > 65536) :
+                      (width != 1 || height != 1 || depth != 1))) {
+        return fail(error, IMTL_COORDINATOR_ERROR_INVALID_ARGUMENT,
+                    kIOReturnBadArgument, NULL, 0, 0);
+    }
+    uint64_t deadline;
+    if (!makeDeadline(c->config.timeout_ns, &deadline)) {
+        return fail(error, IMTL_COORDINATOR_ERROR_INVALID_ARGUMENT,
+                    kIOReturnBadArgument, NULL, 0, 0);
+    }
+    uint8_t *bytes = NULL;
+    size_t size = 0;
+    if (!imtl_typed_query_builder_build(opcode, manifest, &bytes, &size)) {
+        return fail(error, IMTL_COORDINATOR_ERROR_INVALID_ARGUMENT,
+                    kIOReturnBadArgument, NULL, 0, 0);
+    }
+    pthread_mutex_lock(&c->mutex);
+    bool result = monotonicNS() < deadline &&
+                  queryLocked(c, opcode, NULL, 0, NULL, width, height, depth,
+                              bytes, size, out, error, deadline);
+    if (!result && error && error->kind == IMTL_COORDINATOR_ERROR_NONE) {
+        fail(error, IMTL_COORDINATOR_ERROR_TIMEOUT, kIOReturnTimeout, NULL, 0,
+             0);
+    }
+    pthread_mutex_unlock(&c->mutex);
+    imtl_batch_builder_free(bytes);
+    return result;
+}
+
+bool imtl_coordinator_query_library_typed(
+    ImtlCoordinator *c, const ImtlTypedQueryManifest *manifest,
+    ImtlQueryReply *out, ImtlCoordinatorError *error)
+{
+    return queryTyped(c, INFERNO_METAL_QUERY_LIBRARY_TYPED, manifest, 1, 1, 1,
+                      out, error);
+}
+
+bool imtl_coordinator_query_pipeline_typed(
+    ImtlCoordinator *c, const ImtlTypedQueryManifest *manifest,
+    ImtlQueryReply *out, ImtlCoordinatorError *error)
+{
+    return queryTyped(c, INFERNO_METAL_QUERY_PIPELINE_TYPED, manifest, 1, 1, 1,
+                      out, error);
+}
+
+bool imtl_coordinator_query_render_pipeline(
+    ImtlCoordinator *c, const ImtlTypedQueryManifest *manifest,
+    ImtlQueryReply *out, ImtlCoordinatorError *error)
+{
+    return queryTyped(c, INFERNO_METAL_QUERY_RENDER_PIPELINE, manifest, 1, 1, 1,
+                      out, error);
+}
+
+bool imtl_coordinator_query_imageblock_typed(
+    ImtlCoordinator *c, const ImtlTypedQueryManifest *manifest, uint32_t width,
+    uint32_t height, uint32_t depth, ImtlQueryReply *out,
+    ImtlCoordinatorError *error)
+{
+    return queryTyped(c, INFERNO_METAL_QUERY_IMAGEBLOCK_TYPED, manifest, width,
+                      height, depth, out, error);
 }
 
 void imtl_query_reply_free(ImtlQueryReply *reply)
@@ -594,6 +675,256 @@ retry_submit:
 }
 
 void imtl_batch_reply_free(ImtlBatchReply *reply)
+{
+    if (reply) {
+        free(reply->bytes);
+        memset(reply, 0, sizeof(*reply));
+    }
+}
+
+static bool validBatch5ResultIndex(const ImtlBatch5Result *result,
+                                   const uint8_t *manifest,
+                                   uint32_t expected_buffers,
+                                   uint32_t expected_textures,
+                                   uint32_t expected_images)
+{
+    uint32_t library_count =
+        wireGet32(manifest + INFERNO_METAL_RESOURCE_LIBRARY_COUNT_OFFSET);
+    uint32_t compute_pipeline_count = wireGet32(
+        manifest + INFERNO_METAL_RESOURCE_COMPUTE_PIPELINE_COUNT_OFFSET);
+    uint32_t render_pipeline_count = wireGet32(
+        manifest + INFERNO_METAL_RESOURCE_RENDER_PIPELINE_COUNT_OFFSET);
+    uint32_t buffer_count =
+        wireGet32(manifest + INFERNO_METAL_RESOURCE_BUFFER_COUNT_OFFSET);
+    uint32_t texture_count =
+        wireGet32(manifest + INFERNO_METAL_RESOURCE_TEXTURE_COUNT_OFFSET);
+    uint32_t sampler_count =
+        wireGet32(manifest + INFERNO_METAL_RESOURCE_SAMPLER_COUNT_OFFSET);
+    uint32_t command_count = wireGet32(
+        manifest + INFERNO_METAL_RESOURCE_HEADER_COMMAND_COUNT_OFFSET);
+    uint32_t draw_count =
+        wireGet32(manifest + INFERNO_METAL_RESOURCE_DRAW_COUNT_OFFSET);
+    uint32_t binding_count =
+        wireGet32(manifest + INFERNO_METAL_RESOURCE_BINDING_COUNT_OFFSET);
+    if (wireGet32(manifest + INFERNO_METAL_RESOURCE_VERSION_OFFSET) !=
+            INFERNO_METAL_RESOURCE_VERSION ||
+        library_count > INFERNO_METAL_RESOURCE_MAX_LIBRARIES ||
+        compute_pipeline_count > INFERNO_METAL_RESOURCE_MAX_COMPUTE_PIPELINES ||
+        render_pipeline_count > INFERNO_METAL_RESOURCE_MAX_RENDER_PIPELINES ||
+        buffer_count != expected_buffers ||
+        texture_count != expected_textures ||
+        sampler_count > INFERNO_METAL_RESOURCE_MAX_SAMPLERS ||
+        command_count > INFERNO_METAL_RESOURCE_MAX_COMMANDS ||
+        draw_count > INFERNO_METAL_RESOURCE_MAX_DRAWS ||
+        binding_count > INFERNO_METAL_RESOURCE_MAX_BINDINGS ||
+        wireGet32(manifest + INFERNO_METAL_RESOURCE_IMAGES_SIZE_OFFSET) !=
+            expected_images) {
+        return false;
+    }
+    switch (result->failed_record_kind) {
+    case INFERNO_METAL_BATCH_RECORD_UNKNOWN:
+        return result->failed_record_index ==
+               INFERNO_METAL_BATCH_FAILED_INDEX_UNKNOWN;
+    case INFERNO_METAL_BATCH_RECORD_HEADER:
+        return result->failed_record_index == 0;
+    case INFERNO_METAL_BATCH_RECORD_PIPELINE:
+        return result->failed_record_index < compute_pipeline_count;
+    case INFERNO_METAL_BATCH_RECORD_BUFFER:
+        return result->failed_record_index < buffer_count;
+    case INFERNO_METAL_BATCH_RECORD_BINDING:
+        return result->failed_record_index < binding_count;
+    case INFERNO_METAL_RESOURCE_RECORD_LIBRARY:
+        return result->failed_record_index < library_count;
+    case INFERNO_METAL_RESOURCE_RECORD_RENDER_PIPELINE:
+        return result->failed_record_index < render_pipeline_count;
+    case INFERNO_METAL_RESOURCE_RECORD_TEXTURE:
+        return result->failed_record_index < texture_count;
+    case INFERNO_METAL_RESOURCE_RECORD_SAMPLER:
+        return result->failed_record_index < sampler_count;
+    case INFERNO_METAL_RESOURCE_RECORD_COMMAND:
+        return result->failed_record_index < command_count;
+    case INFERNO_METAL_RESOURCE_RECORD_DRAW:
+        return result->failed_record_index < draw_count;
+    default:
+        return false;
+    }
+}
+
+bool imtl_coordinator_execute_batch5(
+    ImtlCoordinator *c, const void *manifest, size_t manifest_size,
+    uint32_t buffer_count, uint32_t texture_count, uint32_t images_size,
+    const ImtlBatchObserver *observer, ImtlBatch5Reply *out,
+    ImtlCoordinatorError *error)
+{
+    clearError(error);
+    if (!c || !manifest || !out ||
+        manifest_size < INFERNO_METAL_RESOURCE_HEADER_SIZE ||
+        manifest_size > INFERNO_METAL_MAX_BUFFER ||
+        buffer_count > INFERNO_METAL_RESOURCE_MAX_BUFFERS ||
+        texture_count > INFERNO_METAL_RESOURCE_MAX_TEXTURES ||
+        images_size > INFERNO_METAL_RESOURCE_MAX_IMAGES ||
+        (observer && !observer->scheduled)) {
+        return fail(error, IMTL_COORDINATOR_ERROR_INVALID_ARGUMENT,
+                    kIOReturnBadArgument, NULL, 0, 0);
+    }
+    memset(out, 0, sizeof(*out));
+    uint64_t deadline;
+    if (!makeDeadline(c->config.timeout_ns, &deadline)) {
+        return fail(error, IMTL_COORDINATOR_ERROR_INVALID_ARGUMENT,
+                    kIOReturnBadArgument, NULL, 0, 0);
+    }
+    pthread_mutex_lock(&c->mutex);
+    if (!c->client) {
+        pthread_mutex_unlock(&c->mutex);
+        return fail(error, IMTL_COORDINATOR_ERROR_CLOSED, kIOReturnNotOpen,
+                    NULL, 0, 0);
+    }
+    if (!drainLocked(c, deadline, error)) {
+        pthread_mutex_unlock(&c->mutex);
+        return false;
+    }
+    if (c->next_sequence == UINT64_MAX) {
+        IOReturn close_io = imtl_user_client_close(&c->client);
+        pthread_mutex_unlock(&c->mutex);
+        return fail(error, IMTL_COORDINATOR_ERROR_CLOSED, close_io, NULL,
+                    UINT64_MAX, close_io);
+    }
+    uint64_t sequence = c->next_sequence++;
+    out->sequence = sequence;
+    IOReturn submit_io;
+    uint64_t delay = 100000;
+retry_submit:
+    submit_io = imtl_batch5_submit(c->client, sequence, manifest, manifest_size,
+                                   images_size);
+    bool uncertain = submit_io != kIOReturnSuccess;
+    c->needs_drain = true;
+    ImtlUserStatus status = { 0 };
+    bool observed = false;
+    while (true) {
+        IOReturn status_io = imtl_user_client_status(c->client, &status);
+        if (status_io != kIOReturnSuccess) {
+            c->needs_drain = true;
+            if (pauseUntil(deadline, &delay)) {
+                continue;
+            }
+            pthread_mutex_unlock(&c->mutex);
+            return fail(error,
+                        uncertain ? IMTL_COORDINATOR_ERROR_UNCERTAIN :
+                                    IMTL_COORDINATOR_ERROR_TRANSPORT,
+                        uncertain ? submit_io : status_io, NULL, sequence, 0);
+        }
+        if (status.state == INFERNO_METAL_USER_COMPLETED &&
+            status.sequence != sequence) {
+            c->needs_drain = true;
+            pthread_mutex_unlock(&c->mutex);
+            return fail(error, IMTL_COORDINATOR_ERROR_PROTOCOL,
+                        kIOReturnBadMessageID, &status, sequence, 0);
+        }
+        if ((status.state == INFERNO_METAL_USER_SUBMITTED ||
+             status.state == INFERNO_METAL_USER_COMPLETED) &&
+            (status.progress & INFERNO_METAL_USER_PROGRESS_SCHEDULED) &&
+            !observed) {
+            observed = true;
+            out->scheduled_observed = true;
+            if (observer) {
+                observer->scheduled(observer->opaque, sequence);
+            }
+        }
+        if (status.state == INFERNO_METAL_USER_IDLE && uncertain) {
+            if (submit_io == kIOReturnBusy) {
+                uncertain = false;
+                c->needs_drain = false;
+                if (!pauseUntil(deadline, &delay)) {
+                    pthread_mutex_unlock(&c->mutex);
+                    return fail(error, IMTL_COORDINATOR_ERROR_BUSY,
+                                kIOReturnBusy, &status, sequence, 0);
+                }
+                goto retry_submit;
+            }
+            c->needs_drain = false;
+            pthread_mutex_unlock(&c->mutex);
+            return fail(error, IMTL_COORDINATOR_ERROR_TRANSPORT, submit_io,
+                        &status, sequence, 0);
+        }
+        if (status.state == INFERNO_METAL_USER_COMPLETED) {
+            if (status.transport_result != INFERNO_METAL_USER_RESULT_OK ||
+                status.completion_error) {
+                IOReturn cleanup = imtl_user_client_ack(c->client);
+                c->needs_drain = cleanup != kIOReturnSuccess;
+                pthread_mutex_unlock(&c->mutex);
+                return fail(error, IMTL_COORDINATOR_ERROR_DEVICE_FAULT,
+                            kIOReturnError, &status, sequence, cleanup);
+            }
+            break;
+        }
+        if (status.state == INFERNO_METAL_USER_FAULTED ||
+            status.state == INFERNO_METAL_USER_STOPPED) {
+            c->needs_drain = true;
+            pthread_mutex_unlock(&c->mutex);
+            return fail(error, IMTL_COORDINATOR_ERROR_DEVICE_FAULT,
+                        kIOReturnError, &status, sequence, 0);
+        }
+        if (!pauseUntil(deadline, &delay)) {
+            IOReturn cleanup = imtl_user_client_reset(c->client);
+            c->needs_drain = true;
+            pthread_mutex_unlock(&c->mutex);
+            return fail(error, IMTL_COORDINATOR_ERROR_TIMEOUT, kIOReturnTimeout,
+                        &status, sequence, cleanup);
+        }
+    }
+    size_t output_size = INFERNO_METAL_RESOURCE_RESULT_SIZE + images_size;
+    uint8_t *bytes = calloc(1, output_size);
+    if (!bytes) {
+        IOReturn cleanup = imtl_user_client_reset(c->client);
+        c->needs_drain = true;
+        pthread_mutex_unlock(&c->mutex);
+        return fail(error, IMTL_COORDINATOR_ERROR_TRANSPORT, kIOReturnNoMemory,
+                    &status, sequence, cleanup);
+    }
+    IOReturn read_io;
+    size_t read_size = 0;
+    while ((read_io = imtl_user_client_read(c->client, 0, bytes, output_size,
+                                            &read_size)) != kIOReturnSuccess) {
+        memset(bytes, 0, output_size);
+        if (!pauseUntil(deadline, &delay)) {
+            break;
+        }
+    }
+    ImtlBatch5Result result;
+    bool valid =
+        read_io == kIOReturnSuccess && read_size == output_size &&
+        imtl_batch5_decode_result(bytes, output_size, sequence, buffer_count,
+                                  texture_count, images_size, &result);
+    if (valid && result.outcome != INFERNO_METAL_BATCH_OUTCOME_MALFORMED) {
+        valid = validBatch5ResultIndex(&result, manifest, buffer_count,
+                                       texture_count, images_size);
+    }
+    IOReturn cleanup = imtl_user_client_ack(c->client);
+    c->needs_drain = cleanup != kIOReturnSuccess;
+    if (!valid) {
+        free(bytes);
+        uint32_t kind = read_io != kIOReturnSuccess ?
+                            IMTL_COORDINATOR_ERROR_TRANSPORT :
+                            IMTL_COORDINATOR_ERROR_PROTOCOL;
+        IOReturn primary =
+            read_io == kIOReturnSuccess ? kIOReturnBadMessageID : read_io;
+        pthread_mutex_unlock(&c->mutex);
+        return fail(error, kind, primary, &status, sequence, cleanup);
+    }
+    *out = (ImtlBatch5Reply){
+        .bytes = bytes,
+        .size = output_size,
+        .result = result,
+        .timer_error = status.timer_error,
+        .cleanup_io = cleanup,
+        .sequence = sequence,
+        .scheduled_observed = observed,
+    };
+    pthread_mutex_unlock(&c->mutex);
+    return true;
+}
+
+void imtl_batch5_reply_free(ImtlBatch5Reply *reply)
 {
     if (reply) {
         free(reply->bytes);

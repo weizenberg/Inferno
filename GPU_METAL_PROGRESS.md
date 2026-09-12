@@ -1,6 +1,6 @@
 # GPU and Metal progress
 
-Last updated: 12 September 2026.
+Last updated: 13 September 2026.
 
 ## Overall status
 
@@ -19,6 +19,14 @@ Target: iOS 26 applications use GPU/Metal rendering, and Settings identifies
 the emulated panel as a **virtual display**.
 
 Development branch: [gpu-metal-bridge](https://github.com/weizenberg/Inferno/tree/gpu-metal-bridge).
+
+## V5 branch milestone
+
+The dedicated branch now includes v5 compiled-library payloads, reusable shared
+textures and samplers, and ordered compute/render provider objects. The accepted
+host and freestanding ARM checks, SDK builds, native-reference comparisons and
+observer-lifetime check are recorded below. Provider GPU tests substitute the
+coordinator/IOKit seam; full native iOS integration remains unfinished.
 
 ## What is done
 
@@ -105,14 +113,191 @@ iOS target; matching the actual iOS kernel interface is still outstanding.
 
 ## Current work
 
+The v5 host executor now builds and passes actual GPU checks for compiled
+compute, texture sampling, clear/render passes, and restoring default raster
+state between two draws. Across the two accepted runs, all 2,520 checked image
+bytes matched independent CPU calculations. All 12 GPU command buffers completed
+with scheduling observed. Typed library, compute, imageblock and render queries
+also returned consistent replies when repeated on the same backend.
+
+The new C client/coordinator checkpoint is implemented. All 12 iPhoneOS/macOS
+compile and link stages passed, and the production decoders accepted 14 unchanged
+real backend replies under address/undefined-behavior sanitizers. Root source
+review corrected unused render-envelope fields before this acceptance.
+
+The full QEMU target builds and its HVF signature verifies. Existing compute,
+alias/offset, live-reset and recovery checks passed under both TCG and HVF, with
+all 14 captures matching their accepted reference and 11 serial lines per guest.
+
+The coordinated v5 host, driver and client transition is implemented and builds.
+Ten new-opcode ARM scenarios passed under both TCG and HVF; all 20 complete
+replies matched the accepted host references. The v5 binary also passed the
+legacy compute, alias/offset, live scheduled-reset and recovery checks, with all
+14 captures matching the prior reference after changing only the protocol
+version word. Each accelerator produced 12 serial progress lines for the new
+scenarios and 11 for the legacy regression.
+
+Legacy opcodes 1–6 now also pass under v5 with only the test's version
+expectations changed. Both TCG and HVF produce 29 serial progress lines; all
+14 compiler captures match between accelerators, pass the production decoder
+under sanitizers, and match the accepted native host metadata. Together with
+the earlier opcode-7 result, this closes the ordinary legacy regression gate.
+Frozen v4 transport sources from the published commit reject the v5 host under
+both accelerators. Application-client negotiation also passes 142 focused
+sanitized checks: the frozen v4 client rejects v5, and the current client accepts
+valid v5 capabilities, rejects unknown bits/reserved flags, and recovers.
+The client checks use fake IOKit and do not prove the native kernel connection.
+Evidence: `metal-v5-legacy-six-wccoh_l6/compiler-v4-regression-e56itfxb/root-runtime-verification.json`,
+`metal-v4-peer-v5-host-hbjndnsw/legacy-v4-ejmv0r2u/root-runtime-verification.json`,
+and `metal-v4-v5-client-negotiation-xoh57odq/root-review.json`.
+
+The Objective-C provider now implements source, compiled data, URL, file and
+bundle/default library factories, typed compute queries and buffer execution
+through resource batch8. All 34 iPhoneOS/macOS compile and link stages passed
+after correcting a concrete pipeline-type error. The texture, sampler and render
+objects now also compile and link: all 42 stages passed across both SDKs. Sol
+corrected misplaced descriptor properties, ARC control flow, unsupported barrier
+behavior, and rejection of Apple's default empty vertex descriptor. The provider
+now passes real-host compute-to-texture/render ordering, pass and binding capture,
+and clear-only execution. The texture/render acceptance results are recorded below; full native integration remains in progress.
+The frozen M2a provider also passed real-host compute through all six source/
+compiled-data/URL/file/bundle/default factories: all 1,200 guarded image bytes
+matched the independent CPU calculation, and all seven commands scheduled and
+completed. This test substitutes the coordinator/IOKit seam and does not prove
+that connection at runtime. A production native MTLDevice adapter is still missing, so
+ordinary iOS application calls cannot yet reach these context methods.
+
+Both the frozen M2a and the new M2b provider passed the same 48 lifecycle
+checks with address and undefined-behavior sanitizers: queue ordering,
+exactly-once handlers, recovery, and no writeback after remote, timer or cleanup
+errors. These use a scripted coordinator and do not validate production IOKit.
+
+The M2b provider now matches the independent native Mac Metal reference for
+compute writing a texture, rendering from it, and sampling that result in a
+second command. Both commands were committed before waiting; all 636 padded
+texture bytes matched the CPU expectation. Additional state-capture checks
+verified 1,060 bytes, including a clear-only pass and an unchanged neighboring
+texture. Six nondefault vertex-layout cases remain explicitly rejected. These
+actual-GPU tests substitute the coordinator/IOKit connection.
+
+The original texture reference also passes through the provider: padded uploads,
+partial updates, region reads, overlapping render passes and shader sampling
+matched all 1,224 CPU/native-reference bytes. The same checks pass using the
+saved iOS-compiled render library through the data factory and sampling library
+through the URL factory. Each variant completed all four commands and their
+handlers. This verifies those fixed artifacts, not arbitrary iOS libraries.
+
+The four new object classes have all required available SDK selectors, with
+438 concrete signature matches across the two SDKs. Unsupported methods remain
+explicitly unsupported; selector coverage does not imply full Metal support.
+
+Evidence: `metal-provider-texture-oracle-omix3erl/run-t7jeug4_/root-runtime-verification.json`,
+`metal-provider-compiled-render-zt9pfelg/run-xniwbfl0/root-runtime-verification.json`,
+and `metal-provider-selector-audit-m2b-r2-A7c9p2/root-review.json`.
+
+Native iOS device initialization, argument-buffer support, truthful capabilities,
+presentation and virtual-display identity remain unfinished.
+
+Compute sampling now passes with a buffer and texture both using slot 3:
+all 384 guarded output and unchanged source bytes match the native reference.
+Both asynchronous render-pipeline factories preserve descriptors captured at
+call time, invoke their callbacks once, and execute the ordering workload.
+All 14 transported pipeline getters match a directly created host pipeline.
+
+A real texture-usage failure exposed a client decoder mismatch: it rejected
+the host's explanatory description when there was no native NSError. Sol
+corrected both batch decoders within the reviewed plan. All 42 SDK compile/link
+stages pass. The same captured reply now produces the specific unsupported-state
+error, without scheduling or changing 280 texture bytes and 56 buffer bytes.
+Two subsequent GPU commands complete and reproduce all 636 expected output
+bytes. These tests still substitute the coordinator/IOKit connection.
+
+Evidence: `metal-provider-compute-sampling-prf9ce0w/run-n8slvb5t/root-runtime-verification.json`,
+`metal-provider-render-async-a9022ybc/run-v6d7apfh/root-runtime-verification.json`,
+`metal-provider-sdk-check-0l03k2sk/results.json`, and
+`metal-provider-texture-access-error-60ir5k8s/run-nhyr4ju2/root-runtime-verification.json`.
+
+The provider also matches native Metal across a ten-draw raster-state comparison:
+all 2,720 output and padding bytes agree. It covers viewport, scissor, both
+windings, front/back culling, fill/line mode, observable RGB/alpha blend constants,
+restoring an earlier state, and mutations after recorded draws. The CPU checker
+verifies nine exact image regions; the line region uses native equality plus
+independent coverage and interior checks. Each run schedules and completes once.
+Evidence: `metal-provider-raster-native-l2sm_ps2/run-xqnbsost/coordinator-review.json`.
+
+All five supported texture formats now pass the same native/provider transfer
+and clear reference: RGBA8Unorm, RGBA8Unorm_sRGB, RGBA8Snorm, BGRA8Unorm and
+BGRA8Unorm_sRGB. All 3,520 bytes match, including padded uploads, partial updates,
+unchanged inputs, readbacks and red clears. This verifies exact zero/one clear
+endpoints, not intermediate sRGB conversion. Each of the five commands schedules
+and completes once. Evidence:
+`metal-provider-texture-formats-qrkwuox8/run-hhvuqyds/coordinator-review.json`.
+
+Four local failure cases also pass: unsupported sampler reduction and pipeline
+depth format, an oversized texture, and same-pass attachment feedback. Each
+preserves 476 existing resource bytes and causes no query or submission. The
+following valid GPU recovery still matches all 636 expected output bytes.
+Evidence: `metal-provider-local-texture-errors-khx66fnv/run-_z2wlca0/root-runtime-verification.json`.
+
+The host observer lifetime check now passes with the unchanged accepted QEMU
+binary. Debugger observations record 13 batches: seven legacy compute batches
+and six texture/render batches. Each clears the scheduled callback and its work
+pointer before worker retirement; both guests finish successfully. This supports
+the source review's lifetime ordering, while debugger timing and finite workloads
+limit the conclusion. Evidence:
+`metal-host-observer-runtime-9ifhwfyy/root-runtime-verification.json`.
+
+Argument-buffer preparation now has a native host measurement. Both public
+encoder APIs agree on a sparse texture/sampler/constant layout, and four valid
+dispatches reproduce all 208 guarded output bytes. This was measured on the
+M5 Pro's Tier 2 implementation; Inferno argument buffers are not implemented.
+The architecture still needs a Fable plan, review and Sol implementation.
+Evidence: `metal-argument-layout-host-nowv2byg/root-review.json`.
+
+The compiled argument-buffer experiment found a material limitation for the
+next design. The same iOS-compiled shader has no library function reflection.
+Pipeline reflection and the function encoder's reflection report a zero array
+stride; creating an encoder from the pipeline binding gives incorrect output.
+Function-derived encoders nevertheless execute all eight data/URL tests
+correctly, matching 416 guarded output bytes. The implementation must preserve
+the function-derived encoding context; public reflection fields alone have not
+proved sufficient to reconstruct it. This is direct host evidence, with no
+Inferno argument-buffer implementation yet. Evidence:
+`metal-argument-function-reflection-85dm68sf/root-review.json` and the retained
+failed alternative `metal-argument-pipeline-debug-q9r6hpre`.
+
+DeepSeek Flash also located the native base initializer's allocation and cleanup
+of the internal storage used by the optional initialization method. Root verified
+the captured instructions against the original cache. The provider must preserve
+this base ownership; constructor internals and actual iOS initialization remain
+open. Evidence: `metal-native-base-storage-infrkawg/coordinator-review.md`.
+The follow-up constructor/destructor analysis reached DeepSeek's response limit
+and produced no final findings. Its five saved IDA queries remain unaccepted;
+no automatic retry was made. Evidence:
+`metal-native-storage-constructor-mqc4cslh/coordinator-status.json`.
+
+Evidence: `metal-provider-sdk-check-8grmk6pn/results.json`,
+`metal-provider-m2b-order-check-cqzymk8h/run-psu4myzd/root-runtime-verification.json`,
+`metal-provider-m2b-state-check-4ylry0vr/run-3doxdtuv/root-runtime-verification.json`,
+and `metal-provider-m2b-lifecycle-a69vg2fz/run-1/root-review.json`.
+
+Evidence: `metal-v5-host-root-build-8cl5viw9`,
+`metal-v5-host-executor-smoke-z8s152jv/run-1/root-verification.json`,
+`metal-v5-valid-batches-gngK7O/root-run-1/root-verification.json`, and
+`metal-v5-client-root-sdk-9pe167x5/root-review.json`,
+`metal-v5-arm-valid-votsw9bi/run-3fabilss/root-runtime-verification.json`,
+`metal-v5-legacy-arm-ovss8ny1/metal-v4-arm-oracle-saarhp21/root-runtime-verification.json`,
+`metal-provider-m2a-root-sdk-r2-ew_uqltj/root-review.json`, and
+`metal-provider-m2a-real-host-fw8ghfp0/run-_npuqlms/root-runtime-verification.json`.
+
 Compiled shader libraries now have a direct host reference. After installing
 Apple's missing Metal Toolchain, the same kernel was compiled for iOS 26 and
 macOS 26. Both artifacts loaded through the public data and URL APIs on the
 Mac and executed correctly: all four 100-byte outputs, including guards,
 matched an independent calculation. This proves one artifact's compatibility;
-it does not establish arbitrary iOS library compatibility. The Inferno bridge
-still accepts only UTF-8 shader source. Opaque library payloads, cache identity,
-pipeline reuse and guest bundle/URL loading remain implementation work.
+it does not establish arbitrary iOS library compatibility. The earlier v4 bridge accepted only UTF-8 shader source. The v5 implementation adds opaque library payloads and shared pipeline caches,
+and its new ARM transport checks now pass. Guest context bundle/URL factories
+now also pass the scoped real-host provider test described above.
 
 The iOS-compiled render and sampling shaders also loaded through the public
 host library API. Four commands reproduced all 1,224 bytes of the unchanged CPU
@@ -121,9 +306,11 @@ evidence to the rendering reference; it remains a direct host test.
 
 The inherited device wrapper method returns nil, so the native provider must
 explicitly handle Metal's optional wrapper path. This is now confirmed from
-actual method metadata and instructions. The remaining optional initialization
-call has been identified, but its behavior and compiled-library compatibility
-are still unverified.
+actual method metadata and instructions. The optional initialization method
+clears a base-object byte and forwards to the compiler getter's result. The
+inherited getter returns nil; concrete overrides and native initialization
+remain unverified. The corrected instruction-level evidence is recorded in
+`metal-native-optional-method-1pp5se_v/coordinator-review.md`.
 
 The native device-registration investigation now confirms wrapper selection
 and ownership after insertion into Metal's device list. Instruction-level
@@ -132,7 +319,7 @@ runtime wrapper configuration, truthful device capabilities and actual iOS
 initialization remain unresolved; this is framework-contract evidence only.
 
 The retained client/compiler/coordinator and service regression suites now
-pass against the current v4 source: **2,390 and 994 checks**, respectively,
+passed against the earlier v4 source: **2,390 and 994 checks**, respectively,
 with address and undefined-behavior sanitizers. Three obsolete v3 assertions
 were omitted because their reserved values are now valid v4 fields. The service
 fixture supplies zero scheduled progress through a mock. These runs preserve
@@ -149,15 +336,50 @@ bytes matched a separate CPU calculation,
 including padding and guard bytes. Both dependent render commands were
 committed before waiting, and vertex/fragment bindings used separate buffers at
 the same slot. Sampling used a real nearest/clamp sampler and preserved the
-patterned source image exactly. This establishes expected results for future guest code;
-textures and rendering are not yet implemented in the native provider.
+patterned source image exactly. This established the reference for provider
+implementation; the current M2b code and its scoped acceptance are described
+above.
 The SDK method and descriptor inventory is now checked, including optional
 methods and platform differences. A source-and-evidence packet now includes compiled-library requirements. Its
 Fable planning pass returned. Root review found an incompatible capability-mask
 assumption, an inconsistent sampler record size, and unresolved API contracts.
-A focused revision is running before texture/render implementation. Public Apple
-documentation now resolves normal default.metallib bundle loading and provides
-the family-specific texture, sampler and dimension limits needed by that plan.
+The focused Fable revision has returned. Its portable and host v5 design
+checkpoints are accepted with corrections for sampler combinations, independent
+color write masks and texture access checked against the final pipeline. Sol has completed the portable records, parser, builder and result decoder.
+The host parser, host/iPhoneOS builders and C++ headers compile successfully.
+Seven valid manifests—empty, clear-only, ordinary rendering and all four typed
+queries—match 20,296 independently constructed bytes and pass the production
+parser under AddressSanitizer and UBSan. These tests do not execute GPU work. Source review
+also corrected color-channel mask bits and required each pipeline's format to
+match its render target. The coordinated interface is now v5, replacing the previously published v4 baseline.
+Public Apple documentation supplies the family-specific texture, sampler and
+dimension limits; this does not yet select a complete guest GPU profile.
+
+Both public default-library APIs now have a verified host reference: the main
+application bundle and a supplied bundle each loaded a known compiled library
+and produced the correct 100-byte guarded compute image. An empty bundle returned
+nil with a real NSError. The first Python checker incorrectly treated numeric
+JSON `1` as failure; an independent review of exits, objects, hashes and every
+output byte accepted the saved runtime without rerunning it. These are host
+observations, not proof of iOS bundle loading.
+
+All 28 isolated render-pipeline getter probes returned successfully on the M5
+Pro host: 14 getters on each of two valid ordinary/sampling pipelines. Values
+must be queried per pipeline; they are not constants for the emulated GPU.
+Actual passes also reported a 32×32 tile and 4096-byte imageblock requirement.
+Host pipeline reflection is now verified on six real pipelines. Source and
+compiled sampling shaders return identical stage/slot metadata; compute shaders
+report distinct read-only, write-only and read/write texture access. Retained
+reflection remains usable after its autorelease pool drains. The corresponding
+host operations and provider texture, sampler and render-encoder objects are now
+implemented; current validation is recorded above.
+
+The registration investigation also corrected an ownership claim in DeepSeek's
+report. Target-cache bytes identify the Blocks calls and an unretained byref
+layout. Apple's pinned public runtime makes the observed `0x83` object helper
+assignment unretained and its disposal a no-op. The report's retain/release
+inference is rejected; the closed target runtime's exact implementation and
+actual native-device startup remain unverified.
 
 Reusable shared buffers and ordered compute command buffers are implemented
 under the reviewed Fable plan, with Sol owning the source changes. The bounded
@@ -239,7 +461,7 @@ The resource/command implementation proceeds independently.
 | Native Metal device discovery | Stock `MTLCreateSystemDefaultDevice()` returns the Inferno device instead of `nil`. |
 | Native compilation integration | Connect the implemented objects to the native device and verify creation, metadata and errors in an iOS application. |
 | Native application execution | An iOS application creates a Metal queue, submits work and receives correct results through the real driver connection. |
-| General resource and command support | Reusable buffers/textures and ordered commands work beyond the current single-operation bridge; required compiled-shader support is established. |
+| Complete resource and command support | Finish M2b acceptance and implement the argument-buffer and capability contracts needed by the native device; verify them through an iOS application. |
 | Native presentation | Metal drawables reach the iOS compositor and display, with correct synchronization. |
 | Virtual-display identification | Settings visibly identifies the panel as a virtual display; no native display-parts authentication claim. |
 | End-to-end verification | Repeatable iOS boots, responsive UI, real app rendering and reset/reconnect recovery are demonstrated under TCG and HVF. |

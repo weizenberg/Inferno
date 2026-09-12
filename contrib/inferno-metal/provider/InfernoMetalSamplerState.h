@@ -14,32 +14,17 @@
  * You should have received a copy of the GNU Affero General Public License
  * along with this program. If not, see <https://www.gnu.org/licenses/>.
  */
-
+#include "../batch-wire.h"
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 
-@class InfernoMetalCommandBuffer;
-
+@class InfernoMetalCompilerContext;
 NS_ASSUME_NONNULL_BEGIN
-
-    @interface InfernoMetalEncodedDispatch : NSObject
-    @property(nonatomic, strong) id<MTLComputePipelineState> pipeline;
-    @property(nonatomic, copy) NSArray *bindings;
-    @property(nonatomic, copy) NSArray *textureBindings;
-    @property(nonatomic, copy) NSArray *samplerBindings;
-    @property(nonatomic, copy) NSArray<NSNumber *> *threadgroupLengths;
-    @property(nonatomic) uint32_t mode;
-    @property(nonatomic) MTLSize grid;
-    @property(nonatomic) MTLSize group;
+    @interface InfernoMetalSamplerState : NSObject <MTLSamplerState>
+    -(nullable instancetype)initWithContext
+        : (InfernoMetalCompilerContext *)context device
+        : (id<MTLDevice>)device descriptor : (MTLSamplerDescriptor *)descriptor;
+    @property(nonatomic, readonly) InfernoMetalCompilerContext *infernoContext;
+    @property(nonatomic, readonly) ImtlBatch5Sampler infernoRecord;
     @end
-
-    @interface InfernoMetalComputeCommandEncoder
-        : NSObject <MTLComputeCommandEncoder>
-
-    -(nullable instancetype)initWithCommandBuffer
-        : (InfernoMetalCommandBuffer *)commandBuffer device
-        : (id<MTLDevice>)device;
-
-    @end
-
 NS_ASSUME_NONNULL_END

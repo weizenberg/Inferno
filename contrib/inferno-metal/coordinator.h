@@ -83,6 +83,16 @@ typedef struct ImtlBatchReply {
     bool scheduled_observed;
 } ImtlBatchReply;
 
+typedef struct ImtlBatch5Reply {
+    uint8_t *bytes;
+    size_t size;
+    ImtlBatch5Result result;
+    IOReturn timer_error;
+    IOReturn cleanup_io;
+    uint64_t sequence;
+    bool scheduled_observed;
+} ImtlBatch5Reply;
+
 typedef struct ImtlCoordinatorError {
     uint32_t kind;
     IOReturn io;
@@ -119,6 +129,24 @@ bool imtl_coordinator_query_imageblock(ImtlCoordinator *coordinator,
                                        uint32_t height, uint32_t depth,
                                        ImtlQueryReply *out,
                                        ImtlCoordinatorError *error);
+/* Typed query manifests and their referenced payloads are borrowed only until
+ * return. Each call builds one immutable canonical copy before entering the
+ * serialized submit/retry path. The returned reply owns its bytes; decoded
+ * views remain valid until imtl_query_reply_free().
+ */
+bool imtl_coordinator_query_library_typed(
+    ImtlCoordinator *coordinator, const ImtlTypedQueryManifest *manifest,
+    ImtlQueryReply *out, ImtlCoordinatorError *error);
+bool imtl_coordinator_query_pipeline_typed(
+    ImtlCoordinator *coordinator, const ImtlTypedQueryManifest *manifest,
+    ImtlQueryReply *out, ImtlCoordinatorError *error);
+bool imtl_coordinator_query_render_pipeline(
+    ImtlCoordinator *coordinator, const ImtlTypedQueryManifest *manifest,
+    ImtlQueryReply *out, ImtlCoordinatorError *error);
+bool imtl_coordinator_query_imageblock_typed(
+    ImtlCoordinator *coordinator, const ImtlTypedQueryManifest *manifest,
+    uint32_t width, uint32_t height, uint32_t depth, ImtlQueryReply *out,
+    ImtlCoordinatorError *error);
 /* True publishes a completely validated reply. timer_error or cleanup_io may
  * still be nonzero and makes provider execution fail without image writeback.
  * On false, scheduled_observed and sequence may describe an already accepted
@@ -130,9 +158,20 @@ bool imtl_coordinator_execute_batch(ImtlCoordinator *coordinator,
                                     const ImtlBatchObserver *observer,
                                     ImtlBatchReply *out,
                                     ImtlCoordinatorError *error);
+/* manifest is borrowed and must remain immutable until return. True publishes
+ * one fully validated owned result containing buffer images followed by
+ * texture images. The caller must refuse all writeback when timer_error or
+ * cleanup_io is nonzero.
+ */
+bool imtl_coordinator_execute_batch5(
+    ImtlCoordinator *coordinator, const void *manifest, size_t manifest_size,
+    uint32_t buffer_count, uint32_t texture_count, uint32_t images_size,
+    const ImtlBatchObserver *observer, ImtlBatch5Reply *out,
+    ImtlCoordinatorError *error);
 
 void imtl_query_reply_free(ImtlQueryReply *reply);
 void imtl_batch_reply_free(ImtlBatchReply *reply);
+void imtl_batch5_reply_free(ImtlBatch5Reply *reply);
 
 /* Invalidation serializes with calls and closes the owned connection once.
  * Destroy requires the external lifetime condition above and clears *ptr.

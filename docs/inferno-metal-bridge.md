@@ -1,4 +1,4 @@
-# Inferno Metal bridge, protocol version 4
+# Inferno Metal bridge, protocol version 5
 
 This experimental device executes bounded guest requests on the host Metal GPU.
 It is available in Darwin builds with the Metal framework and is disabled by
@@ -11,7 +11,7 @@ The Apple DeviceTree node `arm-io/inferno-metal` has compatible
 `inferno,metal-v1`, child address `0xfff00000`, size `0x10000`, AIC parent
 `0x20`, and interrupt `0x200`. Its physical interval is
 `[0x2fff00000, 0x2fff10000)`. This does not replace the native AGX nodes.
-The `inferno,metal-v1` binding name remains unchanged; the MMIO register negotiates protocol version 4.
+The `inferno,metal-v1` binding name remains unchanged; the MMIO register reports protocol version 5 and peers require exact equality.
 
 For freestanding ARM tests, `virt` also accepts
 `-device inferno-metal-bridge,addr=0x0b000000`. Its generated FDT supplies the
@@ -27,7 +27,7 @@ access sizes, and read/write directions fail the bus transaction.
 | Offset | Access | Meaning |
 | --- | --- | --- |
 | `0x00` | R | Magic `0x4c544d49` |
-| `0x04` | R | Protocol version, 4 |
+| `0x04` | R | Protocol version, 5 |
 | `0x08` | R | State: IDLE 0, BUSY 1, DONE 2, FAILED 3 |
 | `0x0c` | R | Error: success 0, bad descriptor 1, bad memory 2, backend 3 |
 | `0x10`, `0x14` | RW | Descriptor physical address, low/high halves |
@@ -64,8 +64,8 @@ All integers are little endian. Addresses are guest physical addresses.
 
 | Byte offset | Type | Meaning |
 | --- | --- | --- |
-| 0 | u32 | Version, 4 |
-| 4 | u32 | Operation: compute 1, triangle render 2, clear 3, library query 4, pipeline query 5, imageblock query 6, compute batch 7 |
+| 0 | u32 | Version, 5 |
+| 4 | u32 | Operation: compute 1, triangle render 2, clear 3, library query 4, pipeline query 5, imageblock query 6, compute batch 7, resource batch 8, typed library/compute/render/imageblock queries 9/10/11/12 |
 | 8 | u64 | Guest sequence identifier |
 | 16 | u64 | Shader source address |
 | 24 | u32 | Shader source byte length |
@@ -96,7 +96,9 @@ is buffer 0 for both vertex and fragment stages. The target is cleared to
 transparent black. Render and clear return tightly packed BGRA8Unorm bytes,
 four bytes per pixel and `width * 4` bytes per row. Dimensions cannot exceed
 4096, and output size must equal `width * height * 4` within the 16 MiB limit.
-There are no depth, blending, texture binding, or presentation operations yet.
+These basic render/clear operations do not expose depth, blending or texture
+bindings. Resource batches below add configurable rendering and texture/sampler
+bindings. Native presentation remains unfinished.
 
 Clear consumes exactly 16 input bytes: four little-endian IEEE float32 RGBA
 values, each finite and in [0,1]. It requires zero source length and depth 1.
@@ -131,25 +133,25 @@ All integers are little endian; the complete output allocation is zero-filled.
 
 | Offset | Type | Meaning |
 | --- | --- | --- |
-| 0, 4 | u32 each | Protocol version 4, query opcode echo |
+| 0, 4 | u32 each | Protocol version 5, query opcode echo |
 | 8 | u64 | Sequence echo |
 | 16, 20, 24 | u32 each | Outcome, phase, flags |
 | 28, 32 | u32 each | Function count, selected function type |
 | 36, 40, 44 | u32 each | Maximum threads, execution width, static threadgroup bytes |
 | 48, 52 | u32 each | Required output size on capacity failure, metadata sub-record count |
-| 56 | byte[8] | Reserved, zero |
+| 56, 60 | u32 each | Function-failure stage for query 11; reserved zero |
 | 64 | i64 | Signed NSError code |
 | 72, 76 | u32 each | Error domain and description lengths in bytes |
 | 80 | byte[128] | UTF-8 error domain, terminated and zero-padded |
 | 208 | byte[16384] | UTF-8 description, terminated and zero-padded |
 | 16592 | byte[64] | Pipeline metadata on successful pipeline/imageblock query |
-| 16656 | byte[512] | Library metadata on successful library query |
+| 16656 | byte[512] | Library metadata on successful library query; render-pipeline metadata for query 11 |
 | 17168 | variable records | Complete function inventory on successful library query |
 
 Pipeline metadata carries u64 allocation size and three u64 required threadgroup
 dimensions, i64 shader-validation value, u64 imageblock byte length, and a u32
 flag for indirect-command-buffer support. The last 12 bytes are reserved zero.
-Imageblock length is populated only for opcode 6. These are actual host values;
+Imageblock length is populated only for opcode 6 or 12. These are actual host values;
 no persistent GPU resource identifier is transported.
 
 Library metadata carries u32 library type, u32 presence flags, u32 install-name
@@ -194,7 +196,7 @@ Pipeline queries share the exact-source/function key with compute execution.
 The library and pipeline caches retain warning diagnostics. Reset preserves
 immutable cached objects and discards stale query output and interrupts through
 the existing generation check. No persistent host resource handle is exposed.
-Both hardware and application protocols require version 4. Older transports
+Both hardware and application protocols require version 5. Older transports
 fail at open, old descriptors fail validation, and application/kernel mismatches
 fail capability negotiation. There is no version fallback.
 
@@ -225,7 +227,7 @@ use a separate namespace. Full images preserve aliases and bytes outside shader
 writes. Pipelines sharing source may be grouped canonically, with dispatch IDs
 remapped without changing dispatch order. A nonempty batch requires pipelines
 and dispatches but may have no buffers. An empty batch has a
-64-byte header with version 4 and every other field zero; it still commits a
+64-byte header with version 5 and every other field zero; it still commits a
 real empty host command buffer.
 
 Validation checks all dimensions and products, actual pipeline/device limits,
@@ -242,6 +244,89 @@ and host status Completed. Typed failures retain diagnostics and return zeroed
 image storage. The entire response is validated before any guest shadow copy.
 This ABI is separate from the 17,168-byte compiler-query header.
 
+## Resource batches and typed libraries
+
+Version 5 changes all outer versions together; there is no mixed-version mode.
+Operations 1 through 7 retain their layouts and validators with the version
+field changed to 5. The new operations carry their manifests only in the input
+range, with zero source length and empty descriptor function names.
+
+| Opcode | Input and output | Descriptor dimensions |
+| --- | --- | --- |
+| 8, resource batch | Input at least 128 bytes; output exactly 16640 plus all resource images | 1/1/1 |
+| 9, typed library query | Input at least 64 bytes; output 17168 through compiler maximum | 1/1/1 |
+| 10, typed compute-pipeline query | Input at least 64 bytes; output exactly 17168 | 1/1/1 |
+| 11, render-pipeline query | Input at least 64 bytes; output exactly 17168 | 1/1/1 |
+| 12, typed imageblock query | Input at least 64 bytes; output exactly 17168 | Each 1..65536 |
+
+A resource manifest starts with a 128-byte header, then contiguous tables in
+this order: libraries, compute pipelines, render pipelines, buffers, textures,
+samplers, commands, draws and bindings. Payload bytes, inline bytes and complete
+initial resource images follow without padding. Integer and floating-point wire
+values are little endian; unaligned byte regions are read without native struct
+casts. Reserved fields and unused per-kind fields are zero.
+
+| Table | Record bytes | Maximum records |
+| --- | --- | --- |
+| Library | 32 | 16 |
+| Compute pipeline | 80 | 8 |
+| Render pipeline | 192 | 8 |
+| Buffer | 16 | 64 |
+| Texture | 32 | 32 |
+| Sampler | 80 | 32 |
+| Ordered command | 96 | 64 |
+| Draw | 160 | 256 |
+| Binding | 32 | 2048 |
+
+Library kind 1 carries nonempty UTF-8 source, at most 64 KiB. Kind 2 carries an
+opaque compiled Metal library, at most 4 MiB. Total payload is at most 8 MiB.
+Inline bindings retain the 4096-byte individual and 64-KiB aggregate limits.
+Each complete input and output must fit the 16-MiB transport bound. Nonempty
+manifests require a command and every declared resource must be referenced.
+The all-zero-count header is a valid real empty GPU submission.
+
+Textures are shared, tracked, non-sparse 2D resources, one level/slice/sample,
+with dimensions 1..8192. Supported four-byte formats are RGBA8Unorm,
+RGBA8Unorm_sRGB, RGBA8Snorm, BGRA8Unorm and BGRA8Unorm_sRGB. Buffer/inline and
+texture slots each run from 0 through 30; sampler slots run from 0 through 15.
+Transport table capacities are separate from these binding-slot limits. The
+host requires a supported Apple GPU family; this does not imply that the guest
+implements that family's complete feature set.
+
+Final pipeline creation reflection determines texture read/write usage
+requirements for each stage before encoding. Unsupported binding shapes fail
+explicitly. Render-target usage is checked separately, and every draw pipeline's
+color format must match its pass attachment. Non-normalized samplers use clamp
+to edge, no mip filtering, equal min/mag filtering and anisotropy 1.
+
+Compute and render commands execute in manifest order in one command buffer.
+Render passes preserve load/clear and store behavior even without draws.
+Each draw captures its pipeline, bindings and raster state; omitted optional
+raster fields select full-attachment defaults rather than a previous draw's
+state. Color write masks apply independently of blending being enabled.
+
+Opcode 8 extends the batch result with texture count at byte 48; bytes 52..63
+remain reserved zero. All buffer images precede all tight texture images in
+table order. Success requires host Completed and observed scheduling. Failures
+return zero image storage. New outcomes are unsupported state 9 and resource
+creation failure 10, with resource phase 7. The compiler and batch outcome enums
+remain distinct; callers must use the envelope selected by opcode.
+
+Typed query manifests use a 64-byte header, one library record (or two for a
+render pipeline), a compute/render pipeline record when applicable, and payload
+bytes. Queries 9, 10 and 12 reuse the existing inventory/compute result layouts.
+Query 11 leaves the compute block and unused compute header limits zero, and
+places actual render metadata in the 512-byte block at byte 16656. It carries
+allocation and imageblock sample sizes, thread/threadgroup limits, execution
+widths, shader validation, required tile/object/mesh dimensions and flags for
+indirect command buffers and tile-size matching. Its remaining 364 bytes are
+zero. Header byte 56 is stage 1 (vertex) or 2 (fragment) only on a query-11
+function failure; otherwise it is zero. Byte 60 remains zero for all queries.
+
+The exact schema constants and bounds live in
+`include/standard-headers/inferno/metal.h`. These transport and host execution
+features do not establish native iOS Metal device discovery or presentation.
+
 ## Reset and lifetime
 
 Reset clears descriptor, completed sequence, error, pending interrupt and mask.
@@ -253,11 +338,12 @@ the slot, then configure the descriptor and interrupt mask again.
 The host API does not support cancelling a submitted command buffer. Device
 teardown joins the worker before releasing its buffers and queue; a host GPU
 driver that never completes can therefore delay shutdown. Buffers and textures
-are per-request. Each device retains up to eight compute/render pipelines,
-evicting the least recently used entry on insertion. Keys contain the opcode,
-an owned copy of the exact shader bytes, and both applicable entrypoint names.
-Protocol v4 fixes the remaining pipeline state, including BGRA8Unorm; future
-configurable state must extend the key. Failed compilation, function validation,
+are per-request. Each device retains up to 32 libraries and 32 compute/render pipelines,
+evicting the least recently used entry on insertion. Legacy keys retain exact
+source and entrypoint identity. Typed keys additionally distinguish source from
+compiled payloads and include canonical render state. Typed query and execution
+share the same constructors and keys. Cached pipelines retain their warning and
+creation reflection together through promotion, eviction and teardown. Failed compilation, function validation,
 or pipeline creation is never cached. A later encoding or execution failure
 still reports an error even when the valid pipeline is retained.
 
@@ -469,8 +555,10 @@ and may be smaller than their backing descriptor, but never larger. The adapter
 retains no user pointer, descriptor or staging allocation after the synchronous
 call, and the service makes its own DMA copy before submit returns.
 
-Capabilities advertise compute, render, clear, library, pipeline and imageblock
-queries, and compute batches as opcode bits 1 through 7. Status state and
+Capabilities advertise the explicit opcode bits 1 through 12. Unknown bits
+remain errors. Resource batches require input/output capacities of at least
+128/16640 bytes; typed queries require at least 64/17168 bytes. These transport
+minimums do not describe a guest GPU feature family. Status state and
 transport results use explicit stable wire mappings;
 the timer error is the 32-bit `IOReturn` pattern, and completion sequence/error
 come only from the connection's session snapshot. Unknown internal enum values
@@ -480,7 +568,7 @@ The status word at byte 28 contains batch progress bit 0, exposed only for the
 owning active session. Unknown bits fail validation. SUBMITTED status retains
 sequence zero; COMPLETED must echo the submitted sequence before its progress
 can be attributed to that command. Capability, submission and status packets
-all use version 4; older peers are rejected explicitly.
+all use version 5; older peers are rejected explicitly.
 
 The user client explicitly enables all three documented default-locking
 properties. It retains the service, shared workloop and session until `free`.
@@ -755,3 +843,57 @@ Current results and remaining acceptance gaps are recorded in
 Native iOS device discovery, driver startup, capability selection, full resource
 families, presentation and Settings virtual-display identification remain
 unverified and incomplete.
+
+## Local v5 integration verification
+
+The coordinated v5 QEMU executable (SHA-256
+`4b0fb5bf6f9a1c01d0c0f2bbe45ea8552e16c863c579008b079e320455c015b1`)
+passes ten valid new-opcode scenarios under both TCG and HVF. All 20 captured
+replies match the independently accepted host references except for the checked
+per-request sequence field. Scenarios cover typed library, compute, imageblock
+and render queries; empty, clear, load/draw, compiled compute, texture sampling
+and per-draw raster-state restoration. Separate legacy opcode7 compute, buffer
+alias/offset, live scheduled-reset and recovery tests pass with all 14 captures
+matching the prior reference after the version-word migration. The reset image
+remains byte-identical. Evidence is in the local GPU/Metal evidence directory
+under `metal-v5-arm-valid-votsw9bi/run-3fabilss` and
+`metal-v5-legacy-arm-ovss8ny1/metal-v4-arm-oracle-saarhp21`.
+
+These freestanding ARM checks exercise actual MMIO and host GPU execution. They
+do not establish native iOS driver loading, provider discovery or presentation.
+The provider M2a context compiles and links for iPhoneOS26.5 arm64e and macOS26.5;
+its source/data/file/default library factories and resource-batch compute path
+also pass a direct real-host provider test. Six factory paths reproduce all
+1,200 independently calculated guarded image bytes, with scheduling/completion
+for six compute commands and one empty command. That fixture substitutes the
+coordinator/IOKit connection while linking actual provider objects, wire builders
+and decoders, and the host backend; it does not establish production connection
+runtime. Evidence: `metal-provider-m2a-real-host-fw8ghfp0/run-_npuqlms`.
+The M2b texture, sampler and render objects now also compile and link on both
+SDKs. Their actual-host provider checks match the native reference for padded
+transfers, partial updates, clear/load passes, compiled render and sampling
+libraries, dependent compute-to-texture rendering, descriptor capture and raster
+state. All five supported formats pass transfer and clear checks; the sRGB clear
+checks use exact zero/one endpoints. Unsupported local states preserve resources
+and submit no work. A real host texture-usage rejection retains its typed error
+and explanatory description without shadow writeback; subsequent valid work
+completes. These provider checks also substitute the coordinator/IOKit seam.
+See GPU_METAL_PROGRESS.md for exact evidence directories and coverage limits.
+
+Legacy opcodes 1–6 additionally pass under TCG/HVF, with all 14 compiler captures
+accepted by the production decoder and matching host metadata. Frozen published
+v4 transport sources reject the v5 peer under both accelerators; focused client
+capability negotiation passes 142 sanitized checks with fake IOKit.
+
+The unchanged QEMU binary also passes a debugger observer-lifetime check using
+the accepted opcode-7 and opcode-8 TCG workloads. All 13 observed GPU batches
+clear their callback and work pointer before worker retirement; four typed-query
+retirements correctly have no GPU observer. Both targets exit zero with complete
+workload markers. Debugger timing limits this to the observed runs, supplemented
+by source review of the shared helper, reset and worker-join paths. Evidence:
+`metal-host-observer-runtime-9ifhwfyy/root-runtime-verification.json`.
+
+A production native MTLDevice adapter, argument buffers, truthful device
+capabilities, actual iOS provider/driver integration and presentation remain
+unfinished. This v5 layer does not establish native iOS Metal acceleration or
+the requested Settings virtual-display identity.

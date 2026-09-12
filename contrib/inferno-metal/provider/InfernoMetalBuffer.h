@@ -30,6 +30,8 @@ NS_ASSUME_NONNULL_BEGIN
         : (MTLResourceOptions)options bytes : (nullable const void *)bytes;
 
     @property(nonatomic, readonly) InfernoMetalCompilerContext *infernoContext;
+    -(NSData *)infernoSnapshot;
+    -(BOOL)infernoReplaceSnapshot : (NSData *)snapshot;
 
     @end
 

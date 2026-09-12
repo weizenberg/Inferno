@@ -59,4 +59,85 @@ const uint8_t *inferno_metal_batch_dispatch(const InfernoMetalBatchView *view,
 const uint8_t *inferno_metal_batch_binding(const InfernoMetalBatchView *view,
                                            uint32_t index);
 
+typedef struct InfernoMetalResourceBatchView {
+    const uint8_t *bytes;
+    size_t size;
+    uint32_t library_count;
+    uint32_t compute_pipeline_count;
+    uint32_t render_pipeline_count;
+    uint32_t buffer_count;
+    uint32_t texture_count;
+    uint32_t sampler_count;
+    uint32_t command_count;
+    uint32_t draw_count;
+    uint32_t binding_count;
+    uint32_t inline_size;
+    uint32_t payload_size;
+    uint32_t images_size;
+    size_t libraries_offset;
+    size_t compute_pipelines_offset;
+    size_t render_pipelines_offset;
+    size_t buffers_offset;
+    size_t textures_offset;
+    size_t samplers_offset;
+    size_t commands_offset;
+    size_t draws_offset;
+    size_t bindings_offset;
+    size_t payload_offset;
+    size_t inline_offset;
+    size_t images_offset;
+} InfernoMetalResourceBatchView;
+
+typedef struct InfernoMetalTypedQueryView {
+    const uint8_t *bytes;
+    size_t size;
+    uint32_t opcode;
+    uint32_t library_count;
+    uint32_t payload_size;
+    size_t libraries_offset;
+    size_t pipeline_offset;
+    size_t pipeline_size;
+    size_t payload_offset;
+} InfernoMetalTypedQueryView;
+
+bool inferno_metal_resource_batch_parse(const void *bytes, size_t size,
+                                        size_t output_size,
+                                        InfernoMetalResourceBatchView *view,
+                                        InfernoMetalBatchParseError *error);
+const uint8_t *
+inferno_metal_resource_batch_library(const InfernoMetalResourceBatchView *view,
+                                     uint32_t index);
+const uint8_t *inferno_metal_resource_batch_compute_pipeline(
+    const InfernoMetalResourceBatchView *view, uint32_t index);
+const uint8_t *inferno_metal_resource_batch_render_pipeline(
+    const InfernoMetalResourceBatchView *view, uint32_t index);
+const uint8_t *
+inferno_metal_resource_batch_buffer(const InfernoMetalResourceBatchView *view,
+                                    uint32_t index);
+const uint8_t *
+inferno_metal_resource_batch_texture(const InfernoMetalResourceBatchView *view,
+                                     uint32_t index);
+const uint8_t *
+inferno_metal_resource_batch_sampler(const InfernoMetalResourceBatchView *view,
+                                     uint32_t index);
+const uint8_t *
+inferno_metal_resource_batch_command(const InfernoMetalResourceBatchView *view,
+                                     uint32_t index);
+const uint8_t *
+inferno_metal_resource_batch_draw(const InfernoMetalResourceBatchView *view,
+                                  uint32_t index);
+const uint8_t *
+inferno_metal_resource_batch_binding(const InfernoMetalResourceBatchView *view,
+                                     uint32_t index);
+
+bool inferno_metal_typed_query_parse(uint32_t opcode, const void *bytes,
+                                     size_t size,
+                                     InfernoMetalTypedQueryView *view,
+                                     InfernoMetalBatchParseError *error);
+const uint8_t *
+inferno_metal_typed_query_library(const InfernoMetalTypedQueryView *view,
+                                  uint32_t index);
+const uint8_t *
+inferno_metal_typed_query_pipeline(const InfernoMetalTypedQueryView *view);
+
 #endif

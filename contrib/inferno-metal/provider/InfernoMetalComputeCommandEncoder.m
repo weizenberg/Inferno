@@ -15,11 +15,13 @@
  * along with this program. If not, see <https://www.gnu.org/licenses/>.
  */
 
+#import "InfernoMetalComputeCommandEncoder.h"
 #import "InfernoMetalBuffer.h"
 #import "InfernoMetalCommandBuffer.h"
-#import "InfernoMetalComputeCommandEncoder.h"
 #import "InfernoMetalComputePipelineState.h"
 #import "InfernoMetalErrors.h"
+#import "InfernoMetalSamplerState.h"
+#import "InfernoMetalTexture.h"
 
 #include "standard-headers/inferno/metal.h"
 
@@ -36,6 +38,8 @@
 @property(nonatomic, strong) id<MTLComputePipelineState> pipeline;
 @property(nonatomic, strong) NSMutableArray *slots;
 @property(nonatomic, strong) NSMutableArray<NSNumber *> *threadgroups;
+@property(nonatomic, strong) NSMutableArray *textures;
+@property(nonatomic, strong) NSMutableArray *samplers;
 @property(nonatomic, copy, nullable) NSString *storedLabel;
 @property(nonatomic) BOOL ended;
 @end
@@ -56,10 +60,15 @@ static void encoderInvalid(NSString *message)
     _storedDevice = device;
     _slots = [NSMutableArray arrayWithCapacity:31];
     _threadgroups = [NSMutableArray arrayWithCapacity:31];
+    _textures = [NSMutableArray arrayWithCapacity:31];
+    _samplers = [NSMutableArray arrayWithCapacity:16];
     for (unsigned i = 0; i < 31; i++) {
         [_slots addObject:[NSNull null]];
         [_threadgroups addObject:@0];
+        [_textures addObject:[NSNull null]];
     }
+    for (unsigned i = 0; i < 16; i++)
+        [_samplers addObject:[NSNull null]];
     return self;
 }
 
@@ -207,6 +216,8 @@ static BOOL dimensionsWithin(MTLSize value, uint64_t limit)
         [[InfernoMetalEncodedDispatch alloc] init];
     dispatch.pipeline = _pipeline;
     dispatch.bindings = [_slots copy];
+    dispatch.textureBindings = [_textures copy];
+    dispatch.samplerBindings = [_samplers copy];
     dispatch.threadgroupLengths = [_threadgroups copy];
     dispatch.grid = grid;
     dispatch.group = group;
@@ -360,28 +371,57 @@ static BOOL dimensionsWithin(MTLSize value, uint64_t limit)
 }
 - (void)setTexture:(id<MTLTexture>)texture atIndex:(NSUInteger)index
 {
-    (void)texture;
-    (void)index;
-    [self unsupported];
+    [self requireActive];
+    [self requireIndex:index];
+    if (!texture) {
+        _textures[index] = [NSNull null];
+        return;
+    }
+    if (![texture isKindOfClass:[InfernoMetalTexture class]] ||
+        ((InfernoMetalTexture *)texture).infernoContext !=
+            _commandBuffer.infernoContext ||
+        !(texture.usage &
+          (MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite)))
+        encoderInvalid(@"The texture is foreign or lacks shader usage");
+    _textures[index] = @{
+        @"kind" : @(INFERNO_METAL_RESOURCE_BINDING_TEXTURE),
+        @"texture" : texture
+    };
 }
 - (void)setTextures:(const id<MTLTexture>[])textures withRange:(NSRange)range
 {
-    (void)textures;
-    (void)range;
-    [self unsupported];
+    [self requireActive];
+    if (!textures || range.location > 31 || range.length > 31 - range.location)
+        encoderInvalid(@"The texture binding range is invalid");
+    for (NSUInteger i = 0; i < range.length; i++)
+        [self setTexture:textures[i] atIndex:range.location + i];
 }
 - (void)setSamplerState:(id<MTLSamplerState>)sampler atIndex:(NSUInteger)index
 {
-    (void)sampler;
-    (void)index;
-    [self unsupported];
+    [self requireActive];
+    if (index > 15)
+        encoderInvalid(@"A sampler binding index must be at most 15");
+    if (!sampler) {
+        _samplers[index] = [NSNull null];
+        return;
+    }
+    if (![sampler isKindOfClass:[InfernoMetalSamplerState class]] ||
+        ((InfernoMetalSamplerState *)sampler).infernoContext !=
+            _commandBuffer.infernoContext)
+        encoderInvalid(@"The sampler belongs to another Metal context");
+    _samplers[index] = @{
+        @"kind" : @(INFERNO_METAL_RESOURCE_BINDING_SAMPLER),
+        @"sampler" : sampler
+    };
 }
 - (void)setSamplerStates:(const id<MTLSamplerState>[])samplers
                withRange:(NSRange)range
 {
-    (void)samplers;
-    (void)range;
-    [self unsupported];
+    [self requireActive];
+    if (!samplers || range.location > 16 || range.length > 16 - range.location)
+        encoderInvalid(@"The sampler binding range is invalid");
+    for (NSUInteger i = 0; i < range.length; i++)
+        [self setSamplerState:samplers[i] atIndex:range.location + i];
 }
 - (void)setSamplerState:(id<MTLSamplerState>)sampler
             lodMinClamp:(float)min

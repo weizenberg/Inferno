@@ -88,6 +88,23 @@
     return _storedContext;
 }
 
+- (NSData *)infernoSnapshot
+{
+    @synchronized(self) {
+        return [NSData dataWithBytes:_storage length:_storedLength];
+    }
+}
+
+- (BOOL)infernoReplaceSnapshot:(NSData *)snapshot
+{
+    if (snapshot.length != _storedLength)
+        return NO;
+    @synchronized(self) {
+        memcpy(_storage, snapshot.bytes, snapshot.length);
+    }
+    return YES;
+}
+
 - (void *)contents
 {
     return _storage;

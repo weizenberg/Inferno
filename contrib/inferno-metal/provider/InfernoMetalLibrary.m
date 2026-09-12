@@ -23,7 +23,8 @@
 @interface InfernoMetalLibrary ()
 @property(nonatomic, strong) InfernoMetalCompilerContext *storedContext;
 @property(nonatomic, strong) id<MTLDevice> storedDevice;
-@property(nonatomic, copy) NSData *storedSource;
+@property(nonatomic, copy) NSData *storedPayload;
+@property(nonatomic) uint32_t storedLibraryKind;
 @property(nonatomic, copy) NSArray *storedFunctionNames;
 @property(nonatomic, copy) NSDictionary *recordsByName;
 @property(nonatomic) MTLLibraryType storedType;
@@ -43,18 +44,23 @@ static uint64_t recordGet64(const uint8_t *p)
 }
 - (instancetype)initWithContext:(InfernoMetalCompilerContext *)context
                          device:(id<MTLDevice>)device
-                         source:(NSData *)source
+                        payload:(NSData *)payload
+                           kind:(uint32_t)kind
                          result:(const ImtlCompilerResult *)result
                  compileWarning:(NSError *)warning
                           error:(NSError **)error
 {
     if (error)
         *error = nil;
-    if (!(self = [super init]) || !context || !device || !source || !result)
+    if (!(self = [super init]) || !context || !device || !payload.length ||
+        (kind != INFERNO_METAL_RESOURCE_LIBRARY_SOURCE &&
+         kind != INFERNO_METAL_RESOURCE_LIBRARY_METALLIB) ||
+        !result)
         return nil;
     _storedContext = context;
     _storedDevice = device;
-    _storedSource = [source copy];
+    _storedPayload = [payload copy];
+    _storedLibraryKind = kind;
     _storedType = result->library_type;
     _storedWarning = warning;
     if (result->library_flags &
@@ -102,9 +108,13 @@ static uint64_t recordGet64(const uint8_t *p)
 {
     return _storedContext;
 }
-- (NSData *)infernoSource
+- (NSData *)infernoPayload
 {
-    return _storedSource;
+    return _storedPayload;
+}
+- (uint32_t)infernoLibraryKind
+{
+    return _storedLibraryKind;
 }
 - (NSError *)compileWarning
 {

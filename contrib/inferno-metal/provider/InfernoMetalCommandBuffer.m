@@ -21,6 +21,7 @@
 #import "InfernoMetalComputeCommandEncoder.h"
 #import "InfernoMetalContextPrivate.h"
 #import "InfernoMetalErrors.h"
+#import "InfernoMetalRenderCommandEncoder.h"
 
 #include <pthread.h>
 
@@ -55,7 +56,7 @@
 @property(nonatomic, strong) NSMutableArray *dispatches;
 @property(nonatomic, strong) NSMutableArray *scheduled;
 @property(nonatomic, strong) NSMutableArray *completed;
-@property(nonatomic, weak) InfernoMetalComputeCommandEncoder *activeEncoder;
+@property(nonatomic, weak) id activeEncoder;
 @property(nonatomic, strong) dispatch_queue_t deliveryQueue;
 @property(nonatomic) uint64_t commitSerial;
 @property(nonatomic) BOOL admitted;
@@ -282,8 +283,8 @@ static void invalidUse(NSString *message)
         return;
     }
     pthread_mutex_unlock(&_mutex);
-    uint64_t serial =
-        [_storedContext commitCommandBuffer:self queue:_storedQueue];
+    uint64_t serial = [_storedContext commitCommandBuffer:self
+                                                    queue:_storedQueue];
     if (!serial) {
         [self infernoFail:InfernoMetalMakeError(
                               InfernoMetalErrorClosed,
@@ -322,6 +323,11 @@ static void invalidUse(NSString *message)
     NSArray *value = [_dispatches copy];
     pthread_mutex_unlock(&_mutex);
     return value;
+}
+
+- (NSArray *)infernoCommands
+{
+    return self.infernoDispatches;
 }
 
 - (InfernoMetalCompilerContext *)infernoContext
@@ -522,32 +528,39 @@ static void invalidUse(NSString *message)
 
 - (void)waitUntilScheduled
 {
-    [self waitForPredicate:^BOOL {
-      return self->_scheduledDelivered ||
-             (self->_scheduledClosed && self->_completedDelivered);
-    }
-                     phase:@"scheduled"];
+    [self
+        waitForPredicate:^BOOL {
+          return self->_scheduledDelivered ||
+                 (self->_scheduledClosed && self->_completedDelivered);
+        }
+                   phase:@"scheduled"];
 }
 
 - (void)waitUntilCompleted
 {
-    [self waitForPredicate:^BOOL {
-      return self->_completedDelivered;
-    }
-                     phase:@"completed"];
+    [self
+        waitForPredicate:^BOOL {
+          return self->_completedDelivered;
+        }
+                   phase:@"completed"];
 }
 
 - (BOOL)infernoAppendDispatch:(id)dispatch
 {
+    return [self infernoAppendCommand:dispatch];
+}
+
+- (BOOL)infernoAppendCommand:(id)command
+{
     pthread_mutex_lock(&_mutex);
     BOOL valid = !_commitStarted;
     if (valid)
-        [_dispatches addObject:dispatch];
+        [_dispatches addObject:command];
     pthread_mutex_unlock(&_mutex);
     return valid;
 }
 
-- (void)infernoEncoderEnded:(InfernoMetalComputeCommandEncoder *)encoder
+- (void)infernoEncoderEnded:(id)encoder
 {
     pthread_mutex_lock(&_mutex);
     if (_activeEncoder == encoder)
@@ -617,9 +630,28 @@ static void invalidUse(NSString *message)
 - (id<MTLRenderCommandEncoder>)renderCommandEncoderWithDescriptor:
     (MTLRenderPassDescriptor *)descriptor
 {
-    (void)descriptor;
-    [self blitCommandEncoder];
-    return nil;
+    if (!descriptor)
+        return nil;
+    pthread_mutex_lock(&_mutex);
+    if (_commitStarted || _activeEncoder) {
+        pthread_mutex_unlock(&_mutex);
+        invalidUse(@"Only one encoder may be active before commit");
+        return nil;
+    }
+    InfernoMetalRenderCommandEncoder *encoder =
+        [[InfernoMetalRenderCommandEncoder alloc]
+            initWithCommandBuffer:self
+                           device:_storedDevice
+                       descriptor:descriptor];
+    if (!encoder) {
+        pthread_mutex_unlock(&_mutex);
+        invalidUse(@"The render pass descriptor is unsupported");
+        return nil;
+    }
+    [_dispatches addObject:encoder.infernoPass];
+    _activeEncoder = encoder;
+    pthread_mutex_unlock(&_mutex);
+    return encoder;
 }
 - (id<MTLParallelRenderCommandEncoder>)
     parallelRenderCommandEncoderWithDescriptor:

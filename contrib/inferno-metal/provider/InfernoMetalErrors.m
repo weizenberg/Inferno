@@ -223,3 +223,88 @@ NSError *InfernoMetalErrorFromBatchResult(const ImtlBatchResult *r,
                                code:code
                            userInfo:info];
 }
+
+NSError *InfernoMetalErrorFromBatch5Result(const ImtlBatch5Result *r,
+                                           IOReturn timer, IOReturn cleanup)
+{
+    if (!r)
+        return InfernoMetalMakeError(InfernoMetalErrorProtocol,
+                                     @"Missing resource batch result");
+    if (r->outcome == INFERNO_METAL_BATCH_OUTCOME_OK &&
+        timer == kIOReturnSuccess && cleanup == kIOReturnSuccess)
+        return nil;
+    NSString *description =
+        [[NSString alloc] initWithBytes:r->error_description
+                                 length:r->error_description_length
+                               encoding:NSUTF8StringEncoding];
+    if (!description.length)
+        description = nil;
+    NSMutableDictionary *info = [@{
+        NSLocalizedDescriptionKey : description ?:
+            @"Inferno Metal resource batch operation failed",
+        InfernoMetalPhaseErrorKey : @(r->phase),
+        InfernoMetalOutcomeErrorKey : @(r->outcome),
+        InfernoMetalFailedRecordKindKey : @(r->failed_record_kind),
+        InfernoMetalFailedRecordIndexKey : @(r->failed_record_index),
+        InfernoMetalHostStatusKey : @(r->host_command_buffer_status),
+        InfernoMetalSequenceErrorKey : @(r->sequence),
+        InfernoMetalScheduledKey :
+            @((r->flags & INFERNO_METAL_BATCH_FLAG_SCHEDULED) != 0)
+    } mutableCopy];
+    if (timer != kIOReturnSuccess)
+        info[InfernoMetalTimerErrorKey] = @((uint32_t)timer);
+    if (cleanup != kIOReturnSuccess)
+        info[InfernoMetalCleanupErrorKey] = @((uint32_t)cleanup);
+    if (r->flags & INFERNO_METAL_BATCH_FLAG_DESCRIPTION_TRUNCATED)
+        info[InfernoMetalDescriptionTruncatedKey] = @YES;
+    if (r->flags & INFERNO_METAL_BATCH_FLAG_DOMAIN_TRUNCATED)
+        info[InfernoMetalDomainTruncatedKey] = @YES;
+    if (!(r->flags & INFERNO_METAL_BATCH_FLAG_NO_NSERROR)) {
+        NSString *domain =
+            [[NSString alloc] initWithBytes:r->error_domain
+                                     length:r->error_domain_length
+                                   encoding:NSUTF8StringEncoding];
+        BOOL truncated = r->flags & INFERNO_METAL_BATCH_FLAG_DOMAIN_TRUNCATED;
+        if (truncated && domain)
+            info[InfernoMetalDomainPrefixErrorKey] = domain;
+        return [NSError
+            errorWithDomain:truncated ? InfernoMetalRemoteErrorDomain : domain
+                       code:(NSInteger)r->error_code
+                   userInfo:info];
+    }
+    InfernoMetalErrorCode code;
+    switch (r->outcome) {
+    case INFERNO_METAL_BATCH_OUTCOME_INVALID_DISPATCH:
+        code = InfernoMetalErrorInvalidDispatch;
+        break;
+    case INFERNO_METAL_BATCH_OUTCOME_MALFORMED:
+        code = InfernoMetalErrorMalformedBatch;
+        break;
+    case INFERNO_METAL_BATCH_OUTCOME_UNSUPPORTED_HOST:
+        code = InfernoMetalErrorUnsupportedHost;
+        break;
+    case INFERNO_METAL_BATCH_OUTCOME_SPECIALIZATION_REQUIRED:
+        code = InfernoMetalErrorSpecializationRequired;
+        break;
+    case INFERNO_METAL_BATCH_OUTCOME_FUNCTION_TYPE_MISMATCH:
+        code = InfernoMetalErrorFunctionTypeMismatch;
+        break;
+    case INFERNO_METAL_BATCH_OUTCOME_EXECUTION_FAILED:
+        code = InfernoMetalErrorExecutionFailed;
+        break;
+    case INFERNO_METAL_RESOURCE_OUTCOME_UNSUPPORTED_STATE:
+        code = InfernoMetalErrorUnsupportedState;
+        break;
+    case INFERNO_METAL_RESOURCE_OUTCOME_RESOURCE_FAILED:
+        code = InfernoMetalErrorResourceCreation;
+        break;
+    default:
+        code = r->outcome == INFERNO_METAL_BATCH_OUTCOME_OK ?
+                   InfernoMetalErrorTransport :
+                   InfernoMetalErrorRemoteWithoutNSError;
+        break;
+    }
+    return [NSError errorWithDomain:InfernoMetalErrorDomain
+                               code:code
+                           userInfo:info];
+}

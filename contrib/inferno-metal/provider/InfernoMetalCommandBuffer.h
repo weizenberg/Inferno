@@ -21,6 +21,7 @@
 @class InfernoMetalCommandQueue;
 @class InfernoMetalCompilerContext;
 @class InfernoMetalComputeCommandEncoder;
+@class InfernoMetalRenderCommandEncoder;
 
 NS_ASSUME_NONNULL_BEGIN
 
@@ -36,6 +37,7 @@ NS_ASSUME_NONNULL_BEGIN
     @property(nonatomic, readonly) uint64_t infernoCommitSerial;
     @property(nonatomic, readonly) BOOL infernoAdmitted;
     @property(nonatomic, readonly) NSArray *infernoDispatches;
+    @property(nonatomic, readonly) NSArray *infernoCommands;
     @property(nonatomic, readonly) InfernoMetalCompilerContext *infernoContext;
     @property(nonatomic, readonly) uint64_t infernoReservationToken;
 
@@ -47,7 +49,8 @@ NS_ASSUME_NONNULL_BEGIN
         : (BOOL)scheduled;
     -(void)infernoFail : (NSError *)error scheduled : (BOOL)scheduled;
     -(BOOL)infernoAppendDispatch : (id)dispatch;
-    -(void)infernoEncoderEnded : (InfernoMetalComputeCommandEncoder *)encoder;
+    -(BOOL)infernoAppendCommand : (id)command;
+    -(void)infernoEncoderEnded : (id)encoder;
 
     @end
 

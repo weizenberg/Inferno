@@ -27,6 +27,9 @@ extern "C" {
 IOReturn imtl_batch_submit(ImtlUserClient *client, uint64_t sequence,
                            const void *manifest, size_t manifest_size,
                            uint32_t images_size);
+IOReturn imtl_batch5_submit(ImtlUserClient *client, uint64_t sequence,
+                            const void *manifest, size_t manifest_size,
+                            uint32_t images_size);
 
 #ifdef __cplusplus
 }

@@ -115,6 +115,43 @@ static bool knownDataType(uint32_t type)
            (type >= 121 && type <= 124) || (type >= 139 && type <= 140);
 }
 
+static bool libraryOpcode(uint32_t opcode)
+{
+    return opcode == INFERNO_METAL_QUERY_LIBRARY ||
+           opcode == INFERNO_METAL_QUERY_LIBRARY_TYPED;
+}
+
+static bool imageblockOpcode(uint32_t opcode)
+{
+    return opcode == INFERNO_METAL_QUERY_IMAGEBLOCK ||
+           opcode == INFERNO_METAL_QUERY_IMAGEBLOCK_TYPED;
+}
+
+static bool typedOpcode(uint32_t opcode)
+{
+    switch (opcode) {
+    case INFERNO_METAL_QUERY_LIBRARY_TYPED:
+    case INFERNO_METAL_QUERY_PIPELINE_TYPED:
+    case INFERNO_METAL_QUERY_RENDER_PIPELINE:
+    case INFERNO_METAL_QUERY_IMAGEBLOCK_TYPED:
+        return true;
+    default:
+        return false;
+    }
+}
+
+static bool compilerOpcode(uint32_t opcode)
+{
+    switch (opcode) {
+    case INFERNO_METAL_QUERY_LIBRARY:
+    case INFERNO_METAL_QUERY_PIPELINE:
+    case INFERNO_METAL_QUERY_IMAGEBLOCK:
+        return true;
+    default:
+        return typedOpcode(opcode);
+    }
+}
+
 size_t imtl_compiler_output_size(uint32_t function_capacity,
                                  uint32_t metadata_capacity)
 {
@@ -236,6 +273,52 @@ IOReturn imtl_compiler_submit_imageblock(ImtlUserClient *client,
                        source_size, kernel_name, width, height, depth);
 }
 
+IOReturn imtl_compiler_submit_typed_query(ImtlUserClient *client,
+                                          uint64_t sequence, uint32_t opcode,
+                                          const void *manifest,
+                                          size_t manifest_size,
+                                          uint32_t output_size, uint32_t width,
+                                          uint32_t height, uint32_t depth)
+{
+    const ImtlUserCaps *caps = imtl_user_client_caps(client);
+    bool imageblock = opcode == INFERNO_METAL_QUERY_IMAGEBLOCK_TYPED;
+    if (!client || !manifest ||
+        manifest_size < INFERNO_METAL_RESOURCE_QUERY_HEADER_SIZE ||
+        manifest_size > INFERNO_METAL_MAX_BUFFER ||
+        (opcode != INFERNO_METAL_QUERY_LIBRARY_TYPED &&
+         opcode != INFERNO_METAL_QUERY_PIPELINE_TYPED &&
+         opcode != INFERNO_METAL_QUERY_RENDER_PIPELINE && !imageblock) ||
+        (opcode == INFERNO_METAL_QUERY_LIBRARY_TYPED ?
+             (output_size < INFERNO_METAL_COMPILER_MIN_OUTPUT ||
+              output_size > INFERNO_METAL_COMPILER_MAX_OUTPUT) :
+             output_size != INFERNO_METAL_COMPILER_MIN_OUTPUT) ||
+        (imageblock ? (!width || width > 65536 || !height || height > 65536 ||
+                       !depth || depth > 65536) :
+                      (width != 1 || height != 1 || depth != 1))) {
+        return kIOReturnBadArgument;
+    }
+    if (!caps || !(caps->opcode_mask & (1U << opcode)) ||
+        manifest_size > caps->max_input_size ||
+        output_size > caps->max_output_size ||
+        caps->max_request_size < INFERNO_METAL_USER_SUBMIT_HEADER_SIZE ||
+        manifest_size >
+            caps->max_request_size - INFERNO_METAL_USER_SUBMIT_HEADER_SIZE) {
+        return kIOReturnUnsupported;
+    }
+    ImtlUserSubmit request = {
+        .opcode = opcode,
+        .sequence = sequence,
+        .output_size = output_size,
+        .width = width,
+        .height = height,
+        .depth = depth,
+        .options = INFERNO_METAL_OPTIONS_DEFAULT,
+        .input = manifest,
+        .input_size = manifest_size,
+    };
+    return imtl_user_client_submit(client, &request);
+}
+
 static bool validDiagnostics(const ImtlCompilerResult *r)
 {
     bool no_error = r->flags & INFERNO_METAL_COMPILER_FLAG_NO_NSERROR;
@@ -295,8 +378,45 @@ static bool validPipeline(const ImtlCompilerResult *r, const uint8_t *bytes)
     if (r->shader_validation < 0 || r->shader_validation > 2) {
         return false;
     }
-    return r->opcode == INFERNO_METAL_QUERY_IMAGEBLOCK ||
-           r->imageblock_memory_length == 0;
+    return imageblockOpcode(r->opcode) || !r->imageblock_memory_length;
+}
+
+static ImtlCompilerSize compilerSize(const uint8_t *record, size_t offset)
+{
+    return (ImtlCompilerSize){
+        .width = get64(record + offset),
+        .height = get64(record + offset + 8),
+        .depth = get64(record + offset + 16),
+    };
+}
+
+static bool validRenderPipeline(const ImtlCompilerRenderPipeline *pipeline,
+                                const uint8_t *bytes)
+{
+    const uint8_t *record =
+        bytes + INFERNO_METAL_RESOURCE_COMPILER_RENDER_RESULT_OFFSET;
+    return pipeline->allocated_size <= SIZE_MAX &&
+           pipeline->shader_validation >= 0 &&
+           pipeline->shader_validation <= 2 &&
+           !(pipeline->flags &
+             ~INFERNO_METAL_RESOURCE_RENDER_RESULT_FLAG_MASK) &&
+           allZero(record +
+                       INFERNO_METAL_RESOURCE_RENDER_RESULT_RESERVED_OFFSET,
+                   INFERNO_METAL_RESOURCE_RENDER_RESULT_RESERVED_SIZE);
+}
+
+static bool validStage(const ImtlCompilerResult *r)
+{
+    bool function_failure =
+        r->outcome == INFERNO_METAL_COMPILER_OUTCOME_FUNCTION_NOT_FOUND ||
+        r->outcome == INFERNO_METAL_COMPILER_OUTCOME_FUNCTION_TYPE_MISMATCH ||
+        r->outcome == INFERNO_METAL_COMPILER_OUTCOME_SPECIALIZATION_REQUIRED;
+    if (r->opcode == INFERNO_METAL_QUERY_RENDER_PIPELINE && function_failure &&
+        r->phase == INFERNO_METAL_COMPILER_PHASE_FUNCTION) {
+        return r->stage == INFERNO_METAL_RESOURCE_COMPILER_STAGE_VERTEX ||
+               r->stage == INFERNO_METAL_RESOURCE_COMPILER_STAGE_FRAGMENT;
+    }
+    return r->stage == INFERNO_METAL_RESOURCE_COMPILER_STAGE_NONE;
 }
 
 static bool validLibrary(const ImtlCompilerResult *r, const uint8_t *bytes)
@@ -321,7 +441,8 @@ static bool validLibrary(const ImtlCompilerResult *r, const uint8_t *bytes)
 
 static bool validFailure(const ImtlCompilerResult *r)
 {
-    bool library = r->opcode == INFERNO_METAL_QUERY_LIBRARY;
+    bool library = libraryOpcode(r->opcode);
+    bool render = r->opcode == INFERNO_METAL_QUERY_RENDER_PIPELINE;
     bool no_error = r->flags & INFERNO_METAL_COMPILER_FLAG_NO_NSERROR;
     if (r->max_total_threads_per_threadgroup || r->thread_execution_width ||
         r->static_threadgroup_memory_length || r->allocated_size ||
@@ -347,12 +468,28 @@ static bool validFailure(const ImtlCompilerResult *r)
         return !library && no_error && !r->function_count &&
                !r->metadata_record_count && !r->required_output_size &&
                knownFunctionType(r->function_type) &&
-               r->function_type != INFERNO_METAL_FUNCTION_TYPE_KERNEL &&
+               (render ?
+                    ((r->stage ==
+                          INFERNO_METAL_RESOURCE_COMPILER_STAGE_VERTEX &&
+                      r->function_type != INFERNO_METAL_FUNCTION_TYPE_VERTEX) ||
+                     (r->stage ==
+                          INFERNO_METAL_RESOURCE_COMPILER_STAGE_FRAGMENT &&
+                      r->function_type !=
+                          INFERNO_METAL_FUNCTION_TYPE_FRAGMENT)) :
+                    r->function_type != INFERNO_METAL_FUNCTION_TYPE_KERNEL) &&
                r->phase == INFERNO_METAL_COMPILER_PHASE_FUNCTION;
     case INFERNO_METAL_COMPILER_OUTCOME_SPECIALIZATION_REQUIRED:
         return !library && no_error && !r->function_count &&
                !r->metadata_record_count && !r->required_output_size &&
-               r->function_type == INFERNO_METAL_FUNCTION_TYPE_KERNEL &&
+               (render ?
+                    ((r->stage ==
+                          INFERNO_METAL_RESOURCE_COMPILER_STAGE_VERTEX &&
+                      r->function_type == INFERNO_METAL_FUNCTION_TYPE_VERTEX) ||
+                     (r->stage ==
+                          INFERNO_METAL_RESOURCE_COMPILER_STAGE_FRAGMENT &&
+                      r->function_type ==
+                          INFERNO_METAL_FUNCTION_TYPE_FRAGMENT)) :
+                    r->function_type == INFERNO_METAL_FUNCTION_TYPE_KERNEL) &&
                r->phase == INFERNO_METAL_COMPILER_PHASE_FUNCTION;
     case INFERNO_METAL_COMPILER_OUTCOME_INVENTORY_UNSUPPORTED:
         return library && no_error && !r->required_output_size &&
@@ -500,18 +637,23 @@ bool imtl_compiler_decode_result(const uint8_t *bytes, size_t size,
                                  uint64_t expected_sequence,
                                  ImtlCompilerResult *out)
 {
-    if (!bytes || !out || expected_opcode < INFERNO_METAL_QUERY_LIBRARY ||
-        expected_opcode > INFERNO_METAL_QUERY_IMAGEBLOCK ||
+    if (!bytes || !out || !compilerOpcode(expected_opcode) ||
         size < INFERNO_METAL_COMPILER_MIN_OUTPUT ||
-        size > INFERNO_METAL_COMPILER_MAX_OUTPUT) {
+        size > INFERNO_METAL_COMPILER_MAX_OUTPUT ||
+        (typedOpcode(expected_opcode) &&
+         expected_opcode != INFERNO_METAL_QUERY_LIBRARY_TYPED &&
+         size != INFERNO_METAL_COMPILER_MIN_OUTPUT)) {
         return false;
     }
+    const uint8_t *render =
+        bytes + INFERNO_METAL_RESOURCE_COMPILER_RENDER_RESULT_OFFSET;
     ImtlCompilerResult r = {
         .opcode = get32(bytes + INFERNO_METAL_COMPILER_OPCODE_OFFSET),
         .sequence = get64(bytes + INFERNO_METAL_COMPILER_SEQUENCE_OFFSET),
         .outcome = get32(bytes + INFERNO_METAL_COMPILER_OUTCOME_OFFSET),
         .phase = get32(bytes + INFERNO_METAL_COMPILER_PHASE_OFFSET),
         .flags = get32(bytes + INFERNO_METAL_COMPILER_FLAGS_OFFSET),
+        .stage = get32(bytes + INFERNO_METAL_RESOURCE_COMPILER_STAGE_OFFSET),
         .function_count =
             get32(bytes + INFERNO_METAL_COMPILER_FUNCTION_COUNT_OFFSET),
         .function_type =
@@ -559,15 +701,69 @@ bool imtl_compiler_decode_result(const uint8_t *bytes, size_t size,
             (const char *)bytes + INFERNO_METAL_COMPILER_LIBRARY_NAME_OFFSET,
         .library_install_name_length =
             get32(bytes + INFERNO_METAL_COMPILER_LIBRARY_NAME_LENGTH_OFFSET),
+        .render_pipeline =
+            {
+                .allocated_size = get64(
+                    render +
+                    INFERNO_METAL_RESOURCE_RENDER_RESULT_ALLOCATED_SIZE_OFFSET),
+                .imageblock_sample_length = get64(
+                    render + INFERNO_METAL_RESOURCE_RENDER_RESULT_IMAGEBLOCK_SAMPLE_LENGTH_OFFSET),
+                .max_total_threads_per_threadgroup = get64(
+                    render +
+                    INFERNO_METAL_RESOURCE_RENDER_RESULT_MAX_TOTAL_THREADS_OFFSET),
+                .max_total_threads_per_object_threadgroup = get64(
+                    render +
+                    INFERNO_METAL_RESOURCE_RENDER_RESULT_MAX_OBJECT_THREADS_OFFSET),
+                .max_total_threads_per_mesh_threadgroup = get64(
+                    render +
+                    INFERNO_METAL_RESOURCE_RENDER_RESULT_MAX_MESH_THREADS_OFFSET),
+                .object_thread_execution_width = get64(
+                    render + INFERNO_METAL_RESOURCE_RENDER_RESULT_OBJECT_EXECUTION_WIDTH_OFFSET),
+                .mesh_thread_execution_width = get64(
+                    render + INFERNO_METAL_RESOURCE_RENDER_RESULT_MESH_EXECUTION_WIDTH_OFFSET),
+                .max_total_threadgroups_per_mesh_grid = get64(
+                    render + INFERNO_METAL_RESOURCE_RENDER_RESULT_MAX_MESH_THREADGROUPS_OFFSET),
+                .shader_validation = getSigned64(
+                    render +
+                    INFERNO_METAL_RESOURCE_RENDER_RESULT_SHADER_VALIDATION_OFFSET),
+                .required_threads_per_tile_threadgroup = compilerSize(
+                    render,
+                    INFERNO_METAL_RESOURCE_RENDER_RESULT_TILE_THREADS_OFFSET),
+                .required_threads_per_object_threadgroup = compilerSize(
+                    render,
+                    INFERNO_METAL_RESOURCE_RENDER_RESULT_OBJECT_THREADS_OFFSET),
+                .required_threads_per_mesh_threadgroup = compilerSize(
+                    render,
+                    INFERNO_METAL_RESOURCE_RENDER_RESULT_MESH_THREADS_OFFSET),
+                .flags = get32(
+                    render + INFERNO_METAL_RESOURCE_RENDER_RESULT_FLAGS_OFFSET),
+            },
         .function_records = bytes + INFERNO_METAL_COMPILER_FUNCTIONS_OFFSET,
         .function_records_size = size - INFERNO_METAL_COMPILER_MIN_OUTPUT,
     };
+    if (expected_opcode == INFERNO_METAL_QUERY_RENDER_PIPELINE) {
+        r.library_type = 0;
+        r.library_flags = 0;
+        r.library_install_name = NULL;
+        r.library_install_name_length = 0;
+    } else {
+        memset(&r.render_pipeline, 0, sizeof(r.render_pipeline));
+    }
+    uint32_t expected_version = typedOpcode(expected_opcode) ?
+                                    INFERNO_METAL_RESOURCE_VERSION :
+                                    INFERNO_METAL_VERSION;
+    const uint8_t *reserved =
+        bytes + (typedOpcode(expected_opcode) ?
+                     INFERNO_METAL_RESOURCE_COMPILER_RESERVED_OFFSET :
+                     INFERNO_METAL_COMPILER_RESERVED_OFFSET);
+    size_t reserved_size = typedOpcode(expected_opcode) ?
+                               INFERNO_METAL_RESOURCE_COMPILER_RESERVED_SIZE :
+                               INFERNO_METAL_COMPILER_RESERVED_SIZE;
     if (get32(bytes + INFERNO_METAL_COMPILER_VERSION_OFFSET) !=
-            INFERNO_METAL_VERSION ||
+            expected_version ||
         r.opcode != expected_opcode || r.sequence != expected_sequence ||
         r.flags & ~INFERNO_METAL_COMPILER_FLAG_MASK ||
-        !allZero(bytes + INFERNO_METAL_COMPILER_RESERVED_OFFSET,
-                 INFERNO_METAL_COMPILER_RESERVED_SIZE) ||
+        !allZero(reserved, reserved_size) || !validStage(&r) ||
         !validString(bytes + INFERNO_METAL_COMPILER_DOMAIN_OFFSET,
                      r.error_domain_length,
                      INFERNO_METAL_COMPILER_DOMAIN_SIZE) ||
@@ -588,7 +784,20 @@ bool imtl_compiler_decode_result(const uint8_t *bytes, size_t size,
     if (r.required_output_size) {
         return false;
     }
-    if (r.opcode != INFERNO_METAL_QUERY_LIBRARY) {
+    if (r.opcode == INFERNO_METAL_QUERY_RENDER_PIPELINE) {
+        if (r.phase != INFERNO_METAL_COMPILER_PHASE_PIPELINE ||
+            size != INFERNO_METAL_COMPILER_MIN_OUTPUT || r.function_count ||
+            r.metadata_record_count || r.function_type ||
+            r.max_total_threads_per_threadgroup || r.thread_execution_width ||
+            r.static_threadgroup_memory_length || !zeroPipeline(bytes) ||
+            !validRenderPipeline(&r.render_pipeline, bytes) ||
+            !allZero(r.function_records, r.function_records_size)) {
+            return false;
+        }
+        *out = r;
+        return true;
+    }
+    if (!libraryOpcode(r.opcode)) {
         if (r.phase != INFERNO_METAL_COMPILER_PHASE_PIPELINE ||
             size != INFERNO_METAL_COMPILER_MIN_OUTPUT || r.function_count ||
             r.metadata_record_count ||
@@ -649,7 +858,7 @@ bool imtl_compiler_decode_result(const uint8_t *bytes, size_t size,
 bool imtl_compiler_function_at(const ImtlCompilerResult *result, uint32_t index,
                                ImtlCompilerFunction *out)
 {
-    if (!result || !out || result->opcode != INFERNO_METAL_QUERY_LIBRARY ||
+    if (!result || !out || !libraryOpcode(result->opcode) ||
         result->outcome != INFERNO_METAL_COMPILER_OUTCOME_OK ||
         index >= result->function_count || !result->function_records) {
         return false;

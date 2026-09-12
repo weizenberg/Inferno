@@ -92,7 +92,12 @@ static uint32_t knownOpcodeMask(void)
     return (1U << INFERNO_METAL_COMPUTE) | (1U << INFERNO_METAL_RENDER) |
            (1U << INFERNO_METAL_CLEAR) | (1U << INFERNO_METAL_QUERY_LIBRARY) |
            (1U << INFERNO_METAL_QUERY_PIPELINE) |
-           (1U << INFERNO_METAL_QUERY_IMAGEBLOCK) | (1U << INFERNO_METAL_BATCH);
+           (1U << INFERNO_METAL_QUERY_IMAGEBLOCK) |
+           (1U << INFERNO_METAL_BATCH) | (1U << INFERNO_METAL_BATCH_RESOURCES) |
+           (1U << INFERNO_METAL_QUERY_LIBRARY_TYPED) |
+           (1U << INFERNO_METAL_QUERY_PIPELINE_TYPED) |
+           (1U << INFERNO_METAL_QUERY_RENDER_PIPELINE) |
+           (1U << INFERNO_METAL_QUERY_IMAGEBLOCK_TYPED);
 }
 
 static IOReturn fetchCaps(io_connect_t connection, ImtlUserCaps *out)
@@ -122,6 +127,10 @@ static IOReturn fetchCaps(io_connect_t connection, ImtlUserCaps *out)
     uint32_t query_opcodes = (1U << INFERNO_METAL_QUERY_LIBRARY) |
                              (1U << INFERNO_METAL_QUERY_PIPELINE) |
                              (1U << INFERNO_METAL_QUERY_IMAGEBLOCK);
+    uint32_t typed_query_opcodes = (1U << INFERNO_METAL_QUERY_LIBRARY_TYPED) |
+                                   (1U << INFERNO_METAL_QUERY_PIPELINE_TYPED) |
+                                   (1U << INFERNO_METAL_QUERY_RENDER_PIPELINE) |
+                                   (1U << INFERNO_METAL_QUERY_IMAGEBLOCK_TYPED);
     if (caps.version != INFERNO_METAL_USER_VERSION ||
         get32(reply + INFERNO_METAL_USER_CAP_SIZE_OFFSET) != sizeof(reply) ||
         !caps.opcode_mask || (caps.opcode_mask & ~known_opcodes) ||
@@ -141,7 +150,18 @@ static IOReturn fetchCaps(io_connect_t connection, ImtlUserCaps *out)
          (caps.max_input_size < INFERNO_METAL_BATCH_HEADER_SIZE ||
           caps.max_output_size < INFERNO_METAL_BATCH_RESULT_SIZE ||
           caps.max_request_size < INFERNO_METAL_USER_SUBMIT_HEADER_SIZE +
-                                      INFERNO_METAL_BATCH_HEADER_SIZE))) {
+                                      INFERNO_METAL_BATCH_HEADER_SIZE)) ||
+        ((caps.opcode_mask & (1U << INFERNO_METAL_BATCH_RESOURCES)) &&
+         (caps.max_input_size < INFERNO_METAL_RESOURCE_HEADER_SIZE ||
+          caps.max_output_size < INFERNO_METAL_RESOURCE_RESULT_SIZE ||
+          caps.max_request_size < INFERNO_METAL_USER_SUBMIT_HEADER_SIZE +
+                                      INFERNO_METAL_RESOURCE_HEADER_SIZE)) ||
+        ((caps.opcode_mask & typed_query_opcodes) &&
+         (caps.max_input_size < INFERNO_METAL_RESOURCE_QUERY_HEADER_SIZE ||
+          caps.max_output_size < INFERNO_METAL_COMPILER_MIN_OUTPUT ||
+          caps.max_request_size <
+              INFERNO_METAL_USER_SUBMIT_HEADER_SIZE +
+                  INFERNO_METAL_RESOURCE_QUERY_HEADER_SIZE))) {
         return kIOReturnBadMessageID;
     }
     *out = caps;
@@ -249,6 +269,52 @@ static bool validUtf8(const uint8_t *p, size_t size)
     return true;
 }
 
+static bool emptyNames(const ImtlUserSubmit *request)
+{
+    return allZero(request->function, sizeof(request->function)) &&
+           allZero(request->fragment, sizeof(request->fragment));
+}
+
+static bool validLegacyQuery(const ImtlUserSubmit *request)
+{
+    bool library = request->opcode == INFERNO_METAL_QUERY_LIBRARY;
+    bool imageblock = request->opcode == INFERNO_METAL_QUERY_IMAGEBLOCK;
+
+    return request->source_size && !request->input_size &&
+           (imageblock ? (request->width && request->width <= 65536 &&
+                          request->height && request->height <= 65536 &&
+                          request->depth && request->depth <= 65536) :
+                         (request->width == 1 && request->height == 1 &&
+                          request->depth == 1)) &&
+           request->output_size >= INFERNO_METAL_COMPILER_MIN_OUTPUT &&
+           request->output_size <= INFERNO_METAL_COMPILER_MAX_OUTPUT &&
+           (library ||
+            request->output_size == INFERNO_METAL_COMPILER_MIN_OUTPUT) &&
+           allZero(request->fragment, sizeof(request->fragment)) &&
+           (library ? allZero(request->function, sizeof(request->function)) :
+                      request->function[0]) &&
+           validUtf8(request->source, request->source_size);
+}
+
+static bool validTypedQuery(const ImtlUserSubmit *request)
+{
+    bool library = request->opcode == INFERNO_METAL_QUERY_LIBRARY_TYPED;
+    bool imageblock = request->opcode == INFERNO_METAL_QUERY_IMAGEBLOCK_TYPED;
+
+    return !request->source_size &&
+           request->input_size >= INFERNO_METAL_RESOURCE_QUERY_HEADER_SIZE &&
+           (imageblock ? (request->width && request->width <= 65536 &&
+                          request->height && request->height <= 65536 &&
+                          request->depth && request->depth <= 65536) :
+                         (request->width == 1 && request->height == 1 &&
+                          request->depth == 1)) &&
+           (library ?
+                (request->output_size >= INFERNO_METAL_COMPILER_MIN_OUTPUT &&
+                 request->output_size <= INFERNO_METAL_COMPILER_MAX_OUTPUT) :
+                request->output_size == INFERNO_METAL_COMPILER_MIN_OUTPUT) &&
+           emptyNames(request);
+}
+
 IOReturn imtl_user_client_submit(ImtlUserClient *client,
                                  const ImtlUserSubmit *request)
 {
@@ -256,7 +322,8 @@ IOReturn imtl_user_client_submit(ImtlUserClient *client,
         return kIOReturnBadArgument;
     }
     if (request->opcode < INFERNO_METAL_COMPUTE ||
-        request->opcode > INFERNO_METAL_BATCH || request->options) {
+        request->opcode > INFERNO_METAL_QUERY_IMAGEBLOCK_TYPED ||
+        request->options) {
         return kIOReturnBadArgument;
     }
     if (!(client->caps.opcode_mask & (1U << request->opcode)) ||
@@ -277,36 +344,46 @@ IOReturn imtl_user_client_submit(ImtlUserClient *client,
                                   request->source_size) {
         return kIOReturnBadArgument;
     }
-    if (request->opcode == INFERNO_METAL_BATCH) {
+    switch (request->opcode) {
+    case INFERNO_METAL_BATCH:
         if (request->source_size ||
             request->input_size < INFERNO_METAL_BATCH_HEADER_SIZE ||
             request->output_size < INFERNO_METAL_BATCH_RESULT_SIZE ||
             request->width != 1 || request->height != 1 ||
-            request->depth != 1 ||
-            !allZero(request->function, sizeof(request->function)) ||
-            !allZero(request->fragment, sizeof(request->fragment))) {
+            request->depth != 1 || !emptyNames(request)) {
             return kIOReturnBadArgument;
         }
-    } else if (request->opcode >= INFERNO_METAL_QUERY_LIBRARY) {
-        bool library = request->opcode == INFERNO_METAL_QUERY_LIBRARY;
-        bool imageblock = request->opcode == INFERNO_METAL_QUERY_IMAGEBLOCK;
-
-        if (!request->source_size || request->input_size ||
-            (!imageblock && (request->width != 1 || request->height != 1 ||
-                             request->depth != 1)) ||
-            (imageblock && (!request->width || request->width > 65536 ||
-                            !request->height || request->height > 65536 ||
-                            !request->depth || request->depth > 65536)) ||
-            request->output_size < INFERNO_METAL_COMPILER_MIN_OUTPUT ||
-            request->output_size > INFERNO_METAL_COMPILER_MAX_OUTPUT ||
-            (!library &&
-             request->output_size != INFERNO_METAL_COMPILER_MIN_OUTPUT) ||
-            !allZero(request->fragment, sizeof(request->fragment)) ||
-            (library ? !allZero(request->function, sizeof(request->function)) :
-                       !request->function[0]) ||
-            !validUtf8(request->source, request->source_size)) {
+        break;
+    case INFERNO_METAL_BATCH_RESOURCES:
+        if (request->source_size ||
+            request->input_size < INFERNO_METAL_RESOURCE_HEADER_SIZE ||
+            request->output_size < INFERNO_METAL_RESOURCE_RESULT_SIZE ||
+            request->width != 1 || request->height != 1 ||
+            request->depth != 1 || !emptyNames(request)) {
             return kIOReturnBadArgument;
         }
+        break;
+    case INFERNO_METAL_QUERY_LIBRARY:
+    case INFERNO_METAL_QUERY_PIPELINE:
+    case INFERNO_METAL_QUERY_IMAGEBLOCK:
+        if (!validLegacyQuery(request)) {
+            return kIOReturnBadArgument;
+        }
+        break;
+    case INFERNO_METAL_QUERY_LIBRARY_TYPED:
+    case INFERNO_METAL_QUERY_PIPELINE_TYPED:
+    case INFERNO_METAL_QUERY_RENDER_PIPELINE:
+    case INFERNO_METAL_QUERY_IMAGEBLOCK_TYPED:
+        if (!validTypedQuery(request)) {
+            return kIOReturnBadArgument;
+        }
+        break;
+    case INFERNO_METAL_COMPUTE:
+    case INFERNO_METAL_RENDER:
+    case INFERNO_METAL_CLEAR:
+        break;
+    default:
+        return kIOReturnBadArgument;
     }
     size_t packet_size = INFERNO_METAL_USER_SUBMIT_HEADER_SIZE +
                          request->source_size + request->input_size;

@@ -49,3 +49,37 @@ IOReturn imtl_batch_submit(ImtlUserClient *client, uint64_t sequence,
     };
     return imtl_user_client_submit(client, &request);
 }
+
+IOReturn imtl_batch5_submit(ImtlUserClient *client, uint64_t sequence,
+                            const void *manifest, size_t manifest_size,
+                            uint32_t images_size)
+{
+    const ImtlUserCaps *caps = imtl_user_client_caps(client);
+    if (!client || !manifest ||
+        manifest_size < INFERNO_METAL_RESOURCE_HEADER_SIZE ||
+        manifest_size > INFERNO_METAL_MAX_BUFFER ||
+        images_size > INFERNO_METAL_RESOURCE_MAX_IMAGES) {
+        return kIOReturnBadArgument;
+    }
+    uint32_t output_size = INFERNO_METAL_RESOURCE_RESULT_SIZE + images_size;
+    if (!caps || !(caps->opcode_mask & (1U << INFERNO_METAL_BATCH_RESOURCES)) ||
+        manifest_size > caps->max_input_size ||
+        output_size > caps->max_output_size ||
+        caps->max_request_size < INFERNO_METAL_USER_SUBMIT_HEADER_SIZE ||
+        manifest_size >
+            caps->max_request_size - INFERNO_METAL_USER_SUBMIT_HEADER_SIZE) {
+        return kIOReturnUnsupported;
+    }
+    ImtlUserSubmit request = {
+        .opcode = INFERNO_METAL_BATCH_RESOURCES,
+        .sequence = sequence,
+        .output_size = output_size,
+        .width = 1,
+        .height = 1,
+        .depth = 1,
+        .options = INFERNO_METAL_OPTIONS_DEFAULT,
+        .input = manifest,
+        .input_size = manifest_size,
+    };
+    return imtl_user_client_submit(client, &request);
+}

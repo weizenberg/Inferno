@@ -41,6 +41,55 @@ static bool allZero(const uint8_t *p, size_t size)
     return true;
 }
 
+static bool emptyNames(const InfernoMetalCommand *command)
+{
+    return allZero((const uint8_t *)command->function,
+                   sizeof(command->function)) &&
+           allZero((const uint8_t *)command->fragment,
+                   sizeof(command->fragment));
+}
+
+static bool validLegacyQuery(const InfernoMetalCommand *command)
+{
+    bool library = command->opcode == INFERNO_METAL_QUERY_LIBRARY;
+    bool imageblock = command->opcode == INFERNO_METAL_QUERY_IMAGEBLOCK;
+
+    return command->source_size && !command->input_size &&
+           (imageblock ? (command->width && command->width <= 65536 &&
+                          command->height && command->height <= 65536 &&
+                          command->depth && command->depth <= 65536) :
+                         (command->width == 1 && command->height == 1 &&
+                          command->depth == 1)) &&
+           command->output_size >= INFERNO_METAL_COMPILER_MIN_OUTPUT &&
+           command->output_size <= INFERNO_METAL_COMPILER_MAX_OUTPUT &&
+           (library ||
+            command->output_size == INFERNO_METAL_COMPILER_MIN_OUTPUT) &&
+           allZero((const uint8_t *)command->fragment,
+                   sizeof(command->fragment)) &&
+           (library ? allZero((const uint8_t *)command->function,
+                              sizeof(command->function)) :
+                      command->function[0]);
+}
+
+static bool validTypedQuery(const InfernoMetalCommand *command)
+{
+    bool library = command->opcode == INFERNO_METAL_QUERY_LIBRARY_TYPED;
+    bool imageblock = command->opcode == INFERNO_METAL_QUERY_IMAGEBLOCK_TYPED;
+
+    return !command->source_size &&
+           command->input_size >= INFERNO_METAL_RESOURCE_QUERY_HEADER_SIZE &&
+           (imageblock ? (command->width && command->width <= 65536 &&
+                          command->height && command->height <= 65536 &&
+                          command->depth && command->depth <= 65536) :
+                         (command->width == 1 && command->height == 1 &&
+                          command->depth == 1)) &&
+           (library ?
+                (command->output_size >= INFERNO_METAL_COMPILER_MIN_OUTPUT &&
+                 command->output_size <= INFERNO_METAL_COMPILER_MAX_OUTPUT) :
+                command->output_size == INFERNO_METAL_COMPILER_MIN_OUTPUT) &&
+           emptyNames(command);
+}
+
 bool imtl_user_decode(const void *packet, size_t size, ImtlUserRequest *result)
 {
     if (!packet || !result || size < INFERNO_METAL_USER_SUBMIT_HEADER_SIZE ||
@@ -67,8 +116,8 @@ bool imtl_user_decode(const void *packet, size_t size, ImtlUserRequest *result)
     r.command.depth = get32(p + INFERNO_METAL_USER_DEPTH_OFFSET);
     r.command.options = get32(p + INFERNO_METAL_USER_OPTIONS_OFFSET);
     if (r.command.opcode < INFERNO_METAL_COMPUTE ||
-        r.command.opcode > INFERNO_METAL_BATCH || r.command.options ||
-        r.command.source_size > INFERNO_METAL_MAX_SOURCE ||
+        r.command.opcode > INFERNO_METAL_QUERY_IMAGEBLOCK_TYPED ||
+        r.command.options || r.command.source_size > INFERNO_METAL_MAX_SOURCE ||
         r.command.input_size > INFERNO_METAL_MAX_BUFFER ||
         !r.command.output_size ||
         r.command.output_size > INFERNO_METAL_MAX_BUFFER) {
@@ -91,39 +140,46 @@ bool imtl_user_decode(const void *packet, size_t size, ImtlUserRequest *result)
     if (!function_end || !fragment_end) {
         return false;
     }
-    if (r.command.opcode == INFERNO_METAL_BATCH) {
+    switch (r.command.opcode) {
+    case INFERNO_METAL_BATCH:
         if (r.command.source_size ||
             r.command.input_size < INFERNO_METAL_BATCH_HEADER_SIZE ||
             r.command.output_size < INFERNO_METAL_BATCH_RESULT_SIZE ||
             r.command.width != 1 || r.command.height != 1 ||
-            r.command.depth != 1 ||
-            !allZero((const uint8_t *)r.command.function,
-                     sizeof(r.command.function)) ||
-            !allZero((const uint8_t *)r.command.fragment,
-                     sizeof(r.command.fragment))) {
+            r.command.depth != 1 || !emptyNames(&r.command)) {
             return false;
         }
-    } else if (r.command.opcode >= INFERNO_METAL_QUERY_LIBRARY) {
-        bool library = r.command.opcode == INFERNO_METAL_QUERY_LIBRARY;
-        bool imageblock = r.command.opcode == INFERNO_METAL_QUERY_IMAGEBLOCK;
-
-        if (!r.command.source_size || r.command.input_size ||
-            (!imageblock && (r.command.width != 1 || r.command.height != 1 ||
-                             r.command.depth != 1)) ||
-            (imageblock && (!r.command.width || r.command.width > 65536 ||
-                            !r.command.height || r.command.height > 65536 ||
-                            !r.command.depth || r.command.depth > 65536)) ||
-            r.command.output_size < INFERNO_METAL_COMPILER_MIN_OUTPUT ||
-            r.command.output_size > INFERNO_METAL_COMPILER_MAX_OUTPUT ||
-            (!library &&
-             r.command.output_size != INFERNO_METAL_COMPILER_MIN_OUTPUT) ||
-            !allZero((const uint8_t *)r.command.fragment,
-                     sizeof(r.command.fragment)) ||
-            (library ? !allZero((const uint8_t *)r.command.function,
-                                sizeof(r.command.function)) :
-                       !r.command.function[0])) {
+        break;
+    case INFERNO_METAL_BATCH_RESOURCES:
+        if (r.command.source_size ||
+            r.command.input_size < INFERNO_METAL_RESOURCE_HEADER_SIZE ||
+            r.command.output_size < INFERNO_METAL_RESOURCE_RESULT_SIZE ||
+            r.command.width != 1 || r.command.height != 1 ||
+            r.command.depth != 1 || !emptyNames(&r.command)) {
             return false;
         }
+        break;
+    case INFERNO_METAL_QUERY_LIBRARY:
+    case INFERNO_METAL_QUERY_PIPELINE:
+    case INFERNO_METAL_QUERY_IMAGEBLOCK:
+        if (!validLegacyQuery(&r.command)) {
+            return false;
+        }
+        break;
+    case INFERNO_METAL_QUERY_LIBRARY_TYPED:
+    case INFERNO_METAL_QUERY_PIPELINE_TYPED:
+    case INFERNO_METAL_QUERY_RENDER_PIPELINE:
+    case INFERNO_METAL_QUERY_IMAGEBLOCK_TYPED:
+        if (!validTypedQuery(&r.command)) {
+            return false;
+        }
+        break;
+    case INFERNO_METAL_COMPUTE:
+    case INFERNO_METAL_RENDER:
+    case INFERNO_METAL_CLEAR:
+        break;
+    default:
+        return false;
     }
     r.source = r.command.source_size ?
                    p + INFERNO_METAL_USER_SUBMIT_HEADER_SIZE :

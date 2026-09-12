@@ -18,27 +18,20 @@
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 
-@class InfernoMetalCommandBuffer;
+@class InfernoMetalCompilerContext;
 
 NS_ASSUME_NONNULL_BEGIN
 
-    @interface InfernoMetalEncodedDispatch : NSObject
-    @property(nonatomic, strong) id<MTLComputePipelineState> pipeline;
-    @property(nonatomic, copy) NSArray *bindings;
-    @property(nonatomic, copy) NSArray *textureBindings;
-    @property(nonatomic, copy) NSArray *samplerBindings;
-    @property(nonatomic, copy) NSArray<NSNumber *> *threadgroupLengths;
-    @property(nonatomic) uint32_t mode;
-    @property(nonatomic) MTLSize grid;
-    @property(nonatomic) MTLSize group;
-    @end
+    @interface InfernoMetalTexture : NSObject <MTLTexture>
 
-    @interface InfernoMetalComputeCommandEncoder
-        : NSObject <MTLComputeCommandEncoder>
+    -(nullable instancetype)initWithContext
+        : (InfernoMetalCompilerContext *)context device
+        : (id<MTLDevice>)device descriptor : (MTLTextureDescriptor *)descriptor;
 
-    -(nullable instancetype)initWithCommandBuffer
-        : (InfernoMetalCommandBuffer *)commandBuffer device
-        : (id<MTLDevice>)device;
+    @property(nonatomic, readonly) InfernoMetalCompilerContext *infernoContext;
+    @property(nonatomic, readonly) NSUInteger infernoImageSize;
+    -(NSData *)infernoSnapshot;
+    -(BOOL)infernoReplaceSnapshot : (NSData *)snapshot;
 
     @end
 

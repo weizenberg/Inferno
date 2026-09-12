@@ -63,6 +63,10 @@ NS_ASSUME_NONNULL_BEGIN
 
     -(nullable id<MTLLibrary>)newLibraryWithData : (dispatch_data_t)data error
         : (NSError **)error;
+    -(nullable id<MTLLibrary>)newLibraryWithURL : (NSURL *)url error
+        : (NSError **)error;
+    -(nullable id<MTLLibrary>)newLibraryWithFile : (NSString *)path error
+        : (NSError **)error;
     -(nullable id<MTLLibrary>)newDefaultLibrary;
     -(nullable id<MTLLibrary>)newDefaultLibraryWithBundle
         : (NSBundle *)bundle error : (NSError **)error;
@@ -79,6 +83,25 @@ NS_ASSUME_NONNULL_BEGIN
     -(nullable id<MTLBuffer>)newBufferWithBytesNoCopy : (void *)pointer length
         : (NSUInteger)length options : (MTLResourceOptions)options deallocator
         : (nullable void (^)(void *pointer, NSUInteger length))deallocator;
+    -(nullable id<MTLTexture>)newTextureWithDescriptor
+        : (MTLTextureDescriptor *)descriptor;
+    -(nullable id<MTLSamplerState>)newSamplerStateWithDescriptor
+        : (MTLSamplerDescriptor *)descriptor;
+    -(nullable id<MTLRenderPipelineState>)newRenderPipelineStateWithDescriptor
+        : (MTLRenderPipelineDescriptor *)descriptor error : (NSError **)error;
+    -(nullable id<MTLRenderPipelineState>)newRenderPipelineStateWithDescriptor
+        : (MTLRenderPipelineDescriptor *)descriptor options
+        : (MTLPipelineOption)options reflection
+        : (MTLRenderPipelineReflection *_Nullable *_Nullable)reflection error
+        : (NSError **)error;
+    -(void)newRenderPipelineStateWithDescriptor
+        : (MTLRenderPipelineDescriptor *)descriptor completionHandler
+        : (MTLNewRenderPipelineStateCompletionHandler)completionHandler;
+    -(void)newRenderPipelineStateWithDescriptor
+        : (MTLRenderPipelineDescriptor *)descriptor options
+        : (MTLPipelineOption)options completionHandler
+        : (MTLNewRenderPipelineStateWithReflectionCompletionHandler)
+              completionHandler;
     -(nullable id<MTLCommandQueue>)newCommandQueue;
     -(nullable id<MTLCommandQueue>)newCommandQueueWithMaxCommandBufferCount
         : (NSUInteger)count;

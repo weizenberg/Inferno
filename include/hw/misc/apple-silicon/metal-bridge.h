@@ -42,5 +42,15 @@ bool inferno_metal_backend_batch(InfernoMetalBackend *backend,
                                  const uint8_t *input, uint8_t *output,
                                  InfernoMetalProgressFn progress, void *opaque,
                                  char *message, size_t message_size);
+bool inferno_metal_backend_resource_batch(InfernoMetalBackend *backend,
+                                          const InfernoMetalCommand *command,
+                                          const uint8_t *input, uint8_t *output,
+                                          InfernoMetalProgressFn progress,
+                                          void *opaque, char *message,
+                                          size_t message_size);
+bool inferno_metal_backend_typed_query(InfernoMetalBackend *backend,
+                                       const InfernoMetalCommand *command,
+                                       const uint8_t *input, uint8_t *output,
+                                       char *message, size_t message_size);
 
 #endif

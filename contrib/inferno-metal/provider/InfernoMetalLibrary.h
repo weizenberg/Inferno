@@ -28,12 +28,14 @@ NS_ASSUME_NONNULL_BEGIN
 
     -(nullable instancetype)initWithContext
         : (InfernoMetalCompilerContext *)context device
-        : (id<MTLDevice>)device source : (NSData *)source result
+        : (id<MTLDevice>)device payload : (NSData *)payload kind
+        : (uint32_t)kind result
         : (const ImtlCompilerResult *)result compileWarning
         : (nullable NSError *)compileWarning error : (NSError **)error;
 
     @property(nonatomic, readonly) InfernoMetalCompilerContext *infernoContext;
-    @property(nonatomic, readonly) NSData *infernoSource;
+    @property(nonatomic, readonly) NSData *infernoPayload;
+    @property(nonatomic, readonly) uint32_t infernoLibraryKind;
     @property(nonatomic, readonly, nullable) NSError *compileWarning;
 
     @end

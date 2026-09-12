@@ -161,18 +161,41 @@ static void *metal_worker(void *opaque)
 {
     InfernoMetalWork *work = opaque;
 
-    if (work->command.opcode == INFERNO_METAL_BATCH) {
-        work->success = inferno_metal_backend_batch(
-            work->device->backend, &work->command, work->input, work->output,
-            metal_work_progress, work, work->message, sizeof(work->message));
-    } else if (work->command.opcode >= INFERNO_METAL_QUERY_LIBRARY) {
-        work->success = inferno_metal_backend_query(
-            work->device->backend, &work->command, work->source, work->output,
-            work->message, sizeof(work->message));
-    } else {
+    switch (work->command.opcode) {
+    case INFERNO_METAL_COMPUTE:
+    case INFERNO_METAL_RENDER:
+    case INFERNO_METAL_CLEAR:
         work->success = inferno_metal_backend_execute(
             work->device->backend, &work->command, work->source, work->input,
             work->output, work->message, sizeof(work->message));
+        break;
+    case INFERNO_METAL_QUERY_LIBRARY:
+    case INFERNO_METAL_QUERY_PIPELINE:
+    case INFERNO_METAL_QUERY_IMAGEBLOCK:
+        work->success = inferno_metal_backend_query(
+            work->device->backend, &work->command, work->source, work->output,
+            work->message, sizeof(work->message));
+        break;
+    case INFERNO_METAL_BATCH:
+        work->success = inferno_metal_backend_batch(
+            work->device->backend, &work->command, work->input, work->output,
+            metal_work_progress, work, work->message, sizeof(work->message));
+        break;
+    case INFERNO_METAL_BATCH_RESOURCES:
+        work->success = inferno_metal_backend_resource_batch(
+            work->device->backend, &work->command, work->input, work->output,
+            metal_work_progress, work, work->message, sizeof(work->message));
+        break;
+    case INFERNO_METAL_QUERY_LIBRARY_TYPED:
+    case INFERNO_METAL_QUERY_PIPELINE_TYPED:
+    case INFERNO_METAL_QUERY_RENDER_PIPELINE:
+    case INFERNO_METAL_QUERY_IMAGEBLOCK_TYPED:
+        work->success = inferno_metal_backend_typed_query(
+            work->device->backend, &work->command, work->input, work->output,
+            work->message, sizeof(work->message));
+        break;
+    default:
+        g_assert_not_reached();
     }
     qemu_bh_schedule(work->device->completion_bh);
     return NULL;
@@ -217,6 +240,49 @@ static void metal_worker_done(void *opaque)
     metal_work_free(work);
 }
 
+static bool metal_names_empty(const InfernoMetalCommand *c)
+{
+    return allZero((const uint8_t *)c->function, sizeof(c->function)) &&
+           allZero((const uint8_t *)c->fragment, sizeof(c->fragment));
+}
+
+static bool metal_valid_legacy_query(const InfernoMetalCommand *c)
+{
+    bool library = c->opcode == INFERNO_METAL_QUERY_LIBRARY;
+    bool imageblock = c->opcode == INFERNO_METAL_QUERY_IMAGEBLOCK;
+
+    if (!c->source_size || c->source_size > INFERNO_METAL_MAX_SOURCE ||
+        c->input_size ||
+        (imageblock ? (!c->width || c->width > 65536 || !c->height ||
+                       c->height > 65536 || !c->depth || c->depth > 65536) :
+                      (c->width != 1 || c->height != 1 || c->depth != 1)) ||
+        c->output_size < INFERNO_METAL_COMPILER_MIN_OUTPUT ||
+        c->output_size > INFERNO_METAL_COMPILER_MAX_OUTPUT ||
+        (!library && c->output_size != INFERNO_METAL_COMPILER_MIN_OUTPUT) ||
+        !allZero((const uint8_t *)c->fragment, sizeof(c->fragment))) {
+        return false;
+    }
+    return library ?
+               allZero((const uint8_t *)c->function, sizeof(c->function)) :
+               c->function[0] && memchr(c->function, 0, sizeof(c->function));
+}
+
+static bool metal_valid_typed_query(const InfernoMetalCommand *c)
+{
+    bool library = c->opcode == INFERNO_METAL_QUERY_LIBRARY_TYPED;
+    bool imageblock = c->opcode == INFERNO_METAL_QUERY_IMAGEBLOCK_TYPED;
+
+    return !c->source_size &&
+           c->input_size >= INFERNO_METAL_RESOURCE_QUERY_HEADER_SIZE &&
+           (imageblock ? (c->width && c->width <= 65536 && c->height &&
+                          c->height <= 65536 && c->depth && c->depth <= 65536) :
+                         (c->width == 1 && c->height == 1 && c->depth == 1)) &&
+           (library ? (c->output_size >= INFERNO_METAL_COMPILER_MIN_OUTPUT &&
+                       c->output_size <= INFERNO_METAL_COMPILER_MAX_OUTPUT) :
+                      c->output_size == INFERNO_METAL_COMPILER_MIN_OUTPUT) &&
+           metal_names_empty(c);
+}
+
 static bool metal_decode_command(const uint8_t *raw, InfernoMetalCommand *c)
 {
     c->opcode = ldl_le_p(raw + 4);
@@ -245,54 +311,41 @@ static bool metal_decode_command(const uint8_t *raw, InfernoMetalCommand *c)
         !c->depth) {
         return false;
     }
-    if (c->opcode == INFERNO_METAL_BATCH) {
+    switch (c->opcode) {
+    case INFERNO_METAL_BATCH:
         if (c->source_size || c->input_size < INFERNO_METAL_BATCH_HEADER_SIZE ||
             c->output_size < INFERNO_METAL_BATCH_RESULT_SIZE || c->width != 1 ||
-            c->height != 1 || c->depth != 1 ||
-            !allZero((const uint8_t *)c->function, sizeof(c->function)) ||
-            !allZero((const uint8_t *)c->fragment, sizeof(c->fragment))) {
+            c->height != 1 || c->depth != 1 || !metal_names_empty(c)) {
             return false;
         }
         return true;
-    } else if (c->opcode >= INFERNO_METAL_QUERY_LIBRARY &&
-               c->opcode <= INFERNO_METAL_QUERY_IMAGEBLOCK) {
-        bool library = c->opcode == INFERNO_METAL_QUERY_LIBRARY;
-        bool imageblock = c->opcode == INFERNO_METAL_QUERY_IMAGEBLOCK;
-
-        if (!c->source_size || c->source_size > INFERNO_METAL_MAX_SOURCE ||
-            c->input_size ||
-            (!imageblock &&
-             (c->width != 1 || c->height != 1 || c->depth != 1)) ||
-            (imageblock &&
-             (!c->width || c->width > 65536 || !c->height ||
-              c->height > 65536 || !c->depth || c->depth > 65536)) ||
-            c->output_size < INFERNO_METAL_COMPILER_MIN_OUTPUT ||
-            c->output_size > INFERNO_METAL_COMPILER_MAX_OUTPUT ||
-            (!library && c->output_size != INFERNO_METAL_COMPILER_MIN_OUTPUT)) {
+    case INFERNO_METAL_BATCH_RESOURCES:
+        if (c->source_size ||
+            c->input_size < INFERNO_METAL_RESOURCE_HEADER_SIZE ||
+            c->output_size < INFERNO_METAL_RESOURCE_RESULT_SIZE ||
+            c->width != 1 || c->height != 1 || c->depth != 1 ||
+            !metal_names_empty(c)) {
             return false;
         }
-        for (unsigned i = 0; i < sizeof(c->fragment); i++) {
-            if (c->fragment[i]) {
-                return false;
-            }
-        }
-        if (library) {
-            for (unsigned i = 0; i < sizeof(c->function); i++) {
-                if (c->function[i]) {
-                    return false;
-                }
-            }
-            return true;
-        }
-        return c->function[0] && memchr(c->function, 0, sizeof(c->function));
-    } else if (c->opcode == INFERNO_METAL_COMPUTE) {
+        return true;
+    case INFERNO_METAL_QUERY_LIBRARY:
+    case INFERNO_METAL_QUERY_PIPELINE:
+    case INFERNO_METAL_QUERY_IMAGEBLOCK:
+        return metal_valid_legacy_query(c);
+    case INFERNO_METAL_QUERY_LIBRARY_TYPED:
+    case INFERNO_METAL_QUERY_PIPELINE_TYPED:
+    case INFERNO_METAL_QUERY_RENDER_PIPELINE:
+    case INFERNO_METAL_QUERY_IMAGEBLOCK_TYPED:
+        return metal_valid_typed_query(c);
+    case INFERNO_METAL_COMPUTE:
         if (c->width > INFERNO_METAL_MAX_THREADS ||
             c->height > INFERNO_METAL_MAX_THREADS / c->width ||
             c->depth > INFERNO_METAL_MAX_THREADS / c->width / c->height) {
             return false;
         }
-    } else if (c->opcode == INFERNO_METAL_RENDER ||
-               c->opcode == INFERNO_METAL_CLEAR) {
+        break;
+    case INFERNO_METAL_RENDER:
+    case INFERNO_METAL_CLEAR:
         if (c->width > 4096 || c->height > 4096 ||
             (uint64_t)c->width * c->height * 4 != c->output_size) {
             return false;
@@ -304,7 +357,8 @@ static bool metal_decode_command(const uint8_t *raw, InfernoMetalCommand *c)
             !memchr(c->fragment, 0, sizeof(c->fragment))) {
             return false;
         }
-    } else {
+        break;
+    default:
         return false;
     }
     return c->source_size && c->source_size <= INFERNO_METAL_MAX_SOURCE &&
