@@ -14,8 +14,9 @@
  * You should have received a copy of the GNU Affero General Public License
  * along with this program. If not, see <https://www.gnu.org/licenses/>.
  */
-#import "InfernoMetalFunction.h"
+#import "InfernoMetalCompilerContext.h"
 #import "InfernoMetalErrors.h"
+#import "InfernoMetalFunction.h"
 #import "InfernoMetalLibrary.h"
 #import "InfernoMetalReflectionObjects.h"
 
@@ -161,10 +162,11 @@
 }
 - (id<MTLArgumentEncoder>)newArgumentEncoderWithBufferIndex:(NSUInteger)index
 {
-    (void)index;
-    [NSException raise:InfernoMetalUnsupportedException
-                format:@"Argument encoders require native resources"];
-    return nil;
+    if (index > 30)
+        [NSException raise:InfernoMetalInvalidUseException
+                    format:@"An argument buffer index must be at most 30"];
+    return [_storedLibrary.infernoContext newArgumentEncoderForFunction:self
+                                                            bufferIndex:index];
 }
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"

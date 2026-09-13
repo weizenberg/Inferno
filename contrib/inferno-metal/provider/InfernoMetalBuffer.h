@@ -19,6 +19,10 @@
 #import <Metal/Metal.h>
 
 @class InfernoMetalCompilerContext;
+@class InfernoMetalArgumentLayout;
+@class InfernoMetalArgumentRegion;
+@class InfernoMetalArgumentLayoutKey;
+@class InfernoMetalEncodedArgument;
 
 NS_ASSUME_NONNULL_BEGIN
 
@@ -32,6 +36,15 @@ NS_ASSUME_NONNULL_BEGIN
     @property(nonatomic, readonly) InfernoMetalCompilerContext *infernoContext;
     -(NSData *)infernoSnapshot;
     -(BOOL)infernoReplaceSnapshot : (NSData *)snapshot;
+    -(nullable InfernoMetalEncodedArgument *)infernoSnapshotArgumentAtOffset
+        : (NSUInteger)offset matchingKey : (InfernoMetalArgumentLayoutKey *)key;
+    -(nullable InfernoMetalArgumentRegion *)infernoMaterializeArgumentLayout
+        : (InfernoMetalArgumentLayout *)layout offset : (NSUInteger)offset;
+    -(void)infernoApplyArgumentLayout
+        : (InfernoMetalArgumentLayout *)layout offset
+        : (NSUInteger)offset resources : (NSArray *)resources offsets
+        : (NSArray<NSNumber *> *)offsets indexes
+        : (NSArray<NSNumber *> *)indexes;
 
     @end
 

@@ -200,8 +200,15 @@ static bool queryLocked(ImtlCoordinator *c, uint32_t opcode, const void *source,
     const ImtlUserCaps *caps = imtl_user_client_caps(c->client);
     bool library = opcode == INFERNO_METAL_QUERY_LIBRARY ||
                    opcode == INFERNO_METAL_QUERY_LIBRARY_TYPED;
-    uint32_t output_size = library ? c->config.initial_output_bytes :
+    bool argument = opcode == INFERNO_METAL_QUERY_ARGUMENT_LAYOUT;
+    uint32_t output_size = argument ?
+                               INFERNO_METAL_ARGUMENT_LAYOUT_OUTPUT_SIZE :
+                           library ? c->config.initial_output_bytes :
                                      INFERNO_METAL_COMPILER_MIN_OUTPUT;
+    if (argument && output_size > caps->max_output_size) {
+        return fail(error, IMTL_COORDINATOR_ERROR_PROTOCOL,
+                    kIOReturnUnsupported, NULL, 0, 0);
+    }
     if (output_size > caps->max_output_size) {
         output_size = caps->max_output_size;
     }
@@ -412,10 +419,12 @@ static bool queryTyped(ImtlCoordinator *c, uint32_t opcode,
 {
     clearError(error);
     bool imageblock = opcode == INFERNO_METAL_QUERY_IMAGEBLOCK_TYPED;
+    bool argument = opcode == INFERNO_METAL_QUERY_ARGUMENT_LAYOUT;
     if (!c || !manifest || !out ||
         (opcode != INFERNO_METAL_QUERY_LIBRARY_TYPED &&
          opcode != INFERNO_METAL_QUERY_PIPELINE_TYPED &&
-         opcode != INFERNO_METAL_QUERY_RENDER_PIPELINE && !imageblock) ||
+         opcode != INFERNO_METAL_QUERY_RENDER_PIPELINE && !imageblock &&
+         !argument) ||
         (imageblock ? (!width || width > 65536 || !height || height > 65536 ||
                        !depth || depth > 65536) :
                       (width != 1 || height != 1 || depth != 1))) {
@@ -477,6 +486,14 @@ bool imtl_coordinator_query_imageblock_typed(
 {
     return queryTyped(c, INFERNO_METAL_QUERY_IMAGEBLOCK_TYPED, manifest, width,
                       height, depth, out, error);
+}
+
+bool imtl_coordinator_query_argument_layout(
+    ImtlCoordinator *c, const ImtlTypedQueryManifest *manifest,
+    ImtlQueryReply *out, ImtlCoordinatorError *error)
+{
+    return queryTyped(c, INFERNO_METAL_QUERY_ARGUMENT_LAYOUT, manifest, 1, 1, 1,
+                      out, error);
 }
 
 void imtl_query_reply_free(ImtlQueryReply *reply)

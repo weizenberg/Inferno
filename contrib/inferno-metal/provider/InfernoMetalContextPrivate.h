@@ -19,6 +19,8 @@
 
 @class InfernoMetalCommandBuffer;
 @class InfernoMetalCommandQueue;
+@class InfernoMetalArgumentLayout;
+@class InfernoMetalArgumentLayoutKey;
 
 @interface InfernoMetalCompilerContext ()
 @property(nonatomic) ImtlCoordinator *coordinator;
@@ -29,6 +31,14 @@
 @property(nonatomic, strong) NSHashTable<InfernoMetalCommandQueue *> *queues;
 @property(nonatomic) BOOL executionClosed;
 @property(nonatomic) uint64_t nextCommitSerial;
+@property(nonatomic, strong) NSLock *argumentLock;
+@property(nonatomic, strong)
+    NSMutableDictionary<InfernoMetalArgumentLayoutKey *,
+                        InfernoMetalArgumentLayout *> *argumentLayouts;
+@property(nonatomic, strong)
+    NSMutableArray<InfernoMetalArgumentLayoutKey *> *argumentLayoutLRU;
+@property(nonatomic, strong) NSLock *samplerLock;
+@property(nonatomic, strong) NSHashTable *argumentSamplers;
 @end
 
 @interface InfernoMetalCompilerContext (Execution)

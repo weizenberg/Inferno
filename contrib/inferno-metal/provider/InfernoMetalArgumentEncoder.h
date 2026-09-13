@@ -18,25 +18,14 @@
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 
-#include "../compiler-client.h"
-
+@class InfernoMetalArgumentLayout;
 @class InfernoMetalCompilerContext;
-@class InfernoMetalFunction;
 
 NS_ASSUME_NONNULL_BEGIN
 
-    @interface InfernoMetalComputePipelineState
-        : NSObject <MTLComputePipelineState>
-
-    -(nullable instancetype)initWithContext
-        : (InfernoMetalCompilerContext *)context device
-        : (id<MTLDevice>)device function
-        : (InfernoMetalFunction *)function result
-        : (const ImtlCompilerResult *)result;
-
-    @property(nonatomic, readonly) InfernoMetalCompilerContext *context;
-    @property(nonatomic, readonly) InfernoMetalFunction *function;
-
+    @interface InfernoMetalArgumentEncoder : NSObject <MTLArgumentEncoder>
+    -(instancetype)initWithLayout : (InfernoMetalArgumentLayout *)layout context
+        : (InfernoMetalCompilerContext *)context device : (id<MTLDevice>)device;
     @end
 
 NS_ASSUME_NONNULL_END

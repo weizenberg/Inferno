@@ -75,7 +75,9 @@ per-device sampler limits. Its ordinary return precedes the separate
 `argumentBuffersSupport` method; a merged decompilation had incorrectly combined
 them. The inherited indirect-capability mask defaults to zero, which selects
 Tier 1. That is a concrete baseline answer, not an abstract method or a claim
-that Inferno already implements argument buffers.
+of complete Inferno argument-buffer support. The v6 bridge now implements a
+scoped compute argument-buffer path; native device capability mapping and full
+tier compatibility remain unverified.
 
 The feature-query path uses a class cluster. Allocation of
 `MTLDeviceFeatureQueries` selects the concrete `_MTLDeviceFeatureQueries`, then
@@ -163,9 +165,44 @@ then the tagged release entry with the same allocation tag. This establishes
 the base lifecycle's ownership; the future provider should use superclass
 initialization and cleanup instead of replacing or freeing this storage.
 Root matched 160 captured instruction items against the original cache bytes.
-The constructor and destruction helper's internals remain unexamined.
 Evidence: `metal-native-base-storage-infrkawg/coordinator-review.md` and
 `root-verification.json` under the local evidence root.
+
+Follow-up instruction checks establish the constructor's initial storage fields
+and paired destruction. It stores the device at allocation+32 and initializes
+the byte at +40. A shared guard invokes `dispatch_once` with a static block;
+the import identity and block invoke pointer are verified against the original
+cache's slide chains and exports. The callback at `0x186109db8` obtains bytes
+through a helper, then sends
+`initWithBytesNoCopy:length:encoding:freeWhenDone:` and stores the result in
+the shared global used by the constructor. The callback explicitly supplies
+four method arguments; the initial decompilation omitted them.
+
+The receiver is now verified as `NSString`. It receives a UTF-8 cache-directory
+path built by helper `0x18610a388`. That helper uses a preexisting global path
+when supplied; otherwise it obtains a directory URL, converts it to a POSIX
+path, optionally appends the main bundle identifier, and appends
+`com.apple.metalfe`. Original-cache exports identify the filesystem calls as
+`stat`, `mkdir` and an optional `chmod`. A failure to obtain the byte string
+skips that shared object's construction; it does not establish that the enclosing
+base initializer fails. Successful helper return alone also does not prove that
+the final directory exists, because its last `stat` result is not a failure gate.
+
+The constructor retains this object into allocation+48 through
+`objc_retain_x8`; normal destruction releases it through `objc_release_x8`.
+Preserve superclass initialization and cleanup. No cache-path override or private
+storage replacement is justified by these findings, and native device startup
+remains unverified.
+
+Evidence: `metal-native-storage-invoke-ur_xcbxl/coordinator-review.md`,
+`metal-native-once-byte-source-u53tgh8_/coordinator-review.md`, and
+`metal-native-directory-helper-gbzm4ir_/coordinator-review.md` under the evidence
+root. The latter resolves the remaining imports, rejects unrelated adjacent
+code included in the decompilation, and records a complete instruction check of
+the path helper. The earlier Foundation export-parser failure was diagnosed by
+Sol: overlapping cache-relative segment ranges selected `__TEXT` instead of
+`__LINKEDIT`. A corrected targeted lookup now resolves the exact `NSString`
+class address and pins its export-trie bytes.
 
 The predicate's semantics/runtime value, native initialization, and the runtime
 wrapper callback identity/value remain unverified. This method analysis does

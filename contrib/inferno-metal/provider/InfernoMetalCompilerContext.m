@@ -14,9 +14,11 @@
  * You should have received a copy of the GNU Affero General Public License
  * along with this program. If not, see <https://www.gnu.org/licenses/>.
  */
-#import "InfernoMetalCompilerContext.h"
+#import "InfernoMetalArgumentEncoder.h"
+#import "InfernoMetalArgumentObjects.h"
 #import "InfernoMetalBuffer.h"
 #import "InfernoMetalCommandQueue.h"
+#import "InfernoMetalCompilerContext.h"
 #import "InfernoMetalComputePipelineState.h"
 #import "InfernoMetalContextPrivate.h"
 #import "InfernoMetalErrors.h"
@@ -25,6 +27,18 @@
 #import "InfernoMetalRenderPipelineState.h"
 #import "InfernoMetalSamplerState.h"
 #import "InfernoMetalTexture.h"
+
+static NSError *resultError(const ImtlCompilerResult *result, IOReturn timer,
+                            IOReturn cleanup);
+
+static void raiseQueryException(NSExceptionName name, NSError *error)
+{
+    @throw [NSException
+        exceptionWithName:name
+                   reason:error.localizedDescription ?:
+                              @"Inferno Metal argument layout query failed"
+                 userInfo:error.userInfo];
+}
 
 @implementation InfernoMetalCompilerContext
 - (instancetype)initWithService:(io_service_t)service
@@ -85,8 +99,15 @@
                                             DISPATCH_QUEUE_SERIAL);
     _schedulerLock = [[NSLock alloc] init];
     _queues = [NSHashTable weakObjectsHashTable];
+    _argumentLock = [[NSLock alloc] init];
+    _argumentLayouts = [NSMutableDictionary dictionary];
+    _argumentLayoutLRU = [NSMutableArray array];
+    _samplerLock = [[NSLock alloc] init];
+    _argumentSamplers = [NSHashTable weakObjectsHashTable];
     _nextCommitSerial = 1;
-    if (!_executionQueue || !_schedulerLock || !_queues)
+    if (!_executionQueue || !_schedulerLock || !_queues || !_argumentLock ||
+        !_argumentLayouts || !_argumentLayoutLRU || !_samplerLock ||
+        !_argumentSamplers)
         return nil;
     return self;
 }
@@ -217,9 +238,128 @@ static BOOL defaultSwizzle(MTLTextureSwizzleChannels value)
     id<MTLDevice> owner = [self executionOwner];
     if (!owner || !descriptor)
         return nil;
-    return [[InfernoMetalSamplerState alloc] initWithContext:self
-                                                      device:owner
-                                                  descriptor:descriptor];
+    MTLSamplerDescriptor *snapshot = [descriptor copy];
+    if (snapshot.supportArgumentBuffers) {
+        [_samplerLock lock];
+        BOOL full = _argumentSamplers.allObjects.count >= 96;
+        [_samplerLock unlock];
+        if (full)
+            return nil;
+    }
+    InfernoMetalSamplerState *sampler =
+        [[InfernoMetalSamplerState alloc] initWithContext:self
+                                                   device:owner
+                                               descriptor:snapshot];
+    if (sampler && snapshot.supportArgumentBuffers) {
+        [_samplerLock lock];
+        if (_argumentSamplers.allObjects.count >= 96)
+            sampler = nil;
+        else
+            [_argumentSamplers addObject:sampler];
+        [_samplerLock unlock];
+    }
+    return sampler;
+}
+
+- (InfernoMetalArgumentLayout *)cachedArgumentLayoutForKey:
+    (InfernoMetalArgumentLayoutKey *)key
+{
+    [_argumentLock lock];
+    InfernoMetalArgumentLayout *layout = _argumentLayouts[key];
+    if (layout) {
+        [_argumentLayoutLRU removeObject:key];
+        [_argumentLayoutLRU addObject:key];
+    }
+    [_argumentLock unlock];
+    return layout;
+}
+
+- (id<MTLArgumentEncoder>)newArgumentEncoderForFunction:
+                              (InfernoMetalFunction *)function
+                                            bufferIndex:(NSUInteger)index
+{
+    InfernoMetalLibrary *library = function.infernoLibrary;
+    InfernoMetalArgumentLayoutKey *key = [[InfernoMetalArgumentLayoutKey alloc]
+        initWithPayload:library.infernoPayload
+                   kind:library.infernoLibraryKind
+                   name:function.name
+            bufferIndex:index];
+    InfernoMetalArgumentLayout *layout = [self cachedArgumentLayoutForKey:key];
+    id<MTLDevice> owner = [self executionOwner];
+    if (!owner)
+        raiseQueryException(
+            InfernoMetalTransportException,
+            InfernoMetalMakeError(InfernoMetalErrorClosed,
+                                  @"The device owner is no longer available"));
+    if (!layout) {
+        ImtlBatch5Library libraryRecord = {
+            .kind = library.infernoLibraryKind,
+            .bytes = library.infernoPayload.bytes,
+            .size = library.infernoPayload.length,
+        };
+        ImtlBatch5ComputePipeline pipelineRecord = {
+            .library_id = 0,
+            .function_name = function.name.UTF8String,
+        };
+        ImtlTypedQueryManifest manifest = {
+            .libraries = &libraryRecord,
+            .library_count = 1,
+            .compute_pipeline = &pipelineRecord,
+            .argument_buffer_index = (uint32_t)index,
+        };
+        ImtlQueryReply reply = { 0 };
+        ImtlCoordinatorError coordinatorError = { 0 };
+        BOOL ok;
+        @synchronized(self) {
+            ok = _coordinator &&
+                 imtl_coordinator_query_argument_layout(
+                     _coordinator, &manifest, &reply, &coordinatorError);
+        }
+        if (!ok) {
+            NSError *error =
+                InfernoMetalErrorFromCoordinator(&coordinatorError);
+            raiseQueryException(InfernoMetalTransportException, error);
+        }
+        NSError *error =
+            resultError(&reply.result, reply.timer_error, reply.cleanup_io);
+        if (reply.result.outcome == INFERNO_METAL_COMPILER_OUTCOME_OK && !error)
+            layout =
+                [[InfernoMetalArgumentLayout alloc] initWithKey:key
+                                                         result:&reply.result];
+        imtl_query_reply_free(&reply);
+        if (!layout || error) {
+            NSExceptionName exception =
+                error.code == InfernoMetalErrorUnsupported ?
+                    InfernoMetalUnsupportedException :
+                    InfernoMetalTransportException;
+            raiseQueryException(
+                exception,
+                error ?:
+                        InfernoMetalMakeError(
+                        InfernoMetalErrorProtocol,
+                        @"Argument layout metadata could not be copied"));
+        }
+        [_argumentLock lock];
+        InfernoMetalArgumentLayout *existing = _argumentLayouts[key];
+        if (existing)
+            layout = existing;
+        else {
+            _argumentLayouts[key] = layout;
+            [_argumentLayoutLRU addObject:key];
+            if (_argumentLayoutLRU.count > 64) {
+                InfernoMetalArgumentLayoutKey *oldest =
+                    _argumentLayoutLRU.firstObject;
+                [_argumentLayouts removeObjectForKey:oldest];
+                [_argumentLayoutLRU removeObjectAtIndex:0];
+            }
+        }
+        [_argumentLayoutLRU removeObject:key];
+        [_argumentLayoutLRU addObject:key];
+        [_argumentLock unlock];
+    }
+    return [[InfernoMetalArgumentEncoder alloc] initWithLayout:layout
+                                                       context:self
+                                                        device:owner];
 }
 
 - (id<MTLCommandQueue>)newCommandQueue
@@ -327,8 +467,8 @@ static NSError *localLibraryError(InfernoMetalErrorCode code,
                 @"The device owner is no longer available");
         return nil;
     }
-    NSData *snapshot = [NSData dataWithBytes:payload.bytes
-                                      length:payload.length];
+    NSData *snapshot =
+        [NSData dataWithBytes:payload.bytes length:payload.length];
     ImtlBatch5Library record = {
         .kind = kind,
         .bytes = snapshot.bytes,
@@ -911,8 +1051,8 @@ invalid:
                                            @"Pipeline options are unsupported");
         return nil;
     }
-    if (!descriptor || ![self validateRenderPipelineDescriptor:descriptor
-                                                         error:error])
+    if (!descriptor ||
+        ![self validateRenderPipelineDescriptor:descriptor error:error])
         return nil;
     id<MTLDevice> owner = [self executionOwner];
     if (!owner) {

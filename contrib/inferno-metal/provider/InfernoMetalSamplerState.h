@@ -26,5 +26,6 @@ NS_ASSUME_NONNULL_BEGIN
         : (id<MTLDevice>)device descriptor : (MTLSamplerDescriptor *)descriptor;
     @property(nonatomic, readonly) InfernoMetalCompilerContext *infernoContext;
     @property(nonatomic, readonly) ImtlBatch5Sampler infernoRecord;
+    @property(nonatomic, readonly) BOOL infernoSupportsArgumentBuffers;
     @end
 NS_ASSUME_NONNULL_END

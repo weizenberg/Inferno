@@ -147,6 +147,9 @@ bool imtl_coordinator_query_imageblock_typed(
     ImtlCoordinator *coordinator, const ImtlTypedQueryManifest *manifest,
     uint32_t width, uint32_t height, uint32_t depth, ImtlQueryReply *out,
     ImtlCoordinatorError *error);
+bool imtl_coordinator_query_argument_layout(
+    ImtlCoordinator *coordinator, const ImtlTypedQueryManifest *manifest,
+    ImtlQueryReply *out, ImtlCoordinatorError *error);
 /* True publishes a completely validated reply. timer_error or cleanup_io may
  * still be nonzero and makes provider execution fail without image writeback.
  * On false, scheduled_observed and sequence may describe an already accepted

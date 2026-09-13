@@ -15,6 +15,7 @@
  * along with this program. If not, see <https://www.gnu.org/licenses/>.
  */
 
+#import "InfernoMetalArgumentObjects.h"
 #import "InfernoMetalBuffer.h"
 #import "InfernoMetalCompilerContext.h"
 #import "InfernoMetalErrors.h"
@@ -34,6 +35,8 @@
 @property(nonatomic) NSUInteger storedLength;
 @property(nonatomic) MTLResourceOptions storedOptions;
 @property(nonatomic, copy, nullable) NSString *storedLabel;
+@property(nonatomic, strong)
+    NSMutableDictionary<NSNumber *, InfernoMetalArgumentRegion *> *regions;
 @end
 
 @implementation InfernoMetalBuffer
@@ -75,7 +78,66 @@
     _storedDevice = device;
     _storedLength = length;
     _storedOptions = options;
+    _regions = [NSMutableDictionary dictionary];
     return self;
+}
+
+- (InfernoMetalEncodedArgument *)
+    infernoSnapshotArgumentAtOffset:(NSUInteger)offset
+                        matchingKey:(InfernoMetalArgumentLayoutKey *)key
+{
+    @synchronized(self) {
+        InfernoMetalArgumentRegion *region = _regions[@(offset)];
+        if (!region)
+            return nil;
+        if (![region.layout.key isEqual:key])
+            [NSException raise:InfernoMetalInvalidUseException
+                        format:@"The argument region does not match the "
+                               @"pipeline function"];
+        NSData *data = [NSData dataWithBytes:_storage length:_storedLength];
+        return [region snapshotFromData:data];
+    }
+}
+
+- (InfernoMetalArgumentRegion *)
+    infernoMaterializeArgumentLayout:(InfernoMetalArgumentLayout *)layout
+                              offset:(NSUInteger)offset
+{
+    @synchronized(self) {
+        InfernoMetalArgumentRegion *existing = _regions[@(offset)];
+        if (existing && [existing.layout.key isEqual:layout.key])
+            return existing;
+        NSUInteger end = offset + layout.encodedLength;
+        for (NSNumber *key in _regions) {
+            InfernoMetalArgumentRegion *region = _regions[key];
+            if (region.base == offset)
+                continue;
+            NSUInteger regionEnd = region.base + region.layout.encodedLength;
+            if (offset < regionEnd && region.base < end) {
+                [NSException raise:InfernoMetalInvalidUseException
+                            format:@"Argument region overlaps base %lu",
+                                   (unsigned long)region.base];
+            }
+        }
+        InfernoMetalArgumentRegion *region =
+            [[InfernoMetalArgumentRegion alloc] initWithLayout:layout
+                                                          base:offset];
+        _regions[@(offset)] = region;
+        return region;
+    }
+}
+
+- (void)infernoApplyArgumentLayout:(InfernoMetalArgumentLayout *)layout
+                            offset:(NSUInteger)offset
+                         resources:(NSArray *)resources
+                           offsets:(NSArray<NSNumber *> *)offsets
+                           indexes:(NSArray<NSNumber *> *)indexes
+{
+    @synchronized(self) {
+        InfernoMetalArgumentRegion *region =
+            [self infernoMaterializeArgumentLayout:layout offset:offset];
+        [region setResources:resources offsets:offsets indexes:indexes];
+    }
 }
 
 - (void)dealloc

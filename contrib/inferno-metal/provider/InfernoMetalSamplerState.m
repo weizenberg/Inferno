@@ -14,9 +14,9 @@
  * You should have received a copy of the GNU Affero General Public License
  * along with this program. If not, see <https://www.gnu.org/licenses/>.
  */
-#import "InfernoMetalSamplerState.h"
 #import "InfernoMetalCompilerContext.h"
 #import "InfernoMetalErrors.h"
+#import "InfernoMetalSamplerState.h"
 
 #include <math.h>
 
@@ -102,6 +102,10 @@ static uint32_t samplerAddressMode(MTLSamplerAddressMode mode)
 - (ImtlBatch5Sampler)infernoRecord
 {
     return _storedRecord;
+}
+- (BOOL)infernoSupportsArgumentBuffers
+{
+    return _storedRecord.support_argument_buffers != 0;
 }
 - (NSString *)label
 {

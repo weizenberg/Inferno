@@ -71,8 +71,12 @@ typedef struct InfernoMetalResourceBatchView {
     uint32_t command_count;
     uint32_t draw_count;
     uint32_t binding_count;
+    uint32_t argument_count;
+    uint32_t member_count;
+    uint32_t declaration_count;
     uint32_t inline_size;
     uint32_t payload_size;
+    uint32_t constants_size;
     uint32_t images_size;
     size_t libraries_offset;
     size_t compute_pipelines_offset;
@@ -83,8 +87,12 @@ typedef struct InfernoMetalResourceBatchView {
     size_t commands_offset;
     size_t draws_offset;
     size_t bindings_offset;
+    size_t arguments_offset;
+    size_t members_offset;
+    size_t declarations_offset;
     size_t payload_offset;
     size_t inline_offset;
+    size_t constants_offset;
     size_t images_offset;
 } InfernoMetalResourceBatchView;
 
@@ -94,6 +102,7 @@ typedef struct InfernoMetalTypedQueryView {
     uint32_t opcode;
     uint32_t library_count;
     uint32_t payload_size;
+    uint32_t argument_buffer_index;
     size_t libraries_offset;
     size_t pipeline_offset;
     size_t pipeline_size;
@@ -129,6 +138,14 @@ inferno_metal_resource_batch_draw(const InfernoMetalResourceBatchView *view,
 const uint8_t *
 inferno_metal_resource_batch_binding(const InfernoMetalResourceBatchView *view,
                                      uint32_t index);
+const uint8_t *
+inferno_metal_resource_batch_argument(const InfernoMetalResourceBatchView *view,
+                                      uint32_t index);
+const uint8_t *
+inferno_metal_resource_batch_member(const InfernoMetalResourceBatchView *view,
+                                    uint32_t index);
+const uint8_t *inferno_metal_resource_batch_declaration(
+    const InfernoMetalResourceBatchView *view, uint32_t index);
 
 bool inferno_metal_typed_query_parse(uint32_t opcode, const void *bytes,
                                      size_t size,

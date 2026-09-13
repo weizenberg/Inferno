@@ -19,6 +19,7 @@
 #import <Metal/Metal.h>
 
 @class InfernoMetalCommandBuffer;
+@class InfernoMetalResourceDeclaration;
 
 NS_ASSUME_NONNULL_BEGIN
 
@@ -28,6 +29,8 @@ NS_ASSUME_NONNULL_BEGIN
     @property(nonatomic, copy) NSArray *textureBindings;
     @property(nonatomic, copy) NSArray *samplerBindings;
     @property(nonatomic, copy) NSArray<NSNumber *> *threadgroupLengths;
+    @property(nonatomic, copy)
+        NSArray<InfernoMetalResourceDeclaration *> *resourceDeclarations;
     @property(nonatomic) uint32_t mode;
     @property(nonatomic) MTLSize grid;
     @property(nonatomic) MTLSize group;

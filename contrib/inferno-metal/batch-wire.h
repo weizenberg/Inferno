@@ -156,6 +156,8 @@ typedef struct ImtlBatch5ComputeCommand {
     uint32_t group_width;
     uint32_t group_height;
     uint32_t group_depth;
+    uint32_t declaration_start;
+    uint32_t declaration_count;
 } ImtlBatch5ComputeCommand;
 
 typedef struct ImtlBatch5RenderCommand {
@@ -209,6 +211,31 @@ typedef struct ImtlBatch5Draw {
     float blend_alpha;
 } ImtlBatch5Draw;
 
+typedef struct ImtlBatch5Argument {
+    uint32_t library_id;
+    uint32_t buffer_index;
+    uint32_t member_start;
+    uint32_t member_count;
+    uint32_t encoded_length;
+    uint32_t alignment;
+    const char *function_name;
+} ImtlBatch5Argument;
+
+typedef struct ImtlBatch5ArgumentMember {
+    uint32_t kind;
+    uint32_t member_id;
+    uint32_t resource;
+    uint64_t offset;
+    const void *constant_bytes;
+    uint32_t constant_length;
+} ImtlBatch5ArgumentMember;
+
+typedef struct ImtlBatch5ResourceDeclaration {
+    uint32_t resource_kind;
+    uint32_t resource;
+    uint32_t usage;
+} ImtlBatch5ResourceDeclaration;
+
 typedef struct ImtlBatch5Manifest {
     const ImtlBatch5Library *libraries;
     uint32_t library_count;
@@ -228,6 +255,12 @@ typedef struct ImtlBatch5Manifest {
     uint32_t draw_count;
     const ImtlBatchBinding *bindings;
     uint32_t binding_count;
+    const ImtlBatch5Argument *arguments;
+    uint32_t argument_count;
+    const ImtlBatch5ArgumentMember *members;
+    uint32_t member_count;
+    const ImtlBatch5ResourceDeclaration *declarations;
+    uint32_t declaration_count;
 } ImtlBatch5Manifest;
 
 typedef struct ImtlTypedQueryManifest {
@@ -235,6 +268,7 @@ typedef struct ImtlTypedQueryManifest {
     uint32_t library_count;
     const ImtlBatch5ComputePipeline *compute_pipeline;
     const ImtlBatch5RenderPipeline *render_pipeline;
+    uint32_t argument_buffer_index;
 } ImtlTypedQueryManifest;
 
 typedef struct ImtlBatch5Result {
@@ -275,19 +309,19 @@ bool imtl_batch_decode_result(const uint8_t *bytes, size_t size,
                               uint32_t expected_images_size,
                               ImtlBatchResult *out);
 
-/* Builds an immutable copied version-5 resource manifest. Raw payload, inline,
+/* Builds an immutable copied version-6 resource manifest. Raw payload, inline,
  * and image bytes are packed without padding in their canonical region order.
  */
 bool imtl_batch5_builder_build(const ImtlBatch5Manifest *manifest,
                                uint8_t **bytes, size_t *size,
                                uint32_t *images_size);
 
-/* Builds one typed-query input for opcodes 9 through 12. */
+/* Builds one typed-query input for opcodes 9 through 13. */
 bool imtl_typed_query_builder_build(uint32_t opcode,
                                     const ImtlTypedQueryManifest *manifest,
                                     uint8_t **bytes, size_t *size);
 
-/* Validates the complete version-5 resource result before publishing out. */
+/* Validates the complete version-6 resource result before publishing out. */
 bool imtl_batch5_decode_result(const uint8_t *bytes, size_t size,
                                uint64_t expected_sequence,
                                uint32_t expected_buffer_count,

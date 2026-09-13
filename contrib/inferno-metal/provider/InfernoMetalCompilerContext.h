@@ -21,6 +21,10 @@
 
 #include "../coordinator.h"
 
+@class InfernoMetalArgumentLayout;
+@class InfernoMetalArgumentLayoutKey;
+@class InfernoMetalFunction;
+
 NS_ASSUME_NONNULL_BEGIN
 
     @interface InfernoMetalCompilerContext : NSObject
@@ -107,6 +111,10 @@ NS_ASSUME_NONNULL_BEGIN
         : (NSUInteger)count;
     -(nullable id<MTLCommandQueue>)newCommandQueueWithDescriptor
         : (MTLCommandQueueDescriptor *)descriptor;
+    -(nullable id<MTLArgumentEncoder>)newArgumentEncoderForFunction
+        : (InfernoMetalFunction *)function bufferIndex : (NSUInteger)index;
+    -(nullable InfernoMetalArgumentLayout *)cachedArgumentLayoutForKey
+        : (InfernoMetalArgumentLayoutKey *)key;
 
     -(void)invalidate;
 

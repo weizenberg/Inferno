@@ -134,6 +134,7 @@ static bool typedOpcode(uint32_t opcode)
     case INFERNO_METAL_QUERY_PIPELINE_TYPED:
     case INFERNO_METAL_QUERY_RENDER_PIPELINE:
     case INFERNO_METAL_QUERY_IMAGEBLOCK_TYPED:
+    case INFERNO_METAL_QUERY_ARGUMENT_LAYOUT:
         return true;
     default:
         return false;
@@ -282,16 +283,20 @@ IOReturn imtl_compiler_submit_typed_query(ImtlUserClient *client,
 {
     const ImtlUserCaps *caps = imtl_user_client_caps(client);
     bool imageblock = opcode == INFERNO_METAL_QUERY_IMAGEBLOCK_TYPED;
+    bool argument = opcode == INFERNO_METAL_QUERY_ARGUMENT_LAYOUT;
     if (!client || !manifest ||
         manifest_size < INFERNO_METAL_RESOURCE_QUERY_HEADER_SIZE ||
         manifest_size > INFERNO_METAL_MAX_BUFFER ||
         (opcode != INFERNO_METAL_QUERY_LIBRARY_TYPED &&
          opcode != INFERNO_METAL_QUERY_PIPELINE_TYPED &&
-         opcode != INFERNO_METAL_QUERY_RENDER_PIPELINE && !imageblock) ||
+         opcode != INFERNO_METAL_QUERY_RENDER_PIPELINE && !imageblock &&
+         !argument) ||
         (opcode == INFERNO_METAL_QUERY_LIBRARY_TYPED ?
              (output_size < INFERNO_METAL_COMPILER_MIN_OUTPUT ||
               output_size > INFERNO_METAL_COMPILER_MAX_OUTPUT) :
-             output_size != INFERNO_METAL_COMPILER_MIN_OUTPUT) ||
+             output_size != (argument ?
+                                 INFERNO_METAL_ARGUMENT_LAYOUT_OUTPUT_SIZE :
+                                 INFERNO_METAL_COMPILER_MIN_OUTPUT)) ||
         (imageblock ? (!width || width > 65536 || !height || height > 65536 ||
                        !depth || depth > 65536) :
                       (width != 1 || height != 1 || depth != 1))) {
@@ -510,6 +515,17 @@ static bool validFailure(const ImtlCompilerResult *r)
                    r->function_records_size +
                        INFERNO_METAL_COMPILER_MIN_OUTPUT &&
                r->phase == INFERNO_METAL_COMPILER_PHASE_INVENTORY;
+    case INFERNO_METAL_COMPILER_OUTCOME_ARGUMENT_UNSUPPORTED:
+        return r->opcode == INFERNO_METAL_QUERY_ARGUMENT_LAYOUT && no_error &&
+               !r->function_count && !r->metadata_record_count &&
+               !r->function_type && !r->required_output_size &&
+               r->phase == INFERNO_METAL_COMPILER_PHASE_ARGUMENT &&
+               r->error_description_length &&
+               !(r->flags & (INFERNO_METAL_COMPILER_FLAG_DOMAIN_TRUNCATED |
+                             INFERNO_METAL_COMPILER_FLAG_WARNING)) &&
+               !(r->flags &
+                 ~(INFERNO_METAL_COMPILER_FLAG_NO_NSERROR |
+                   INFERNO_METAL_COMPILER_FLAG_DESCRIPTION_TRUNCATED));
     default:
         return false;
     }
@@ -632,6 +648,192 @@ static bool validFunctionRecord(const uint8_t *record, size_t available,
     return true;
 }
 
+static bool argumentConstantType(uint32_t type)
+{
+    return (type >= 3 && type <= 6) || (type >= 16 && type <= 19) ||
+           (type >= 29 && type <= 56);
+}
+
+static bool validArgumentMember(const uint8_t *record, uint64_t encoded_length,
+                                ImtlArgumentLayoutMember *out)
+{
+    ImtlArgumentLayoutMember member = {
+        .member_id =
+            get32(record + INFERNO_METAL_ARGUMENT_LAYOUT_MEMBER_ID_OFFSET),
+        .kind =
+            get32(record + INFERNO_METAL_ARGUMENT_LAYOUT_MEMBER_KIND_OFFSET),
+        .data_type = get32(
+            record + INFERNO_METAL_ARGUMENT_LAYOUT_MEMBER_DATA_TYPE_OFFSET),
+        .access =
+            get32(record + INFERNO_METAL_ARGUMENT_LAYOUT_MEMBER_ACCESS_OFFSET),
+        .byte_offset = get64(
+            record + INFERNO_METAL_ARGUMENT_LAYOUT_MEMBER_BYTE_OFFSET_OFFSET),
+        .constant_size = get32(
+            record + INFERNO_METAL_ARGUMENT_LAYOUT_MEMBER_CONSTANT_SIZE_OFFSET),
+        .texture_type = get32(
+            record + INFERNO_METAL_ARGUMENT_LAYOUT_MEMBER_TEXTURE_TYPE_OFFSET),
+        .texture_data_type = get32(
+            record +
+            INFERNO_METAL_ARGUMENT_LAYOUT_MEMBER_TEXTURE_DATA_TYPE_OFFSET),
+        .depth =
+            get32(record + INFERNO_METAL_ARGUMENT_LAYOUT_MEMBER_DEPTH_OFFSET),
+        .array_length = get32(
+            record + INFERNO_METAL_ARGUMENT_LAYOUT_MEMBER_ARRAY_LENGTH_OFFSET),
+        .argument_index_stride = get32(
+            record +
+            INFERNO_METAL_ARGUMENT_LAYOUT_MEMBER_ARGUMENT_INDEX_STRIDE_OFFSET),
+        .element_data_type = get32(
+            record +
+            INFERNO_METAL_ARGUMENT_LAYOUT_MEMBER_ELEMENT_DATA_TYPE_OFFSET),
+    };
+    if (member.kind < INFERNO_METAL_RESOURCE_ARGUMENT_MEMBER_BUFFER ||
+        member.kind > INFERNO_METAL_RESOURCE_ARGUMENT_MEMBER_CONSTANT ||
+        member.byte_offset >= encoded_length ||
+        !allZero(record + INFERNO_METAL_ARGUMENT_LAYOUT_MEMBER_RESERVED_OFFSET,
+                 INFERNO_METAL_ARGUMENT_LAYOUT_MEMBER_RESERVED_SIZE)) {
+        return false;
+    }
+    bool array = member.array_length || member.argument_index_stride ||
+                 member.element_data_type;
+    if (array &&
+        (member.kind != INFERNO_METAL_RESOURCE_ARGUMENT_MEMBER_TEXTURE ||
+         member.data_type != 2 || member.element_data_type != 58 ||
+         member.array_length < 2 || !member.argument_index_stride)) {
+        return false;
+    }
+    bool texture_shape =
+        member.texture_type == 2 &&
+        (member.texture_data_type == 3 || member.texture_data_type == 16) &&
+        !member.depth;
+    switch (member.kind) {
+    case INFERNO_METAL_RESOURCE_ARGUMENT_MEMBER_BUFFER:
+        if (member.data_type != 60 || member.access > 1 ||
+            member.constant_size || member.texture_type ||
+            member.texture_data_type || member.depth || array) {
+            return false;
+        }
+        break;
+    case INFERNO_METAL_RESOURCE_ARGUMENT_MEMBER_TEXTURE:
+        if ((!array && member.data_type != 58) || member.access ||
+            member.constant_size || !texture_shape) {
+            return false;
+        }
+        break;
+    case INFERNO_METAL_RESOURCE_ARGUMENT_MEMBER_SAMPLER:
+        if (member.data_type != 59 || member.access || member.constant_size ||
+            member.texture_type || member.texture_data_type || member.depth ||
+            array) {
+            return false;
+        }
+        break;
+    case INFERNO_METAL_RESOURCE_ARGUMENT_MEMBER_CONSTANT:
+        if (!argumentConstantType(member.data_type) || member.access ||
+            !member.constant_size ||
+            member.constant_size > INFERNO_METAL_ARGUMENT_MAX_CONSTANT ||
+            member.constant_size > encoded_length ||
+            member.byte_offset > encoded_length - member.constant_size ||
+            member.texture_type || member.texture_data_type || member.depth ||
+            array) {
+            return false;
+        }
+        break;
+    }
+    *out = member;
+    return true;
+}
+
+static bool argumentMemberContainsId(const ImtlArgumentLayoutMember *member,
+                                     uint32_t id)
+{
+    uint32_t count = member->array_length ? member->array_length : 1;
+    uint32_t stride = member->array_length ? member->argument_index_stride : 0;
+    for (uint32_t i = 0; i < count; i++) {
+        uint64_t expanded = (uint64_t)member->member_id + (uint64_t)i * stride;
+        if (expanded == id) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool validArgumentLayout(const uint8_t *bytes, ImtlArgumentLayout *out)
+{
+    const uint8_t *header = bytes + INFERNO_METAL_ARGUMENT_LAYOUT_HEADER_OFFSET;
+    ImtlArgumentLayout layout = {
+        .encoded_length =
+            get64(header + INFERNO_METAL_ARGUMENT_LAYOUT_ENCODED_LENGTH_OFFSET),
+        .alignment =
+            get64(header + INFERNO_METAL_ARGUMENT_LAYOUT_ALIGNMENT_OFFSET),
+        .member_count =
+            get32(header + INFERNO_METAL_ARGUMENT_LAYOUT_MEMBER_COUNT_OFFSET),
+        .flags = get32(header + INFERNO_METAL_ARGUMENT_LAYOUT_FLAGS_OFFSET),
+        .members = bytes + INFERNO_METAL_ARGUMENT_LAYOUT_MEMBERS_OFFSET,
+    };
+    if (!layout.encoded_length ||
+        layout.encoded_length > INFERNO_METAL_ARGUMENT_MAX_ENCODED_LENGTH ||
+        !layout.alignment || layout.alignment > 4096 ||
+        (layout.alignment & (layout.alignment - 1)) || layout.flags ||
+        !layout.member_count ||
+        layout.member_count > INFERNO_METAL_ARGUMENT_MAX_LAYOUT_MEMBERS ||
+        !allZero(header + INFERNO_METAL_ARGUMENT_LAYOUT_RESERVED_OFFSET,
+                 INFERNO_METAL_ARGUMENT_LAYOUT_RESERVED_SIZE)) {
+        return false;
+    }
+    ImtlArgumentLayoutMember decoded[INFERNO_METAL_ARGUMENT_MAX_LAYOUT_MEMBERS];
+    uint32_t expanded_count = 0;
+    for (uint32_t i = 0; i < layout.member_count; i++) {
+        const uint8_t *record =
+            layout.members +
+            (size_t)i * INFERNO_METAL_ARGUMENT_LAYOUT_MEMBER_SIZE;
+        if (!validArgumentMember(record, layout.encoded_length, &decoded[i]) ||
+            (i && decoded[i].member_id <= decoded[i - 1].member_id)) {
+            return false;
+        }
+        uint32_t count = decoded[i].array_length ? decoded[i].array_length : 1;
+        if (count >
+            INFERNO_METAL_ARGUMENT_MAX_LAYOUT_MEMBERS - expanded_count) {
+            return false;
+        }
+        for (uint32_t j = 0; j < count; j++) {
+            uint64_t id = (uint64_t)decoded[i].member_id +
+                          (uint64_t)j * decoded[i].argument_index_stride;
+            if (id > UINT32_MAX) {
+                return false;
+            }
+            for (uint32_t k = 0; k < i; k++) {
+                if (argumentMemberContainsId(&decoded[k], (uint32_t)id)) {
+                    return false;
+                }
+            }
+        }
+        if (decoded[i].kind ==
+            INFERNO_METAL_RESOURCE_ARGUMENT_MEMBER_CONSTANT) {
+            uint64_t end = decoded[i].byte_offset + decoded[i].constant_size;
+            for (uint32_t k = 0; k < i; k++) {
+                if (decoded[k].kind ==
+                    INFERNO_METAL_RESOURCE_ARGUMENT_MEMBER_CONSTANT) {
+                    uint64_t prior_end =
+                        decoded[k].byte_offset + decoded[k].constant_size;
+                    if (decoded[i].byte_offset < prior_end &&
+                        decoded[k].byte_offset < end) {
+                        return false;
+                    }
+                }
+            }
+        }
+        expanded_count += count;
+    }
+    size_t used =
+        (size_t)layout.member_count * INFERNO_METAL_ARGUMENT_LAYOUT_MEMBER_SIZE;
+    size_t capacity = (size_t)INFERNO_METAL_ARGUMENT_MAX_LAYOUT_MEMBERS *
+                      INFERNO_METAL_ARGUMENT_LAYOUT_MEMBER_SIZE;
+    if (!allZero(layout.members + used, capacity - used)) {
+        return false;
+    }
+    *out = layout;
+    return true;
+}
+
 bool imtl_compiler_decode_result(const uint8_t *bytes, size_t size,
                                  uint32_t expected_opcode,
                                  uint64_t expected_sequence,
@@ -640,9 +842,11 @@ bool imtl_compiler_decode_result(const uint8_t *bytes, size_t size,
     if (!bytes || !out || !compilerOpcode(expected_opcode) ||
         size < INFERNO_METAL_COMPILER_MIN_OUTPUT ||
         size > INFERNO_METAL_COMPILER_MAX_OUTPUT ||
-        (typedOpcode(expected_opcode) &&
-         expected_opcode != INFERNO_METAL_QUERY_LIBRARY_TYPED &&
-         size != INFERNO_METAL_COMPILER_MIN_OUTPUT)) {
+        (expected_opcode == INFERNO_METAL_QUERY_ARGUMENT_LAYOUT ?
+             size != INFERNO_METAL_ARGUMENT_LAYOUT_OUTPUT_SIZE :
+             (typedOpcode(expected_opcode) &&
+              expected_opcode != INFERNO_METAL_QUERY_LIBRARY_TYPED &&
+              size != INFERNO_METAL_COMPILER_MIN_OUTPUT))) {
         return false;
     }
     const uint8_t *render =
@@ -740,6 +944,15 @@ bool imtl_compiler_decode_result(const uint8_t *bytes, size_t size,
             },
         .function_records = bytes + INFERNO_METAL_COMPILER_FUNCTIONS_OFFSET,
         .function_records_size = size - INFERNO_METAL_COMPILER_MIN_OUTPUT,
+        .argument_layout =
+            expected_opcode == INFERNO_METAL_QUERY_ARGUMENT_LAYOUT ?
+                bytes + INFERNO_METAL_ARGUMENT_LAYOUT_HEADER_OFFSET :
+                NULL,
+        .argument_layout_size =
+            expected_opcode == INFERNO_METAL_QUERY_ARGUMENT_LAYOUT ?
+                INFERNO_METAL_ARGUMENT_LAYOUT_OUTPUT_SIZE -
+                    INFERNO_METAL_ARGUMENT_LAYOUT_HEADER_OFFSET :
+                0,
     };
     if (expected_opcode == INFERNO_METAL_QUERY_RENDER_PIPELINE) {
         r.library_type = 0;
@@ -783,6 +996,18 @@ bool imtl_compiler_decode_result(const uint8_t *bytes, size_t size,
     }
     if (r.required_output_size) {
         return false;
+    }
+    if (r.opcode == INFERNO_METAL_QUERY_ARGUMENT_LAYOUT) {
+        ImtlArgumentLayout layout;
+        if (r.phase != INFERNO_METAL_COMPILER_PHASE_ARGUMENT ||
+            r.function_count || r.metadata_record_count || r.function_type ||
+            r.max_total_threads_per_threadgroup || r.thread_execution_width ||
+            r.static_threadgroup_memory_length || !zeroPipeline(bytes) ||
+            !zeroLibrary(bytes) || !validArgumentLayout(bytes, &layout)) {
+            return false;
+        }
+        *out = r;
+        return true;
     }
     if (r.opcode == INFERNO_METAL_QUERY_RENDER_PIPELINE) {
         if (r.phase != INFERNO_METAL_COMPILER_PHASE_PIPELINE ||
@@ -918,5 +1143,50 @@ bool imtl_compiler_metadata_at(const ImtlCompilerFunction *function,
             get32(record + INFERNO_METAL_COMPILER_METADATA_NAME_LENGTH_OFFSET),
     };
     *out = metadata;
+    return true;
+}
+
+bool imtl_compiler_argument_layout(const ImtlCompilerResult *result,
+                                   ImtlArgumentLayout *out)
+{
+    if (!result || !out ||
+        result->opcode != INFERNO_METAL_QUERY_ARGUMENT_LAYOUT ||
+        result->outcome != INFERNO_METAL_COMPILER_OUTCOME_OK ||
+        !result->argument_layout ||
+        result->argument_layout_size !=
+            INFERNO_METAL_ARGUMENT_LAYOUT_OUTPUT_SIZE -
+                INFERNO_METAL_ARGUMENT_LAYOUT_HEADER_OFFSET) {
+        return false;
+    }
+    const uint8_t *header = result->argument_layout;
+    ImtlArgumentLayout layout = {
+        .encoded_length =
+            get64(header + INFERNO_METAL_ARGUMENT_LAYOUT_ENCODED_LENGTH_OFFSET),
+        .alignment =
+            get64(header + INFERNO_METAL_ARGUMENT_LAYOUT_ALIGNMENT_OFFSET),
+        .member_count =
+            get32(header + INFERNO_METAL_ARGUMENT_LAYOUT_MEMBER_COUNT_OFFSET),
+        .flags = get32(header + INFERNO_METAL_ARGUMENT_LAYOUT_FLAGS_OFFSET),
+        .members = header + INFERNO_METAL_ARGUMENT_LAYOUT_HEADER_SIZE,
+    };
+    *out = layout;
+    return true;
+}
+
+bool imtl_argument_layout_member_at(const ImtlArgumentLayout *layout,
+                                    uint32_t index,
+                                    ImtlArgumentLayoutMember *out)
+{
+    if (!layout || !out || !layout->members || index >= layout->member_count) {
+        return false;
+    }
+    const uint8_t *record =
+        layout->members +
+        (size_t)index * INFERNO_METAL_ARGUMENT_LAYOUT_MEMBER_SIZE;
+    ImtlArgumentLayoutMember member;
+    if (!validArgumentMember(record, layout->encoded_length, &member)) {
+        return false;
+    }
+    *out = member;
     return true;
 }

@@ -75,6 +75,7 @@ static bool validTypedQuery(const InfernoMetalCommand *command)
 {
     bool library = command->opcode == INFERNO_METAL_QUERY_LIBRARY_TYPED;
     bool imageblock = command->opcode == INFERNO_METAL_QUERY_IMAGEBLOCK_TYPED;
+    bool argument = command->opcode == INFERNO_METAL_QUERY_ARGUMENT_LAYOUT;
 
     return !command->source_size &&
            command->input_size >= INFERNO_METAL_RESOURCE_QUERY_HEADER_SIZE &&
@@ -86,7 +87,9 @@ static bool validTypedQuery(const InfernoMetalCommand *command)
            (library ?
                 (command->output_size >= INFERNO_METAL_COMPILER_MIN_OUTPUT &&
                  command->output_size <= INFERNO_METAL_COMPILER_MAX_OUTPUT) :
-                command->output_size == INFERNO_METAL_COMPILER_MIN_OUTPUT) &&
+                command->output_size ==
+                    (argument ? INFERNO_METAL_ARGUMENT_LAYOUT_OUTPUT_SIZE :
+                                INFERNO_METAL_COMPILER_MIN_OUTPUT)) &&
            emptyNames(command);
 }
 
@@ -116,7 +119,7 @@ bool imtl_user_decode(const void *packet, size_t size, ImtlUserRequest *result)
     r.command.depth = get32(p + INFERNO_METAL_USER_DEPTH_OFFSET);
     r.command.options = get32(p + INFERNO_METAL_USER_OPTIONS_OFFSET);
     if (r.command.opcode < INFERNO_METAL_COMPUTE ||
-        r.command.opcode > INFERNO_METAL_QUERY_IMAGEBLOCK_TYPED ||
+        r.command.opcode > INFERNO_METAL_QUERY_ARGUMENT_LAYOUT ||
         r.command.options || r.command.source_size > INFERNO_METAL_MAX_SOURCE ||
         r.command.input_size > INFERNO_METAL_MAX_BUFFER ||
         !r.command.output_size ||
@@ -170,6 +173,7 @@ bool imtl_user_decode(const void *packet, size_t size, ImtlUserRequest *result)
     case INFERNO_METAL_QUERY_PIPELINE_TYPED:
     case INFERNO_METAL_QUERY_RENDER_PIPELINE:
     case INFERNO_METAL_QUERY_IMAGEBLOCK_TYPED:
+    case INFERNO_METAL_QUERY_ARGUMENT_LAYOUT:
         if (!validTypedQuery(&r.command)) {
             return false;
         }

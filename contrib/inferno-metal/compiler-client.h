@@ -72,6 +72,29 @@ typedef struct ImtlCompilerRenderPipeline {
     uint32_t flags;
 } ImtlCompilerRenderPipeline;
 
+typedef struct ImtlArgumentLayout {
+    uint64_t encoded_length;
+    uint64_t alignment;
+    uint32_t member_count;
+    uint32_t flags;
+    const uint8_t *members;
+} ImtlArgumentLayout;
+
+typedef struct ImtlArgumentLayoutMember {
+    uint32_t member_id;
+    uint32_t kind;
+    uint32_t data_type;
+    uint32_t access;
+    uint64_t byte_offset;
+    uint32_t constant_size;
+    uint32_t texture_type;
+    uint32_t texture_data_type;
+    uint32_t depth;
+    uint32_t array_length;
+    uint32_t argument_index_stride;
+    uint32_t element_data_type;
+} ImtlArgumentLayoutMember;
+
 /* All string and record views are borrowed from the immutable caller-owned
  * bytes passed to the decoder. They remain valid only while those bytes remain
  * unchanged and alive. Kernel ACK does not invalidate a private reply buffer;
@@ -113,6 +136,8 @@ typedef struct ImtlCompilerResult {
     ImtlCompilerRenderPipeline render_pipeline;
     const uint8_t *function_records;
     size_t function_records_size;
+    const uint8_t *argument_layout;
+    size_t argument_layout_size;
 } ImtlCompilerResult;
 
 /* Zero capacities are a valid size probe. Invalid capacities/overflow return
@@ -160,6 +185,11 @@ bool imtl_compiler_function_at(const ImtlCompilerResult *result, uint32_t index,
                                ImtlCompilerFunction *out);
 bool imtl_compiler_metadata_at(const ImtlCompilerFunction *function,
                                uint32_t index, ImtlCompilerMetadata *out);
+bool imtl_compiler_argument_layout(const ImtlCompilerResult *result,
+                                   ImtlArgumentLayout *out);
+bool imtl_argument_layout_member_at(const ImtlArgumentLayout *layout,
+                                    uint32_t index,
+                                    ImtlArgumentLayoutMember *out);
 
 #ifdef __cplusplus
 }

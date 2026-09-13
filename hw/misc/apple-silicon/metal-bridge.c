@@ -190,6 +190,7 @@ static void *metal_worker(void *opaque)
     case INFERNO_METAL_QUERY_PIPELINE_TYPED:
     case INFERNO_METAL_QUERY_RENDER_PIPELINE:
     case INFERNO_METAL_QUERY_IMAGEBLOCK_TYPED:
+    case INFERNO_METAL_QUERY_ARGUMENT_LAYOUT:
         work->success = inferno_metal_backend_typed_query(
             work->device->backend, &work->command, work->input, work->output,
             work->message, sizeof(work->message));
@@ -271,15 +272,18 @@ static bool metal_valid_typed_query(const InfernoMetalCommand *c)
 {
     bool library = c->opcode == INFERNO_METAL_QUERY_LIBRARY_TYPED;
     bool imageblock = c->opcode == INFERNO_METAL_QUERY_IMAGEBLOCK_TYPED;
+    bool argument = c->opcode == INFERNO_METAL_QUERY_ARGUMENT_LAYOUT;
 
     return !c->source_size &&
            c->input_size >= INFERNO_METAL_RESOURCE_QUERY_HEADER_SIZE &&
            (imageblock ? (c->width && c->width <= 65536 && c->height &&
                           c->height <= 65536 && c->depth && c->depth <= 65536) :
                          (c->width == 1 && c->height == 1 && c->depth == 1)) &&
-           (library ? (c->output_size >= INFERNO_METAL_COMPILER_MIN_OUTPUT &&
+           (library  ? (c->output_size >= INFERNO_METAL_COMPILER_MIN_OUTPUT &&
                        c->output_size <= INFERNO_METAL_COMPILER_MAX_OUTPUT) :
-                      c->output_size == INFERNO_METAL_COMPILER_MIN_OUTPUT) &&
+            argument ? c->output_size ==
+                           INFERNO_METAL_ARGUMENT_LAYOUT_OUTPUT_SIZE :
+                       c->output_size == INFERNO_METAL_COMPILER_MIN_OUTPUT) &&
            metal_names_empty(c);
 }
 
@@ -336,6 +340,7 @@ static bool metal_decode_command(const uint8_t *raw, InfernoMetalCommand *c)
     case INFERNO_METAL_QUERY_PIPELINE_TYPED:
     case INFERNO_METAL_QUERY_RENDER_PIPELINE:
     case INFERNO_METAL_QUERY_IMAGEBLOCK_TYPED:
+    case INFERNO_METAL_QUERY_ARGUMENT_LAYOUT:
         return metal_valid_typed_query(c);
     case INFERNO_METAL_COMPUTE:
         if (c->width > INFERNO_METAL_MAX_THREADS ||

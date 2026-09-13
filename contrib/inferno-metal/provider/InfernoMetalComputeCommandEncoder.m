@@ -15,11 +15,15 @@
  * along with this program. If not, see <https://www.gnu.org/licenses/>.
  */
 
-#import "InfernoMetalComputeCommandEncoder.h"
+#import "InfernoMetalArgumentObjects.h"
 #import "InfernoMetalBuffer.h"
 #import "InfernoMetalCommandBuffer.h"
+#import "InfernoMetalCompilerContext.h"
+#import "InfernoMetalComputeCommandEncoder.h"
 #import "InfernoMetalComputePipelineState.h"
 #import "InfernoMetalErrors.h"
+#import "InfernoMetalFunction.h"
+#import "InfernoMetalLibrary.h"
 #import "InfernoMetalSamplerState.h"
 #import "InfernoMetalTexture.h"
 
@@ -40,6 +44,8 @@
 @property(nonatomic, strong) NSMutableArray<NSNumber *> *threadgroups;
 @property(nonatomic, strong) NSMutableArray *textures;
 @property(nonatomic, strong) NSMutableArray *samplers;
+@property(nonatomic, strong)
+    NSMutableArray<InfernoMetalResourceDeclaration *> *resourceDeclarations;
 @property(nonatomic, copy, nullable) NSString *storedLabel;
 @property(nonatomic) BOOL ended;
 @end
@@ -62,6 +68,7 @@ static void encoderInvalid(NSString *message)
     _threadgroups = [NSMutableArray arrayWithCapacity:31];
     _textures = [NSMutableArray arrayWithCapacity:31];
     _samplers = [NSMutableArray arrayWithCapacity:16];
+    _resourceDeclarations = [NSMutableArray array];
     for (unsigned i = 0; i < 31; i++) {
         [_slots addObject:[NSNull null]];
         [_threadgroups addObject:@0];
@@ -212,13 +219,77 @@ static BOOL dimensionsWithin(MTLSize value, uint64_t limit)
     if (mode == INFERNO_METAL_BATCH_DISPATCH_THREADGROUPS &&
         gridProduct > INFERNO_METAL_MAX_THREADS / groupProduct)
         encoderInvalid(@"The dispatched thread count exceeds the bridge limit");
+    InfernoMetalComputePipelineState *pipeline = (id)_pipeline;
+    InfernoMetalFunction *function = pipeline.function;
+    NSMutableArray *capturedSlots = [_slots mutableCopy];
+    NSUInteger bufferEntries = 0, textureEntries = 0, samplerEntries = 0;
+    for (NSUInteger index = 0; index < capturedSlots.count; index++) {
+        id slot = capturedSlots[index];
+        if (![slot isKindOfClass:[NSDictionary class]])
+            continue;
+        if ([slot[@"kind"] unsignedIntValue] !=
+            INFERNO_METAL_RESOURCE_BINDING_BUFFER)
+            continue;
+        InfernoMetalBuffer *buffer = slot[@"buffer"];
+        NSUInteger offset = [slot[@"offset"] unsignedIntegerValue];
+        InfernoMetalArgumentLayoutKey *key =
+            [[InfernoMetalArgumentLayoutKey alloc]
+                initWithPayload:function.infernoLibrary.infernoPayload
+                           kind:function.infernoLibrary.infernoLibraryKind
+                           name:function.name
+                    bufferIndex:index];
+        InfernoMetalEncodedArgument *argument =
+            [buffer infernoSnapshotArgumentAtOffset:offset matchingKey:key];
+        if (argument) {
+            capturedSlots[index] = argument;
+            for (InfernoMetalEncodedArgumentMember *member in argument
+                     .members) {
+                switch (member.layout.record.kind) {
+                case INFERNO_METAL_RESOURCE_ARGUMENT_MEMBER_BUFFER:
+                    bufferEntries++;
+                    break;
+                case INFERNO_METAL_RESOURCE_ARGUMENT_MEMBER_TEXTURE:
+                    textureEntries++;
+                    break;
+                case INFERNO_METAL_RESOURCE_ARGUMENT_MEMBER_SAMPLER:
+                    samplerEntries++;
+                    break;
+                default:
+                    break;
+                }
+            }
+        } else if ([_commandBuffer.infernoContext
+                       cachedArgumentLayoutForKey:key]) {
+            encoderInvalid(
+                @"The selected argument backing has never been encoded");
+        } else {
+            bufferEntries++;
+        }
+    }
+    for (id slot in _textures)
+        textureEntries += slot != [NSNull null];
+    for (id slot in _samplers)
+        samplerEntries += slot != [NSNull null];
+    if (bufferEntries > 31 || textureEntries > 31 || samplerEntries > 16)
+        encoderInvalid(
+            @"The dispatch exceeds combined argument resource limits");
     InfernoMetalEncodedDispatch *dispatch =
         [[InfernoMetalEncodedDispatch alloc] init];
     dispatch.pipeline = _pipeline;
-    dispatch.bindings = [_slots copy];
+    dispatch.bindings = [capturedSlots copy];
     dispatch.textureBindings = [_textures copy];
     dispatch.samplerBindings = [_samplers copy];
     dispatch.threadgroupLengths = [_threadgroups copy];
+    NSMutableArray *capturedDeclarations =
+        [NSMutableArray arrayWithCapacity:_resourceDeclarations.count];
+    for (InfernoMetalResourceDeclaration
+             *declaration in _resourceDeclarations) {
+        [capturedDeclarations
+            addObject:[[InfernoMetalResourceDeclaration alloc]
+                          initWithResource:declaration.resource
+                                     usage:declaration.usage]];
+    }
+    dispatch.resourceDeclarations = [capturedDeclarations copy];
     dispatch.grid = grid;
     dispatch.group = group;
     dispatch.mode = mode;
@@ -248,6 +319,7 @@ static BOOL dimensionsWithin(MTLSize value, uint64_t limit)
     InfernoMetalCommandBuffer *buffer = _commandBuffer;
     _ended = YES;
     _commandBuffer = nil;
+    [_resourceDeclarations removeAllObjects];
     [buffer infernoEncoderEnded:self];
 }
 
@@ -484,18 +556,58 @@ static BOOL dimensionsWithin(MTLSize value, uint64_t limit)
 }
 - (void)useResource:(id<MTLResource>)resource usage:(MTLResourceUsage)usage
 {
-    (void)resource;
-    (void)usage;
-    [self unsupported];
+    [self requireActive];
+    uint32_t sample = 1U << 2;
+    uint32_t allowed =
+        (uint32_t)(MTLResourceUsageRead | MTLResourceUsageWrite) | sample;
+    if (!resource || !(usage & allowed) || (usage & ~allowed) ||
+        (![resource isKindOfClass:[InfernoMetalBuffer class]] &&
+         ![resource isKindOfClass:[InfernoMetalTexture class]]) ||
+        (([resource isKindOfClass:[InfernoMetalBuffer class]] ?
+              ((InfernoMetalBuffer *)resource).infernoContext :
+              ((InfernoMetalTexture *)resource).infernoContext) !=
+         _commandBuffer.infernoContext))
+        encoderInvalid(@"The declared resource or usage is invalid");
+    uint32_t normalized = 0;
+    if ((uint32_t)usage & ((uint32_t)MTLResourceUsageRead | sample))
+        normalized |= INFERNO_METAL_RESOURCE_USAGE_READ;
+    if (usage & MTLResourceUsageWrite)
+        normalized |= INFERNO_METAL_RESOURCE_USAGE_WRITE;
+    for (InfernoMetalResourceDeclaration
+             *declaration in _resourceDeclarations) {
+        if (declaration.resource == resource) {
+            declaration.usage |= normalized;
+            return;
+        }
+    }
+    [_resourceDeclarations addObject:[[InfernoMetalResourceDeclaration alloc]
+                                         initWithResource:resource
+                                                    usage:normalized]];
 }
 - (void)useResources:(const id<MTLResource>[])resources
                count:(NSUInteger)count
                usage:(MTLResourceUsage)usage
 {
-    (void)resources;
-    (void)count;
-    (void)usage;
-    [self unsupported];
+    [self requireActive];
+    if (!resources && count)
+        encoderInvalid(@"The declared resource array is missing");
+    uint32_t allowed =
+        (uint32_t)(MTLResourceUsageRead | MTLResourceUsageWrite) | (1U << 2);
+    if (!(usage & allowed) || (usage & ~allowed))
+        encoderInvalid(@"The declared resource usage is invalid");
+    for (NSUInteger i = 0; i < count; i++) {
+        id resource = resources[i];
+        if (!resource ||
+            (![resource isKindOfClass:[InfernoMetalBuffer class]] &&
+             ![resource isKindOfClass:[InfernoMetalTexture class]]) ||
+            (([resource isKindOfClass:[InfernoMetalBuffer class]] ?
+                  ((InfernoMetalBuffer *)resource).infernoContext :
+                  ((InfernoMetalTexture *)resource).infernoContext) !=
+             _commandBuffer.infernoContext))
+            encoderInvalid(@"A declared resource is invalid");
+    }
+    for (NSUInteger i = 0; i < count; i++)
+        [self useResource:resources[i] usage:usage];
 }
 - (void)useHeap:(id<MTLHeap>)heap
 {

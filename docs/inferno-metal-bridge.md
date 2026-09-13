@@ -1,4 +1,4 @@
-# Inferno Metal bridge, protocol version 5
+# Inferno Metal bridge, protocol version 6
 
 This experimental device executes bounded guest requests on the host Metal GPU.
 It is available in Darwin builds with the Metal framework and is disabled by
@@ -11,7 +11,7 @@ The Apple DeviceTree node `arm-io/inferno-metal` has compatible
 `inferno,metal-v1`, child address `0xfff00000`, size `0x10000`, AIC parent
 `0x20`, and interrupt `0x200`. Its physical interval is
 `[0x2fff00000, 0x2fff10000)`. This does not replace the native AGX nodes.
-The `inferno,metal-v1` binding name remains unchanged; the MMIO register reports protocol version 5 and peers require exact equality.
+The `inferno,metal-v1` binding name remains unchanged; the MMIO register reports protocol version 6 and peers require exact equality.
 
 For freestanding ARM tests, `virt` also accepts
 `-device inferno-metal-bridge,addr=0x0b000000`. Its generated FDT supplies the
@@ -27,7 +27,7 @@ access sizes, and read/write directions fail the bus transaction.
 | Offset | Access | Meaning |
 | --- | --- | --- |
 | `0x00` | R | Magic `0x4c544d49` |
-| `0x04` | R | Protocol version, 5 |
+| `0x04` | R | Protocol version, 6 |
 | `0x08` | R | State: IDLE 0, BUSY 1, DONE 2, FAILED 3 |
 | `0x0c` | R | Error: success 0, bad descriptor 1, bad memory 2, backend 3 |
 | `0x10`, `0x14` | RW | Descriptor physical address, low/high halves |
@@ -64,8 +64,8 @@ All integers are little endian. Addresses are guest physical addresses.
 
 | Byte offset | Type | Meaning |
 | --- | --- | --- |
-| 0 | u32 | Version, 5 |
-| 4 | u32 | Operation: compute 1, triangle render 2, clear 3, library query 4, pipeline query 5, imageblock query 6, compute batch 7, resource batch 8, typed library/compute/render/imageblock queries 9/10/11/12 |
+| 0 | u32 | Version, 6 |
+| 4 | u32 | Operation: compute 1, triangle render 2, clear 3, library query 4, pipeline query 5, imageblock query 6, compute batch 7, resource batch 8, typed library/compute/render/imageblock queries 9/10/11/12, argument-layout query 13 |
 | 8 | u64 | Guest sequence identifier |
 | 16 | u64 | Shader source address |
 | 24 | u32 | Shader source byte length |
@@ -133,7 +133,7 @@ All integers are little endian; the complete output allocation is zero-filled.
 
 | Offset | Type | Meaning |
 | --- | --- | --- |
-| 0, 4 | u32 each | Protocol version 5, query opcode echo |
+| 0, 4 | u32 each | Protocol version 6, query opcode echo |
 | 8 | u64 | Sequence echo |
 | 16, 20, 24 | u32 each | Outcome, phase, flags |
 | 28, 32 | u32 each | Function count, selected function type |
@@ -196,7 +196,7 @@ Pipeline queries share the exact-source/function key with compute execution.
 The library and pipeline caches retain warning diagnostics. Reset preserves
 immutable cached objects and discards stale query output and interrupts through
 the existing generation check. No persistent host resource handle is exposed.
-Both hardware and application protocols require version 5. Older transports
+Both hardware and application protocols require version 6. Older transports
 fail at open, old descriptors fail validation, and application/kernel mismatches
 fail capability negotiation. There is no version fallback.
 
@@ -227,7 +227,7 @@ use a separate namespace. Full images preserve aliases and bytes outside shader
 writes. Pipelines sharing source may be grouped canonically, with dispatch IDs
 remapped without changing dispatch order. A nonempty batch requires pipelines
 and dispatches but may have no buffers. An empty batch has a
-64-byte header with version 5 and every other field zero; it still commits a
+64-byte header with version 6 and every other field zero; it still commits a
 real empty host command buffer.
 
 Validation checks all dimensions and products, actual pipeline/device limits,
@@ -246,10 +246,12 @@ This ABI is separate from the 17,168-byte compiler-query header.
 
 ## Resource batches and typed libraries
 
-Version 5 changes all outer versions together; there is no mixed-version mode.
+Version 6 changes all outer versions together; there is no mixed-version mode.
 Operations 1 through 7 retain their layouts and validators with the version
-field changed to 5. The new operations carry their manifests only in the input
-range, with zero source length and empty descriptor function names.
+field changed to 6. Resource batches and typed queries, introduced in v5, carry
+their manifests only in the input range, with zero source length and empty
+descriptor function names. V6 extends resource batches for compute argument
+buffers and adds layout query 13.
 
 | Opcode | Input and output | Descriptor dimensions |
 | --- | --- | --- |
@@ -258,11 +260,13 @@ range, with zero source length and empty descriptor function names.
 | 10, typed compute-pipeline query | Input at least 64 bytes; output exactly 17168 | 1/1/1 |
 | 11, render-pipeline query | Input at least 64 bytes; output exactly 17168 | 1/1/1 |
 | 12, typed imageblock query | Input at least 64 bytes; output exactly 17168 | Each 1..65536 |
+| 13, argument-layout query | Input at least 64 bytes; output exactly 25424 | 1/1/1 |
 
 A resource manifest starts with a 128-byte header, then contiguous tables in
 this order: libraries, compute pipelines, render pipelines, buffers, textures,
-samplers, commands, draws and bindings. Payload bytes, inline bytes and complete
-initial resource images follow without padding. Integer and floating-point wire
+samplers, commands, draws, bindings, arguments, members and declarations. Payload
+bytes, inline bytes, constant bytes and complete initial resource images follow
+without padding. Integer and floating-point wire
 values are little endian; unaligned byte regions are read without native struct
 casts. Reserved fields and unused per-kind fields are zero.
 
@@ -277,6 +281,9 @@ casts. Reserved fields and unused per-kind fields are zero.
 | Ordered command | 96 | 64 |
 | Draw | 160 | 256 |
 | Binding | 32 | 2048 |
+| Argument | 96 | 64 |
+| Argument member | 32 | 1024 |
+| Resource declaration | 16 | 256 |
 
 Library kind 1 carries nonempty UTF-8 source, at most 64 KiB. Kind 2 carries an
 opaque compiled Metal library, at most 4 MiB. Total payload is at most 8 MiB.
@@ -326,6 +333,64 @@ function failure; otherwise it is zero. Byte 60 remains zero for all queries.
 The exact schema constants and bounds live in
 `include/standard-headers/inferno/metal.h`. These transport and host execution
 features do not establish native iOS Metal device discovery or presentation.
+
+## V6 compute argument buffers
+
+Query 13 takes one source or compiled library and a compute function identity.
+Its 64-byte typed-query header stores the buffer index at byte 16; bytes 20–63
+are reserved zero. The result extends the compiler envelope with a 64-byte
+layout header at byte 17168 and 128 fixed 64-byte member slots at byte 17232.
+The total output is exactly 25424 bytes. The header carries encoded length,
+alignment and member count. Member descriptors preserve native ID, kind, data
+type, access, byte offset, meaningful constant size, texture shape and array
+index stride. Unsupported layouts use compiler outcome 7 and phase 5; earlier
+library/function failures keep their original diagnostics.
+
+The host obtains layouts and encoders from the actual function. Buffer pointer
+reflection's `elementIsArgumentBuffer` distinguishes argument roots from
+ordinary constant structs; a struct alone is insufficient. Array argument IDs
+are expanded independently of array byte stride. Constant sizes count meaningful
+components: `float3` and `packed_float3` both carry 12 bytes even when their
+native encoded lengths, alignments and offsets differ. Each layout has at most
+128 members and 64 KiB encoded length; each constant is at most 16 bytes.
+
+Resource-header bytes 56, 60 and 64 hold argument, member and declaration
+counts; byte 68 holds constant-byte length, bounded by 16 KiB. Bytes 72–127
+remain reserved zero. Binding kind 6 references an argument record in the
+compute buffer namespace. Compute-command bytes 48/52 select its declaration
+slice; render clear-color fields at those offsets retain their meaning.
+Argument/member/declaration record kinds are 12/13/14. Members are sorted by ID;
+declarations are sorted and unique per command. All slices, constant ranges,
+resource ownership and native binding shapes are validated before native
+argument setters or command-buffer creation. Render argument buffers remain
+unsupported.
+
+The provider implements function-created `MTLArgumentEncoder` objects and
+required direct selector signatures, with explicit errors for unfinished
+operations. The deprecated reflection out-parameter remains nil. Selecting or
+detaching a destination does not erase an existing region. Actual writes create
+or replace a region after validation; writes at distinct overlapping bases are
+unsupported. Bulk setters validate the whole update before changing assignments.
+Region resource references are weak. A recorded dispatch retains resolved
+resources, copies constants, and copies the declarations then in effect.
+Declarations made later cannot change an earlier dispatch. CPU copies of encoded
+backing bytes do not create new provider resource assignments or host GPU IDs.
+These rules define this intermediate provider's capture behavior; they do not
+claim complete native argument-buffer compatibility.
+
+Direct, indirect and declared resources share one identity-based resource table.
+Effective usage is unioned across a command buffer, so any writable alias wins.
+Read-only images still advance the reply cursor. Full validation precedes any
+shadow replacement; remote, timer, cleanup and coordinator errors prevent all
+writeback. Declaration ownership is released after encoding/completion as
+appropriate, including encoders with no dispatch.
+
+Argument-bearing dispatches combine direct and indirect bindings within limits
+of 31 buffers, 31 textures and 16 samplers. Ordinary v5 dispatch capacities are
+preserved. The provider tracks at most 96 live argument-capable samplers and
+caches 64 immutable layouts; the host caches 32 function encoders/layouts.
+Eviction does not invalidate live provider encoders. Reset preserves the host
+cache, and teardown joins the worker before releasing it.
 
 ## Reset and lifetime
 
@@ -555,9 +620,10 @@ and may be smaller than their backing descriptor, but never larger. The adapter
 retains no user pointer, descriptor or staging allocation after the synchronous
 call, and the service makes its own DMA copy before submit returns.
 
-Capabilities advertise the explicit opcode bits 1 through 12. Unknown bits
+Capabilities advertise the explicit opcode bits 1 through 13. Unknown bits
 remain errors. Resource batches require input/output capacities of at least
-128/16640 bytes; typed queries require at least 64/17168 bytes. These transport
+128/16640 bytes; typed queries require at least 64/17168 bytes, and layout
+query 13 requires 25424 output bytes. These transport
 minimums do not describe a guest GPU feature family. Status state and
 transport results use explicit stable wire mappings;
 the timer error is the 32-bit `IOReturn` pattern, and completion sequence/error
@@ -568,7 +634,7 @@ The status word at byte 28 contains batch progress bit 0, exposed only for the
 owning active session. Unknown bits fail validation. SUBMITTED status retains
 sequence zero; COMPLETED must echo the submitted sequence before its progress
 can be attributed to that command. Capability, submission and status packets
-all use version 5; older peers are rejected explicitly.
+all use version 6; older peers are rejected explicitly.
 
 The user client explicitly enables all three documented default-locking
 properties. It retains the service, shared workloop and session until `free`.
@@ -893,7 +959,43 @@ workload markers. Debugger timing limits this to the observed runs, supplemented
 by source review of the shared helper, reset and worker-join paths. Evidence:
 `metal-host-observer-runtime-9ifhwfyy/root-runtime-verification.json`.
 
-A production native MTLDevice adapter, argument buffers, truthful device
-capabilities, actual iOS provider/driver integration and presentation remain
-unfinished. This v5 layer does not establish native iOS Metal acceleration or
-the requested Settings virtual-display identity.
+At the v5 milestone, argument buffers were still missing; the v6 compute
+implementation above supersedes that status. A production native MTLDevice
+adapter, truthful capabilities, actual iOS provider/driver integration, full
+argument-buffer compatibility and presentation remain unfinished. Neither
+milestone establishes native iOS Metal acceleration or Settings virtual-display
+identity.
+
+
+## Local v6 integration verification
+
+The signed v6 QEMU binary has SHA-256
+`f3d1dc6e2342901ec7f9c344b9059cbcd8eaaec99962e4b22181b792e6161d66`.
+Fourteen valid transport scenarios pass under each of TCG/HVF, with 28 replies
+matching native host references. Legacy opcodes 1–6 and 7 additionally pass:
+28 captures match the accepted v5 captures after only the version-word change,
+while reset sentinels remain unchanged. Both accelerators exercise live reset
+and recovery. All 14 legacy compiler envelopes pass the current production
+decoder under ASan/UBSan. V5/v6 application-client negotiation passes 142
+sanitized checks using fake IOKit, including version-only mismatch rejection.
+
+The corrected provider passes 46 iPhoneOS/macOS SDK compile/link stages and
+32 argument-buffer GPU commands across four native layouts, checking 3328
+input/output/guard bytes. A two-dispatch regression verifies independent
+constants and declaration usage. Focused lifetime tests cover released/nil
+assignments, atomic bulk rejection, declaration retention/release and the live
+sampler limit with recovery. The alias/error matrix runs nine valid host GPU
+commands: five successes write expected aliased results, while injected remote,
+timer, cleanup and protocol errors preserve provider buffers. It checks 468
+provider bytes and 540 actual backend image bytes, plus error metadata. A
+separate selection/detach and overlap-rejection test preserves the original
+argument region and executes it successfully, checking 52 provider and 60
+backend bytes.
+
+These provider tests substitute the coordinator/IOKit connection. Injected
+coordinator conditions do not establish actual native GPU failures or kernel
+transport recovery. Source review additionally checks cache ownership and
+combined bounds; no broad runtime cache/limit coverage is claimed. Native iOS
+initialization, actual driver/provider connection and presentation remain open.
+The current evidence paths and remaining work are in
+[GPU_METAL_PROGRESS.md](../GPU_METAL_PROGRESS.md).

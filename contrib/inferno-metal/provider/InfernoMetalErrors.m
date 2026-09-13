@@ -95,6 +95,8 @@ NSError *InfernoMetalErrorFromCompilerResult(const ImtlCompilerResult *r,
             InfernoMetalErrorSpecializationRequired :
         r->outcome == INFERNO_METAL_COMPILER_OUTCOME_FUNCTION_TYPE_MISMATCH ?
             InfernoMetalErrorFunctionTypeMismatch :
+        r->outcome == INFERNO_METAL_COMPILER_OUTCOME_ARGUMENT_UNSUPPORTED ?
+            InfernoMetalErrorUnsupported :
             InfernoMetalErrorRemoteWithoutNSError;
     return [NSError errorWithDomain:InfernoMetalErrorDomain
                                code:code

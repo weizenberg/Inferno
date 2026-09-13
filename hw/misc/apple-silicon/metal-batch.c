@@ -528,6 +528,29 @@ inferno_metal_resource_batch_binding(const InfernoMetalResourceBatchView *view,
 }
 
 const uint8_t *
+inferno_metal_resource_batch_argument(const InfernoMetalResourceBatchView *view,
+                                      uint32_t index)
+{
+    return view->bytes + view->arguments_offset +
+           (size_t)index * INFERNO_METAL_RESOURCE_ARGUMENT_RECORD_SIZE;
+}
+
+const uint8_t *
+inferno_metal_resource_batch_member(const InfernoMetalResourceBatchView *view,
+                                    uint32_t index)
+{
+    return view->bytes + view->members_offset +
+           (size_t)index * INFERNO_METAL_RESOURCE_MEMBER_RECORD_SIZE;
+}
+
+const uint8_t *inferno_metal_resource_batch_declaration(
+    const InfernoMetalResourceBatchView *view, uint32_t index)
+{
+    return view->bytes + view->declarations_offset +
+           (size_t)index * INFERNO_METAL_RESOURCE_DECLARATION_RECORD_SIZE;
+}
+
+const uint8_t *
 inferno_metal_typed_query_library(const InfernoMetalTypedQueryView *view,
                                   uint32_t index)
 {
@@ -732,10 +755,12 @@ static bool validResourceBindings(
     const InfernoMetalResourceBatchView *view, uint32_t start, uint32_t count,
     uint32_t allowed_kinds, uint32_t *expected_inline, bool *referenced_buffers,
     bool *referenced_textures, bool *referenced_samplers,
-    uint32_t forbidden_texture, InfernoMetalBatchParseError *error)
+    bool *referenced_arguments, uint32_t forbidden_texture,
+    uint32_t compute_pipeline, InfernoMetalBatchParseError *error)
 {
     uint32_t prior_index = 0, prior_kind = 0;
     bool have_prior = false;
+    bool have_slot_binding = false;
     if (start > view->binding_count || count > view->binding_count - start) {
         return false;
     }
@@ -755,14 +780,18 @@ static bool validResourceBindings(
             get64(record + INFERNO_METAL_RESOURCE_BINDING_OFFSET_OFFSET);
         bool ordered = !have_prior || index > prior_index ||
                        (index == prior_index && kind > prior_kind);
-        bool duplicate =
-            have_prior && index == prior_index &&
-            ((kind <= INFERNO_METAL_RESOURCE_BINDING_INLINE &&
-              prior_kind <= INFERNO_METAL_RESOURCE_BINDING_INLINE) ||
-             kind == prior_kind);
+        bool same_index = have_prior && index == prior_index;
+        if (!same_index) {
+            have_slot_binding = false;
+        }
+        bool slot_binding = kind == INFERNO_METAL_RESOURCE_BINDING_BUFFER ||
+                            kind == INFERNO_METAL_RESOURCE_BINDING_INLINE ||
+                            kind == INFERNO_METAL_RESOURCE_BINDING_ARGUMENT;
+        bool duplicate = same_index && ((slot_binding && have_slot_binding) ||
+                                        kind == prior_kind);
         bool valid =
             kind >= INFERNO_METAL_RESOURCE_BINDING_BUFFER &&
-            kind <= INFERNO_METAL_RESOURCE_BINDING_SAMPLER &&
+            kind <= INFERNO_METAL_RESOURCE_BINDING_ARGUMENT &&
             (allowed_kinds & (1U << kind)) && ordered && !duplicate &&
             !get64(record + INFERNO_METAL_RESOURCE_BINDING_RESERVED_OFFSET);
         if (kind == INFERNO_METAL_RESOURCE_BINDING_SAMPLER) {
@@ -807,6 +836,35 @@ static bool validResourceBindings(
             if (valid) {
                 referenced_samplers[resource] = true;
             }
+        } else if (kind == INFERNO_METAL_RESOURCE_BINDING_ARGUMENT) {
+            valid = valid && resource < view->argument_count && !length &&
+                    !offset && compute_pipeline < view->compute_pipeline_count;
+            if (valid) {
+                const uint8_t *argument =
+                    inferno_metal_resource_batch_argument(view, resource);
+                const uint8_t *pipeline =
+                    inferno_metal_resource_batch_compute_pipeline(
+                        view, compute_pipeline);
+                uint32_t library = get32(
+                    pipeline +
+                    INFERNO_METAL_RESOURCE_COMPUTE_PIPELINE_LIBRARY_OFFSET);
+                valid =
+                    get32(
+                        argument +
+                        INFERNO_METAL_RESOURCE_ARGUMENT_BUFFER_INDEX_OFFSET) ==
+                        index &&
+                    get32(argument +
+                          INFERNO_METAL_RESOURCE_ARGUMENT_LIBRARY_OFFSET) ==
+                        library &&
+                    !memcmp(
+                        argument + INFERNO_METAL_RESOURCE_ARGUMENT_NAME_OFFSET,
+                        pipeline +
+                            INFERNO_METAL_RESOURCE_COMPUTE_PIPELINE_NAME_OFFSET,
+                        INFERNO_METAL_RESOURCE_FUNCTION_NAME_SIZE);
+            }
+            if (valid) {
+                referenced_arguments[resource] = true;
+            }
         }
         if (!valid) {
             return fail(error, INFERNO_METAL_BATCH_RECORD_BINDING,
@@ -815,6 +873,7 @@ static bool validResourceBindings(
         prior_index = index;
         prior_kind = kind;
         have_prior = true;
+        have_slot_binding |= slot_binding;
     }
     return true;
 }
@@ -939,18 +998,27 @@ bool inferno_metal_resource_batch_parse(const void *opaque, size_t size,
         .draw_count = get32(bytes + INFERNO_METAL_RESOURCE_DRAW_COUNT_OFFSET),
         .binding_count =
             get32(bytes + INFERNO_METAL_RESOURCE_BINDING_COUNT_OFFSET),
+        .argument_count =
+            get32(bytes + INFERNO_METAL_RESOURCE_ARGUMENT_COUNT_OFFSET),
+        .member_count =
+            get32(bytes + INFERNO_METAL_RESOURCE_MEMBER_COUNT_OFFSET),
+        .declaration_count =
+            get32(bytes + INFERNO_METAL_RESOURCE_DECLARATION_COUNT_OFFSET),
         .inline_size = get32(bytes + INFERNO_METAL_RESOURCE_INLINE_SIZE_OFFSET),
         .payload_size =
             get32(bytes + INFERNO_METAL_RESOURCE_PAYLOAD_SIZE_OFFSET),
+        .constants_size =
+            get32(bytes + INFERNO_METAL_RESOURCE_CONSTANTS_SIZE_OFFSET),
         .images_size = get32(bytes + INFERNO_METAL_RESOURCE_IMAGES_SIZE_OFFSET),
         .libraries_offset = INFERNO_METAL_RESOURCE_HEADER_SIZE,
     };
-    bool empty = !view.library_count && !view.compute_pipeline_count &&
-                 !view.render_pipeline_count && !view.buffer_count &&
-                 !view.texture_count && !view.sampler_count &&
-                 !view.command_count && !view.draw_count &&
-                 !view.binding_count && !view.inline_size &&
-                 !view.payload_size && !view.images_size;
+    bool empty =
+        !view.library_count && !view.compute_pipeline_count &&
+        !view.render_pipeline_count && !view.buffer_count &&
+        !view.texture_count && !view.sampler_count && !view.command_count &&
+        !view.draw_count && !view.binding_count && !view.argument_count &&
+        !view.member_count && !view.declaration_count && !view.inline_size &&
+        !view.payload_size && !view.constants_size && !view.images_size;
     if (view.library_count > INFERNO_METAL_RESOURCE_MAX_LIBRARIES ||
         view.compute_pipeline_count >
             INFERNO_METAL_RESOURCE_MAX_COMPUTE_PIPELINES ||
@@ -962,8 +1030,12 @@ bool inferno_metal_resource_batch_parse(const void *opaque, size_t size,
         view.command_count > INFERNO_METAL_RESOURCE_MAX_COMMANDS ||
         view.draw_count > INFERNO_METAL_RESOURCE_MAX_DRAWS ||
         view.binding_count > INFERNO_METAL_RESOURCE_MAX_BINDINGS ||
+        view.argument_count > INFERNO_METAL_RESOURCE_MAX_ARGUMENTS ||
+        view.member_count > INFERNO_METAL_RESOURCE_MAX_MEMBERS ||
+        view.declaration_count > INFERNO_METAL_RESOURCE_MAX_DECLARATIONS ||
         view.inline_size > INFERNO_METAL_RESOURCE_MAX_INLINE ||
         view.payload_size > INFERNO_METAL_RESOURCE_MAX_PAYLOAD ||
+        view.constants_size > INFERNO_METAL_ARGUMENT_MAX_CONSTANTS ||
         view.images_size > INFERNO_METAL_RESOURCE_MAX_IMAGES ||
         (!empty && !view.command_count) ||
         output_size != INFERNO_METAL_RESOURCE_RESULT_SIZE + view.images_size) {
@@ -1015,12 +1087,31 @@ bool inferno_metal_resource_batch_parse(const void *opaque, size_t size,
                    INFERNO_METAL_RESOURCE_BINDING_RECORD_SIZE, size)) {
         return false;
     }
+    view.arguments_offset = offset;
+    if (!addRegion(&offset, view.argument_count,
+                   INFERNO_METAL_RESOURCE_ARGUMENT_RECORD_SIZE, size)) {
+        return false;
+    }
+    view.members_offset = offset;
+    if (!addRegion(&offset, view.member_count,
+                   INFERNO_METAL_RESOURCE_MEMBER_RECORD_SIZE, size)) {
+        return false;
+    }
+    view.declarations_offset = offset;
+    if (!addRegion(&offset, view.declaration_count,
+                   INFERNO_METAL_RESOURCE_DECLARATION_RECORD_SIZE, size)) {
+        return false;
+    }
     view.payload_offset = offset;
     if (!addRegion(&offset, view.payload_size, 1, size)) {
         return false;
     }
     view.inline_offset = offset;
     if (!addRegion(&offset, view.inline_size, 1, size)) {
+        return false;
+    }
+    view.constants_offset = offset;
+    if (!addRegion(&offset, view.constants_size, 1, size)) {
         return false;
     }
     view.images_offset = offset;
@@ -1045,6 +1136,7 @@ bool inferno_metal_resource_batch_parse(const void *opaque, size_t size,
     bool referenced_textures[INFERNO_METAL_RESOURCE_MAX_TEXTURES] = { false };
     bool referenced_samplers[INFERNO_METAL_RESOURCE_MAX_SAMPLERS] = { false };
     bool referenced_draws[INFERNO_METAL_RESOURCE_MAX_DRAWS] = { false };
+    bool referenced_arguments[INFERNO_METAL_RESOURCE_MAX_ARGUMENTS] = { false };
 
     for (uint32_t i = 0; i < view.compute_pipeline_count; i++) {
         const uint8_t *record =
@@ -1137,7 +1229,111 @@ bool inferno_metal_resource_batch_parse(const void *opaque, size_t size,
         }
     }
 
+    uint32_t expected_member = 0;
+    uint32_t expected_constant = 0;
+    for (uint32_t i = 0; i < view.argument_count; i++) {
+        const uint8_t *argument =
+            inferno_metal_resource_batch_argument(&view, i);
+        uint32_t member_start = get32(
+            argument + INFERNO_METAL_RESOURCE_ARGUMENT_MEMBER_START_OFFSET);
+        uint32_t member_count = get32(
+            argument + INFERNO_METAL_RESOURCE_ARGUMENT_MEMBER_COUNT_OFFSET);
+        uint32_t encoded_length = get32(
+            argument + INFERNO_METAL_RESOURCE_ARGUMENT_ENCODED_LENGTH_OFFSET);
+        uint32_t alignment =
+            get32(argument + INFERNO_METAL_RESOURCE_ARGUMENT_ALIGNMENT_OFFSET);
+        if (get32(argument + INFERNO_METAL_RESOURCE_ARGUMENT_LIBRARY_OFFSET) >=
+                view.library_count ||
+            get32(argument +
+                  INFERNO_METAL_RESOURCE_ARGUMENT_BUFFER_INDEX_OFFSET) > 30 ||
+            member_start != expected_member || !member_count ||
+            member_count > INFERNO_METAL_ARGUMENT_MAX_LAYOUT_MEMBERS ||
+            expected_member > view.member_count ||
+            member_count > view.member_count - expected_member ||
+            !encoded_length ||
+            encoded_length > INFERNO_METAL_ARGUMENT_MAX_ENCODED_LENGTH ||
+            !alignment || alignment > 4096 || (alignment & (alignment - 1)) ||
+            get32(argument + INFERNO_METAL_RESOURCE_ARGUMENT_FLAGS_OFFSET) ||
+            !allZero(argument + INFERNO_METAL_RESOURCE_ARGUMENT_RESERVED_OFFSET,
+                     INFERNO_METAL_RESOURCE_ARGUMENT_RESERVED_SIZE) ||
+            !validName(argument +
+                       INFERNO_METAL_RESOURCE_ARGUMENT_NAME_OFFSET)) {
+            return fail(error, INFERNO_METAL_RESOURCE_RECORD_ARGUMENT, i);
+        }
+        uint32_t prior_id = 0;
+        for (uint32_t j = 0; j < member_count; j++) {
+            uint32_t member_index = member_start + j;
+            const uint8_t *member =
+                inferno_metal_resource_batch_member(&view, member_index);
+            uint32_t kind =
+                get32(member + INFERNO_METAL_RESOURCE_MEMBER_KIND_OFFSET);
+            uint32_t id =
+                get32(member + INFERNO_METAL_RESOURCE_MEMBER_ID_OFFSET);
+            uint32_t resource =
+                get32(member + INFERNO_METAL_RESOURCE_MEMBER_RESOURCE_OFFSET);
+            uint32_t length =
+                get32(member + INFERNO_METAL_RESOURCE_MEMBER_LENGTH_OFFSET);
+            uint64_t member_offset =
+                get64(member + INFERNO_METAL_RESOURCE_MEMBER_OFFSET_OFFSET);
+            bool valid =
+                (!j || id > prior_id) &&
+                !get64(member + INFERNO_METAL_RESOURCE_MEMBER_RESERVED_OFFSET);
+            if (kind == INFERNO_METAL_RESOURCE_ARGUMENT_MEMBER_BUFFER) {
+                valid = valid && resource < view.buffer_count && !length;
+                if (valid) {
+                    uint32_t buffer_length = get32(
+                        inferno_metal_resource_batch_buffer(&view, resource) +
+                        INFERNO_METAL_RESOURCE_BUFFER_LENGTH_OFFSET);
+                    valid = member_offset < buffer_length;
+                }
+                if (valid) {
+                    referenced_buffers[resource] = true;
+                }
+            } else if (kind == INFERNO_METAL_RESOURCE_ARGUMENT_MEMBER_TEXTURE) {
+                valid = valid && resource < view.texture_count && !length &&
+                        !member_offset;
+                if (valid) {
+                    referenced_textures[resource] = true;
+                }
+            } else if (kind == INFERNO_METAL_RESOURCE_ARGUMENT_MEMBER_SAMPLER) {
+                valid =
+                    valid && resource < view.sampler_count && !length &&
+                    !member_offset &&
+                    get32(
+                        inferno_metal_resource_batch_sampler(&view, resource) +
+                        INFERNO_METAL_RESOURCE_SAMPLER_SUPPORT_ARGUMENT_BUFFERS_OFFSET);
+                if (valid) {
+                    referenced_samplers[resource] = true;
+                }
+            } else if (kind ==
+                       INFERNO_METAL_RESOURCE_ARGUMENT_MEMBER_CONSTANT) {
+                valid = valid && resource == expected_constant && length &&
+                        length <= INFERNO_METAL_ARGUMENT_MAX_CONSTANT &&
+                        !member_offset && resource <= view.constants_size &&
+                        length <= view.constants_size - resource;
+                if (valid) {
+                    expected_constant += length;
+                }
+            } else {
+                valid = false;
+            }
+            if (!valid) {
+                return fail(error, INFERNO_METAL_RESOURCE_RECORD_MEMBER,
+                            member_index);
+            }
+            prior_id = id;
+        }
+        referenced_libraries[get32(
+            argument + INFERNO_METAL_RESOURCE_ARGUMENT_LIBRARY_OFFSET)] = true;
+        expected_member += member_count;
+    }
+    if (expected_member != view.member_count ||
+        expected_constant != view.constants_size) {
+        return fail(error, INFERNO_METAL_BATCH_RECORD_HEADER, 0);
+    }
+
     uint32_t expected_binding = 0, expected_draw = 0, expected_inline = 0;
+    uint32_t expected_declaration = 0;
     for (uint32_t i = 0; i < view.command_count; i++) {
         const uint8_t *record = inferno_metal_resource_batch_command(&view, i);
         uint32_t kind =
@@ -1154,6 +1350,12 @@ bool inferno_metal_resource_batch_parse(const void *opaque, size_t size,
                 record + INFERNO_METAL_RESOURCE_COMMAND_COUNT_OR_ACTION_OFFSET);
             uint32_t count =
                 get32(record + INFERNO_METAL_RESOURCE_COMMAND_START_OFFSET);
+            uint32_t declaration_start = get32(
+                record +
+                INFERNO_METAL_RESOURCE_COMMAND_COMPUTE_DECLARATION_START_OFFSET);
+            uint32_t declaration_count = get32(
+                record +
+                INFERNO_METAL_RESOURCE_COMMAND_COMPUTE_DECLARATION_COUNT_OFFSET);
             uint32_t dimensions[6] = {
                 get32(record + INFERNO_METAL_RESOURCE_COMMAND_COUNT_OFFSET),
                 get32(
@@ -1198,13 +1400,66 @@ bool inferno_metal_resource_batch_parse(const void *opaque, size_t size,
                         (1U << INFERNO_METAL_RESOURCE_BINDING_INLINE) |
                         (1U << INFERNO_METAL_RESOURCE_BINDING_THREADGROUP) |
                         (1U << INFERNO_METAL_RESOURCE_BINDING_TEXTURE) |
-                        (1U << INFERNO_METAL_RESOURCE_BINDING_SAMPLER),
+                        (1U << INFERNO_METAL_RESOURCE_BINDING_SAMPLER) |
+                        (1U << INFERNO_METAL_RESOURCE_BINDING_ARGUMENT),
                     &expected_inline, referenced_buffers, referenced_textures,
-                    referenced_samplers, UINT32_MAX, error)) {
+                    referenced_samplers, referenced_arguments, UINT32_MAX,
+                    pipeline, error) ||
+                declaration_start != expected_declaration ||
+                declaration_start > view.declaration_count ||
+                declaration_count >
+                    view.declaration_count - declaration_start) {
                 return false;
+            }
+            uint32_t prior_resource_kind = 0, prior_resource = 0;
+            for (uint32_t j = 0; j < declaration_count; j++) {
+                uint32_t declaration_index = declaration_start + j;
+                const uint8_t *declaration =
+                    inferno_metal_resource_batch_declaration(&view,
+                                                             declaration_index);
+                uint32_t resource_kind = get32(
+                    declaration +
+                    INFERNO_METAL_RESOURCE_DECLARATION_RESOURCE_KIND_OFFSET);
+                uint32_t resource =
+                    get32(declaration +
+                          INFERNO_METAL_RESOURCE_DECLARATION_RESOURCE_OFFSET);
+                uint32_t usage =
+                    get32(declaration +
+                          INFERNO_METAL_RESOURCE_DECLARATION_USAGE_OFFSET);
+                bool ordered = !j || resource_kind > prior_resource_kind ||
+                               (resource_kind == prior_resource_kind &&
+                                resource > prior_resource);
+                bool valid =
+                    ordered && usage &&
+                    !(usage & ~INFERNO_METAL_RESOURCE_USAGE_MASK) &&
+                    !get32(declaration +
+                           INFERNO_METAL_RESOURCE_DECLARATION_RESERVED_OFFSET);
+                if (resource_kind ==
+                    INFERNO_METAL_RESOURCE_DECLARATION_BUFFER) {
+                    valid = valid && resource < view.buffer_count;
+                    if (valid) {
+                        referenced_buffers[resource] = true;
+                    }
+                } else if (resource_kind ==
+                           INFERNO_METAL_RESOURCE_DECLARATION_TEXTURE) {
+                    valid = valid && resource < view.texture_count;
+                    if (valid) {
+                        referenced_textures[resource] = true;
+                    }
+                } else {
+                    valid = false;
+                }
+                if (!valid) {
+                    return fail(error,
+                                INFERNO_METAL_RESOURCE_RECORD_DECLARATION,
+                                declaration_index);
+                }
+                prior_resource_kind = resource_kind;
+                prior_resource = resource;
             }
             referenced_compute[pipeline] = true;
             expected_binding += count;
+            expected_declaration += declaration_count;
         } else if (kind == INFERNO_METAL_RESOURCE_COMMAND_RENDER) {
             uint32_t texture =
                 get32(record + INFERNO_METAL_RESOURCE_COMMAND_RESOURCE_OFFSET);
@@ -1297,8 +1552,8 @@ bool inferno_metal_resource_batch_parse(const void *opaque, size_t size,
                 if (!validResourceBindings(
                         &view, vertex_start, vertex_count, render_kinds,
                         &expected_inline, referenced_buffers,
-                        referenced_textures, referenced_samplers, texture,
-                        error)) {
+                        referenced_textures, referenced_samplers, NULL, texture,
+                        UINT32_MAX, error)) {
                     return false;
                 }
                 expected_binding += vertex_count;
@@ -1311,8 +1566,8 @@ bool inferno_metal_resource_batch_parse(const void *opaque, size_t size,
                 if (!validResourceBindings(
                         &view, fragment_start, fragment_count, render_kinds,
                         &expected_inline, referenced_buffers,
-                        referenced_textures, referenced_samplers, texture,
-                        error)) {
+                        referenced_textures, referenced_samplers, NULL, texture,
+                        UINT32_MAX, error)) {
                     return false;
                 }
                 expected_binding += fragment_count;
@@ -1326,7 +1581,8 @@ bool inferno_metal_resource_batch_parse(const void *opaque, size_t size,
     }
     if (expected_binding != view.binding_count ||
         expected_draw != view.draw_count ||
-        expected_inline != view.inline_size) {
+        expected_inline != view.inline_size ||
+        expected_declaration != view.declaration_count) {
         return fail(error, INFERNO_METAL_BATCH_RECORD_HEADER, 0);
     }
 #define REQUIRE_REFERENCED(count, referenced, kind) \
@@ -1351,6 +1607,8 @@ bool inferno_metal_resource_batch_parse(const void *opaque, size_t size,
                        INFERNO_METAL_RESOURCE_RECORD_SAMPLER);
     REQUIRE_REFERENCED(view.draw_count, referenced_draws,
                        INFERNO_METAL_RESOURCE_RECORD_DRAW);
+    REQUIRE_REFERENCED(view.argument_count, referenced_arguments,
+                       INFERNO_METAL_RESOURCE_RECORD_ARGUMENT);
 #undef REQUIRE_REFERENCED
     *out = view;
     return true;
@@ -1374,12 +1632,20 @@ bool inferno_metal_typed_query_parse(uint32_t opcode, const void *opaque,
         (opcode != INFERNO_METAL_QUERY_LIBRARY_TYPED &&
          opcode != INFERNO_METAL_QUERY_PIPELINE_TYPED &&
          opcode != INFERNO_METAL_QUERY_RENDER_PIPELINE &&
-         opcode != INFERNO_METAL_QUERY_IMAGEBLOCK_TYPED) ||
+         opcode != INFERNO_METAL_QUERY_IMAGEBLOCK_TYPED &&
+         opcode != INFERNO_METAL_QUERY_ARGUMENT_LAYOUT) ||
         get32(bytes + INFERNO_METAL_RESOURCE_QUERY_VERSION_OFFSET) !=
             INFERNO_METAL_RESOURCE_VERSION ||
         get32(bytes + INFERNO_METAL_RESOURCE_QUERY_FLAGS_OFFSET) ||
-        !allZero(bytes + INFERNO_METAL_RESOURCE_QUERY_RESERVED_OFFSET,
-                 INFERNO_METAL_RESOURCE_QUERY_RESERVED_SIZE)) {
+        (opcode == INFERNO_METAL_QUERY_ARGUMENT_LAYOUT ?
+             (get32(bytes +
+                    INFERNO_METAL_RESOURCE_QUERY_ARGUMENT_BUFFER_INDEX_OFFSET) >
+                  30 ||
+              !allZero(
+                  bytes + INFERNO_METAL_RESOURCE_QUERY_ARGUMENT_RESERVED_OFFSET,
+                  INFERNO_METAL_RESOURCE_QUERY_ARGUMENT_RESERVED_SIZE)) :
+             !allZero(bytes + INFERNO_METAL_RESOURCE_QUERY_RESERVED_OFFSET,
+                      INFERNO_METAL_RESOURCE_QUERY_RESERVED_SIZE))) {
         return false;
     }
     view = (InfernoMetalTypedQueryView){
@@ -1390,6 +1656,12 @@ bool inferno_metal_typed_query_parse(uint32_t opcode, const void *opaque,
             get32(bytes + INFERNO_METAL_RESOURCE_QUERY_LIBRARY_COUNT_OFFSET),
         .payload_size =
             get32(bytes + INFERNO_METAL_RESOURCE_QUERY_PAYLOAD_SIZE_OFFSET),
+        .argument_buffer_index =
+            opcode == INFERNO_METAL_QUERY_ARGUMENT_LAYOUT ?
+                get32(
+                    bytes +
+                    INFERNO_METAL_RESOURCE_QUERY_ARGUMENT_BUFFER_INDEX_OFFSET) :
+                0,
         .libraries_offset = INFERNO_METAL_RESOURCE_QUERY_HEADER_SIZE,
     };
     uint32_t required_libraries =
@@ -1408,7 +1680,8 @@ bool inferno_metal_typed_query_parse(uint32_t opcode, const void *opaque,
     }
     view.pipeline_offset = offset;
     if (opcode == INFERNO_METAL_QUERY_PIPELINE_TYPED ||
-        opcode == INFERNO_METAL_QUERY_IMAGEBLOCK_TYPED) {
+        opcode == INFERNO_METAL_QUERY_IMAGEBLOCK_TYPED ||
+        opcode == INFERNO_METAL_QUERY_ARGUMENT_LAYOUT) {
         view.pipeline_size =
             INFERNO_METAL_RESOURCE_COMPUTE_PIPELINE_RECORD_SIZE;
     } else if (opcode == INFERNO_METAL_QUERY_RENDER_PIPELINE) {
