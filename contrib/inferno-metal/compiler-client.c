@@ -421,7 +421,26 @@ static bool validStage(const ImtlCompilerResult *r)
         return r->stage == INFERNO_METAL_RESOURCE_COMPILER_STAGE_VERTEX ||
                r->stage == INFERNO_METAL_RESOURCE_COMPILER_STAGE_FRAGMENT;
     }
+    if (r->opcode == INFERNO_METAL_QUERY_ARGUMENT_LAYOUT) {
+        return r->stage == INFERNO_METAL_RESOURCE_COMPILER_STAGE_NONE ||
+               r->stage == INFERNO_METAL_RESOURCE_COMPILER_STAGE_VERTEX ||
+               r->stage == INFERNO_METAL_RESOURCE_COMPILER_STAGE_FRAGMENT;
+    }
     return r->stage == INFERNO_METAL_RESOURCE_COMPILER_STAGE_NONE;
+}
+
+static uint32_t functionTypeForStage(uint32_t stage)
+{
+    switch (stage) {
+    case INFERNO_METAL_RESOURCE_COMPILER_STAGE_NONE:
+        return INFERNO_METAL_FUNCTION_TYPE_KERNEL;
+    case INFERNO_METAL_RESOURCE_COMPILER_STAGE_VERTEX:
+        return INFERNO_METAL_FUNCTION_TYPE_VERTEX;
+    case INFERNO_METAL_RESOURCE_COMPILER_STAGE_FRAGMENT:
+        return INFERNO_METAL_FUNCTION_TYPE_FRAGMENT;
+    default:
+        return 0;
+    }
 }
 
 static bool validLibrary(const ImtlCompilerResult *r, const uint8_t *bytes)
@@ -448,6 +467,10 @@ static bool validFailure(const ImtlCompilerResult *r)
 {
     bool library = libraryOpcode(r->opcode);
     bool render = r->opcode == INFERNO_METAL_QUERY_RENDER_PIPELINE;
+    bool argument = r->opcode == INFERNO_METAL_QUERY_ARGUMENT_LAYOUT;
+    uint32_t expected_function_type = render || argument ?
+                                          functionTypeForStage(r->stage) :
+                                          INFERNO_METAL_FUNCTION_TYPE_KERNEL;
     bool no_error = r->flags & INFERNO_METAL_COMPILER_FLAG_NO_NSERROR;
     if (r->max_total_threads_per_threadgroup || r->thread_execution_width ||
         r->static_threadgroup_memory_length || r->allocated_size ||
@@ -463,7 +486,9 @@ static bool validFailure(const ImtlCompilerResult *r)
                !r->function_type && !r->required_output_size &&
                (r->phase == INFERNO_METAL_COMPILER_PHASE_LIBRARY ||
                 (!library &&
-                 r->phase == INFERNO_METAL_COMPILER_PHASE_PIPELINE));
+                 r->phase == INFERNO_METAL_COMPILER_PHASE_PIPELINE &&
+                 (!argument ||
+                  r->stage == INFERNO_METAL_RESOURCE_COMPILER_STAGE_NONE)));
     case INFERNO_METAL_COMPILER_OUTCOME_FUNCTION_NOT_FOUND:
         return !library && no_error && !r->function_count &&
                !r->metadata_record_count && !r->function_type &&
@@ -472,29 +497,14 @@ static bool validFailure(const ImtlCompilerResult *r)
     case INFERNO_METAL_COMPILER_OUTCOME_FUNCTION_TYPE_MISMATCH:
         return !library && no_error && !r->function_count &&
                !r->metadata_record_count && !r->required_output_size &&
-               knownFunctionType(r->function_type) &&
-               (render ?
-                    ((r->stage ==
-                          INFERNO_METAL_RESOURCE_COMPILER_STAGE_VERTEX &&
-                      r->function_type != INFERNO_METAL_FUNCTION_TYPE_VERTEX) ||
-                     (r->stage ==
-                          INFERNO_METAL_RESOURCE_COMPILER_STAGE_FRAGMENT &&
-                      r->function_type !=
-                          INFERNO_METAL_FUNCTION_TYPE_FRAGMENT)) :
-                    r->function_type != INFERNO_METAL_FUNCTION_TYPE_KERNEL) &&
+               knownFunctionType(r->function_type) && expected_function_type &&
+               r->function_type != expected_function_type &&
                r->phase == INFERNO_METAL_COMPILER_PHASE_FUNCTION;
     case INFERNO_METAL_COMPILER_OUTCOME_SPECIALIZATION_REQUIRED:
         return !library && no_error && !r->function_count &&
                !r->metadata_record_count && !r->required_output_size &&
-               (render ?
-                    ((r->stage ==
-                          INFERNO_METAL_RESOURCE_COMPILER_STAGE_VERTEX &&
-                      r->function_type == INFERNO_METAL_FUNCTION_TYPE_VERTEX) ||
-                     (r->stage ==
-                          INFERNO_METAL_RESOURCE_COMPILER_STAGE_FRAGMENT &&
-                      r->function_type ==
-                          INFERNO_METAL_FUNCTION_TYPE_FRAGMENT)) :
-                    r->function_type == INFERNO_METAL_FUNCTION_TYPE_KERNEL) &&
+               expected_function_type &&
+               r->function_type == expected_function_type &&
                r->phase == INFERNO_METAL_COMPILER_PHASE_FUNCTION;
     case INFERNO_METAL_COMPILER_OUTCOME_INVENTORY_UNSUPPORTED:
         return library && no_error && !r->required_output_size &&

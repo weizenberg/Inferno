@@ -31,6 +31,7 @@
 - (instancetype)initWithPayload:(NSData *)payload
                            kind:(uint32_t)kind
                            name:(NSString *)name
+                   functionType:(MTLFunctionType)type
                     bufferIndex:(NSUInteger)index
 {
     if (!(self = [super init]) || !payload || !name)
@@ -38,6 +39,7 @@
     _payload = [payload copy];
     _libraryKind = kind;
     _functionName = [name copy];
+    _functionType = type;
     _bufferIndex = index;
     return self;
 }
@@ -48,7 +50,8 @@
 }
 - (NSUInteger)hash
 {
-    return _payload.hash ^ _functionName.hash ^ _libraryKind ^ _bufferIndex;
+    return _payload.hash ^ _functionName.hash ^ _libraryKind ^ _functionType ^
+           _bufferIndex;
 }
 - (BOOL)isEqual:(id)object
 {
@@ -59,6 +62,7 @@
     InfernoMetalArgumentLayoutKey *other = object;
     return _libraryKind == other.libraryKind &&
            _bufferIndex == other.bufferIndex &&
+           _functionType == other.functionType &&
            [_functionName isEqualToString:other.functionName] &&
            [_payload isEqual:other.payload];
 }
@@ -124,14 +128,26 @@
                       resource:(id)resource
                         offset:(NSUInteger)offset
                   constantData:(NSData *)data
+                explicitlyNull:(BOOL)explicitlyNull
 {
     if (!(self = [super init]) || !layout)
+        return nil;
+    uint32_t kind = layout.record.kind;
+    BOOL invalidNull = explicitlyNull &&
+                       (kind != INFERNO_METAL_RESOURCE_ARGUMENT_MEMBER_BUFFER ||
+                        resource || offset || data);
+    BOOL missingValue =
+        !explicitlyNull &&
+        (kind == INFERNO_METAL_RESOURCE_ARGUMENT_MEMBER_CONSTANT ? !data :
+                                                                   !resource);
+    if (invalidNull || missingValue)
         return nil;
     _layout = layout;
     _memberIndex = memberIndex;
     _resource = resource;
     _offset = offset;
     _constantData = [data copy];
+    _explicitlyNull = explicitlyNull;
     return self;
 }
 @end
@@ -215,7 +231,8 @@
                                          memberIndex:index
                                             resource:nil
                                               offset:0
-                                        constantData:constant]];
+                                        constantData:constant
+                                      explicitlyNull:NO]];
                     continue;
                 }
                 id entry = _assignments[@(index)];
@@ -225,10 +242,21 @@
                                        (unsigned long)index];
                 }
                 if (entry == [NSNull null]) {
-                    [NSException
-                         raise:InfernoMetalUnsupportedException
-                        format:@"Nil argument member %lu is unsupported",
-                               (unsigned long)index];
+                    if (record.kind !=
+                        INFERNO_METAL_RESOURCE_ARGUMENT_MEMBER_BUFFER)
+                        [NSException
+                             raise:InfernoMetalUnsupportedException
+                            format:@"Nil argument member %lu is unsupported",
+                                   (unsigned long)index];
+                    [members
+                        addObject:[[InfernoMetalEncodedArgumentMember alloc]
+                                      initWithLayout:layoutMember
+                                         memberIndex:index
+                                            resource:nil
+                                              offset:0
+                                        constantData:nil
+                                      explicitlyNull:YES]];
+                    continue;
                 }
                 id resource =
                     ((InfernoMetalWeakArgumentResource *)entry).resource;
@@ -243,7 +271,8 @@
                                              resource:resource
                                                offset:[_offsets[@(index)]
                                                           unsignedIntegerValue]
-                                         constantData:nil]];
+                                         constantData:nil
+                                       explicitlyNull:NO]];
             }
         }
         [members sortUsingComparator:^NSComparisonResult(
@@ -267,6 +296,17 @@
         return nil;
     _resource = resource;
     _usage = usage;
+    return self;
+}
+- (instancetype)initWithResource:(id)resource
+                     vertexUsage:(uint32_t)vertexUsage
+                   fragmentUsage:(uint32_t)fragmentUsage
+{
+    if (!(self = [super init]) || !resource || (!vertexUsage && !fragmentUsage))
+        return nil;
+    _resource = resource;
+    _vertexUsage = vertexUsage;
+    _fragmentUsage = fragmentUsage;
     return self;
 }
 @end

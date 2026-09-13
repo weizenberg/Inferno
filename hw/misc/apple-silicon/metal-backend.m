@@ -321,8 +321,8 @@ static NSArray *metal_sorted_constants(NSDictionary *dictionary,
             MTLFunctionConstant *other = [result objectAtIndex:insertion];
             if ([constant index] < [other index] ||
                 ([constant index] == [other index] &&
-                 [[constant name] compare:[other name]] ==
-                     NSOrderedAscending)) {
+                 [[constant name]
+                     compare:[other name]] == NSOrderedAscending)) {
                 break;
             }
             insertion++;
@@ -590,8 +590,8 @@ bool inferno_metal_backend_query(InfernoMetalBackend *backend,
         NSArray *pipeline_key = nil;
         id<MTLComputePipelineState> pipeline = nil;
         NSError *pipeline_warning = nil;
-        NSData *library_key =
-            [NSData dataWithBytes:source length:c->source_size];
+        NSData *library_key = [NSData dataWithBytes:source
+                                             length:c->source_size];
         if (c->opcode == INFERNO_METAL_QUERY_PIPELINE ||
             c->opcode == INFERNO_METAL_QUERY_IMAGEBLOCK) {
             function_name = [NSString stringWithUTF8String:c->function];
@@ -967,8 +967,8 @@ bool inferno_metal_backend_execute(InfernoMetalBackend *backend,
                                                cached_pipeline != nil,
                                                [backend->pipeline_keys count]);
             if (!cached_pipeline) {
-                NSData *library_key =
-                    [NSData dataWithBytes:source length:c->source_size];
+                NSData *library_key = [NSData dataWithBytes:source
+                                                     length:c->source_size];
                 library = metal_library_lookup(backend, library_key,
                                                &library_warning);
                 if (!library) {
@@ -2235,31 +2235,69 @@ metal_v5_argument_root_binding(NSArray<id<MTLBinding>> *bindings,
     return buffer;
 }
 
-static NSDictionary *metal_v5_argument_layout(
-    InfernoMetalBackend *backend, const uint8_t *pipeline_record,
-    const uint8_t *library_record, id<MTLLibrary> library,
-    const uint8_t *payload, MTLComputePipelineReflection *reflection,
-    uint32_t slot, MetalV5Failure *failure, uint32_t failure_kind,
-    uint32_t failure_index, NSString **reason, bool *resource_failed)
+static bool metal_v7_function_type(uint32_t wire_type,
+                                   MTLFunctionType *metal_type, uint32_t *stage)
 {
-    NSArray *key = [metal_v5_compute_key(pipeline_record, library_record,
-                                         payload) arrayByAddingObject:@(slot)];
+    switch (wire_type) {
+    case INFERNO_METAL_FUNCTION_TYPE_VERTEX:
+        *metal_type = MTLFunctionTypeVertex;
+        *stage = INFERNO_METAL_RESOURCE_COMPILER_STAGE_VERTEX;
+        return true;
+    case INFERNO_METAL_FUNCTION_TYPE_FRAGMENT:
+        *metal_type = MTLFunctionTypeFragment;
+        *stage = INFERNO_METAL_RESOURCE_COMPILER_STAGE_FRAGMENT;
+        return true;
+    case INFERNO_METAL_FUNCTION_TYPE_KERNEL:
+        *metal_type = MTLFunctionTypeKernel;
+        *stage = INFERNO_METAL_RESOURCE_COMPILER_STAGE_NONE;
+        return true;
+    default:
+        return false;
+    }
+}
+
+static NSArray *metal_v7_argument_key(const uint8_t *function_record,
+                                      size_t name_offset,
+                                      const uint8_t *library_record,
+                                      const uint8_t *payload,
+                                      uint32_t function_type, uint32_t slot)
+{
+    uint32_t kind =
+        ldl_le_p(library_record + INFERNO_METAL_RESOURCE_LIBRARY_KIND_OFFSET);
+    uint32_t offset = ldl_le_p(library_record +
+                               INFERNO_METAL_RESOURCE_LIBRARY_PAYLOAD_OFFSET);
+    uint32_t size = ldl_le_p(
+        library_record + INFERNO_METAL_RESOURCE_LIBRARY_PAYLOAD_SIZE_OFFSET);
+    return @[
+        @"v7-argument", @(kind), metal_v5_bytes(payload + offset, size),
+        metal_v5_name(function_record, name_offset), @(function_type), @(slot)
+    ];
+}
+
+static NSDictionary *metal_v7_argument_layout(
+    InfernoMetalBackend *backend, const uint8_t *function_record,
+    size_t name_offset, const uint8_t *library_record, id<MTLLibrary> library,
+    const uint8_t *payload, uint32_t function_type, uint32_t slot,
+    MetalV5Failure *failure, uint32_t failure_kind, uint32_t failure_index,
+    NSString **reason, bool *resource_failed)
+{
+    MTLFunctionType metal_type;
+    uint32_t stage;
+    if (!metal_v7_function_type(function_type, &metal_type, &stage)) {
+        *reason = @"argument function type is unsupported";
+        return nil;
+    }
+    NSArray *key =
+        metal_v7_argument_key(function_record, name_offset, library_record,
+                              payload, function_type, slot);
     NSDictionary *cached = metal_argument_lookup(backend, key);
     if (cached) {
         return cached;
     }
-    id<MTLBufferBinding> root =
-        metal_v5_argument_root_binding([reflection bindings], slot, reason);
-    if (!root) {
-        return nil;
-    }
     id<MTLFunction> function = nil;
-    if (!metal_v5_function(
-            library,
-            metal_v5_name(pipeline_record,
-                          INFERNO_METAL_RESOURCE_COMPUTE_PIPELINE_NAME_OFFSET),
-            MTLFunctionTypeKernel, &function, failure, failure_kind,
-            failure_index, INFERNO_METAL_RESOURCE_COMPILER_STAGE_NONE)) {
+    if (!metal_v5_function(library, metal_v5_name(function_record, name_offset),
+                           metal_type, &function, failure, failure_kind,
+                           failure_index, stage)) {
         return nil;
     }
 #pragma clang diagnostic push
@@ -2267,6 +2305,10 @@ static NSDictionary *metal_v5_argument_layout(
     MTLArgument *argument = nil;
     id<MTLArgumentEncoder> encoder =
         [function newArgumentEncoderWithBufferIndex:slot reflection:&argument];
+    MTLPointerType *argument_pointer =
+        argument ? [argument bufferPointerType] : nil;
+    MTLStructType *argument_struct =
+        argument ? [argument bufferStructType] : nil;
 #pragma clang diagnostic pop
     if (!encoder) {
         *reason = @"Metal returned no function argument encoder";
@@ -2275,28 +2317,20 @@ static NSDictionary *metal_v5_argument_layout(
     }
     NSUInteger encoded_length = [encoder encodedLength];
     NSUInteger alignment = [encoder alignment];
-    NSArray *graph_a = argument ? [[argument bufferStructType] members] : nil;
-    NSArray *graph_b = [[root bufferStructType] members];
+    NSArray *graph_a = [argument_struct members];
     NSArray *members_a = nil;
-    NSArray *members_b = nil;
     if (!encoded_length ||
         encoded_length > INFERNO_METAL_ARGUMENT_MAX_ENCODED_LENGTH ||
         !alignment || alignment > 4096 || (alignment & (alignment - 1))) {
         *reason = @"argument encoder layout exceeds the wire range";
-    } else if (!argument || ![argument bufferStructType]) {
+    } else if (!argument || !argument_pointer ||
+               ![argument_pointer elementIsArgumentBuffer] ||
+               !argument_struct) {
         *reason = @"function argument reflection is unavailable";
     } else {
         members_a = metal_v5_argument_members(graph_a, encoded_length, reason);
-        if (members_a) {
-            members_b =
-                metal_v5_argument_members(graph_b, encoded_length, reason);
-        }
-        if (members_a && members_b && ![members_a isEqualToArray:members_b]) {
-            *reason = @"function and pipeline argument layouts disagree";
-            members_b = nil;
-        }
     }
-    if (!members_a || !members_b) {
+    if (!members_a) {
         [encoder release];
         return nil;
     }
@@ -2309,6 +2343,28 @@ static NSDictionary *metal_v5_argument_layout(
     [encoder release];
     metal_argument_insert(backend, key, layout);
     return layout;
+}
+
+static bool
+metal_v7_validate_final_argument_layout(NSDictionary *layout,
+                                        NSArray<id<MTLBinding>> *bindings,
+                                        uint32_t slot, NSString **reason)
+{
+    id<MTLBufferBinding> root =
+        metal_v5_argument_root_binding(bindings, slot, reason);
+    if (!root) {
+        return false;
+    }
+    NSArray *members = metal_v5_argument_members(
+        [[root bufferStructType] members],
+        [layout[@"encoded_length"] unsignedIntegerValue], reason);
+    if (!members || ![members isEqualToArray:layout[@"members"]]) {
+        if (members) {
+            *reason = @"function and final pipeline argument layouts disagree";
+        }
+        return false;
+    }
+    return true;
 }
 
 static void metal_v5_render_descriptor(MTLRenderPipelineDescriptor *d,
@@ -2499,8 +2555,9 @@ static bool metal_v5_argument_query_finish(const InfernoMetalCommand *c,
                                            uint8_t *output,
                                            NSDictionary *layout,
                                            NSError *diagnostic,
-                                           NSString *reason)
+                                           NSString *reason, uint32_t stage)
 {
+    stl_le_p(output + INFERNO_METAL_RESOURCE_COMPILER_STAGE_OFFSET, stage);
     if (!layout) {
         return metal_query_finish(
             c, output, INFERNO_METAL_COMPILER_OUTCOME_ARGUMENT_UNSUPPORTED,
@@ -2820,6 +2877,11 @@ bool inferno_metal_backend_typed_query(InfernoMetalBackend *backend,
         NSMutableArray *warnings =
             [NSMutableArray arrayWithCapacity:view.library_count];
         MetalV5Failure failure = { 0 };
+        if (c->opcode == INFERNO_METAL_QUERY_ARGUMENT_LAYOUT) {
+            MTLFunctionType ignored_type;
+            metal_v7_function_type(view.argument_function_type, &ignored_type,
+                                   &failure.stage);
+        }
         for (uint32_t i = 0; i < view.library_count; i++) {
             const uint8_t *record = inferno_metal_typed_query_library(&view, i);
             NSError *warning = nil;
@@ -2875,9 +2937,45 @@ bool inferno_metal_backend_typed_query(InfernoMetalBackend *backend,
                                       INFERNO_METAL_COMPILER_PHASE_PIPELINE,
                                       diagnostic, nil, diagnostic != nil);
         }
+        id library_warning = [warnings objectAtIndex:0];
+        if (c->opcode == INFERNO_METAL_QUERY_ARGUMENT_LAYOUT) {
+            NSString *reason = nil;
+            bool resource_failed = false;
+            NSDictionary *layout = metal_v7_argument_layout(
+                backend, pipeline_record,
+                INFERNO_METAL_RESOURCE_COMPUTE_PIPELINE_NAME_OFFSET,
+                inferno_metal_typed_query_library(&view, 0),
+                [libraries objectAtIndex:0], input + view.payload_offset,
+                view.argument_function_type, view.argument_buffer_index,
+                &failure, INFERNO_METAL_BATCH_RECORD_PIPELINE, 0, &reason,
+                &resource_failed);
+            NSError *diagnostic =
+                library_warning == [NSNull null] ? nil : library_warning;
+            if (layout && view.argument_function_type ==
+                              INFERNO_METAL_FUNCTION_TYPE_KERNEL) {
+                MTLComputePipelineReflection *reflection = nil;
+                id pipeline = metal_v5_compute_pipeline(
+                    backend, c, pipeline_record,
+                    inferno_metal_typed_query_library(&view, 0),
+                    [libraries objectAtIndex:0], input + view.payload_offset,
+                    diagnostic, &failure, 0, &reflection, &diagnostic);
+                if (!pipeline) {
+                    return metal_v5_query_finish(c, output, &failure);
+                }
+                if (!metal_v7_validate_final_argument_layout(
+                        layout, [reflection bindings],
+                        view.argument_buffer_index, &reason)) {
+                    layout = nil;
+                }
+            }
+            if (!layout && failure.outcome) {
+                return metal_v5_query_finish(c, output, &failure);
+            }
+            return metal_v5_argument_query_finish(c, output, layout, diagnostic,
+                                                  reason, failure.stage);
+        }
         MTLComputePipelineReflection *reflection = nil;
         NSError *diagnostic = nil;
-        id library_warning = [warnings objectAtIndex:0];
         id pipeline = metal_v5_compute_pipeline(
             backend, c, pipeline_record,
             inferno_metal_typed_query_library(&view, 0),
@@ -2886,22 +2984,6 @@ bool inferno_metal_backend_typed_query(InfernoMetalBackend *backend,
             0, &reflection, &diagnostic);
         if (!pipeline) {
             return metal_v5_query_finish(c, output, &failure);
-        }
-        if (c->opcode == INFERNO_METAL_QUERY_ARGUMENT_LAYOUT) {
-            NSString *reason = nil;
-            bool resource_failed = false;
-            NSDictionary *layout = metal_v5_argument_layout(
-                backend, pipeline_record,
-                inferno_metal_typed_query_library(&view, 0),
-                [libraries objectAtIndex:0], input + view.payload_offset,
-                reflection, view.argument_buffer_index, &failure,
-                INFERNO_METAL_BATCH_RECORD_PIPELINE, 0, &reason,
-                &resource_failed);
-            if (!layout && failure.outcome) {
-                return metal_v5_query_finish(c, output, &failure);
-            }
-            return metal_v5_argument_query_finish(c, output, layout, diagnostic,
-                                                  reason);
         }
         if (!metal_query_pipeline_limits(c, pipeline, output, message,
                                          message_size)) {
@@ -3159,15 +3241,9 @@ static bool metal_v5_validate_plain_buffer_bindings(
 
 static bool
 metal_v5_validate_declarations(const InfernoMetalResourceBatchView *view,
-                               const uint8_t *command, NSArray *textures,
-                               MetalV5Failure *failure)
+                               uint32_t start, uint32_t count,
+                               NSArray *textures, MetalV5Failure *failure)
 {
-    uint32_t start = ldl_le_p(
-        command +
-        INFERNO_METAL_RESOURCE_COMMAND_COMPUTE_DECLARATION_START_OFFSET);
-    uint32_t count = ldl_le_p(
-        command +
-        INFERNO_METAL_RESOURCE_COMMAND_COMPUTE_DECLARATION_COUNT_OFFSET);
     for (uint32_t i = 0; i < count; i++) {
         uint32_t declaration_index = start + i;
         const uint8_t *declaration =
@@ -3228,9 +3304,10 @@ static uint32_t metal_v5_argument_expanded_count(NSArray *members)
 static bool metal_v5_validate_argument_binding(
     InfernoMetalBackend *backend, const InfernoMetalResourceBatchView *view,
     const uint8_t *binding, uint32_t argument_index,
-    const uint8_t *pipeline_record, const uint8_t *library_record,
-    id<MTLLibrary> library, MTLComputePipelineReflection *reflection,
-    NSArray *textures, NSMutableArray *argument_layouts, uint32_t *buffer_total,
+    const uint8_t *function_record, size_t name_offset, uint32_t function_type,
+    const uint8_t *library_record, id<MTLLibrary> library,
+    NSArray<id<MTLBinding>> *reflection, NSArray *textures,
+    NSMutableArray *argument_layouts, uint32_t *buffer_total,
     uint32_t *texture_total, uint32_t *sampler_total, MetalV5Failure *failure)
 {
     const uint8_t *argument =
@@ -3239,9 +3316,9 @@ static bool metal_v5_validate_argument_binding(
         ldl_le_p(binding + INFERNO_METAL_RESOURCE_BINDING_INDEX_OFFSET);
     NSString *reason = nil;
     bool resource_failed = false;
-    NSDictionary *layout = metal_v5_argument_layout(
-        backend, pipeline_record, library_record, library,
-        view->bytes + view->payload_offset, reflection, slot, failure,
+    NSDictionary *layout = metal_v7_argument_layout(
+        backend, function_record, name_offset, library_record, library,
+        view->bytes + view->payload_offset, function_type, slot, failure,
         INFERNO_METAL_RESOURCE_RECORD_ARGUMENT, argument_index, &reason,
         &resource_failed);
     if (!layout) {
@@ -3256,6 +3333,14 @@ static bool metal_v5_validate_argument_binding(
                 INFERNO_METAL_RESOURCE_RECORD_ARGUMENT, argument_index,
                 reason ?: @"argument layout is unavailable");
         }
+        return false;
+    }
+    if (!metal_v7_validate_final_argument_layout(layout, reflection, slot,
+                                                 &reason)) {
+        metal_v5_fail(failure, INFERNO_METAL_RESOURCE_OUTCOME_UNSUPPORTED_STATE,
+                      INFERNO_METAL_BATCH_PHASE_VALIDATE,
+                      INFERNO_METAL_RESOURCE_RECORD_ARGUMENT, argument_index,
+                      reason ?: @"final argument reflection disagrees");
         return false;
     }
     if ([layout[@"encoded_length"] unsignedIntValue] !=
@@ -3297,6 +3382,9 @@ static bool metal_v5_validate_argument_binding(
             ldl_le_p(record + INFERNO_METAL_RESOURCE_MEMBER_LENGTH_OFFSET);
         uint64_t offset =
             ldq_le_p(record + INFERNO_METAL_RESOURCE_MEMBER_OFFSET_OFFSET);
+        bool is_null =
+            ldl_le_p(record + INFERNO_METAL_RESOURCE_MEMBER_FLAGS_OFFSET) &
+            INFERNO_METAL_RESOURCE_MEMBER_NULL;
         NSDictionary *descriptor =
             metal_v5_argument_member_for_id(members, member_id);
         NSNumber *key = @(member_id);
@@ -3305,7 +3393,7 @@ static bool metal_v5_validate_argument_binding(
         if (valid && kind == INFERNO_METAL_RESOURCE_ARGUMENT_MEMBER_BUFFER) {
             uint32_t alignment =
                 [descriptor[@"pointer_alignment"] unsignedIntValue];
-            valid = alignment && !(offset % alignment);
+            valid = is_null || (alignment && !(offset % alignment));
             (*buffer_total)++;
         } else if (valid &&
                    kind == INFERNO_METAL_RESOURCE_ARGUMENT_MEMBER_TEXTURE) {
@@ -3342,7 +3430,79 @@ static bool metal_v5_validate_argument_binding(
         }
         [assigned addObject:key];
     }
-    [argument_layouts replaceObjectAtIndex:argument_index withObject:layout];
+    id prior_layout = [argument_layouts objectAtIndex:argument_index];
+    if (prior_layout != (id)[NSNull null] &&
+        (![prior_layout[@"members"] isEqualToArray:layout[@"members"]] ||
+         ![prior_layout[@"encoded_length"]
+             isEqualToNumber:layout[@"encoded_length"]] ||
+         ![prior_layout[@"alignment"] isEqualToNumber:layout[@"alignment"]])) {
+        metal_v5_fail(failure, INFERNO_METAL_RESOURCE_OUTCOME_UNSUPPORTED_STATE,
+                      INFERNO_METAL_BATCH_PHASE_VALIDATE,
+                      INFERNO_METAL_RESOURCE_RECORD_ARGUMENT, argument_index,
+                      @"argument record has incompatible stage layouts");
+        return false;
+    }
+    if (prior_layout == (id)[NSNull null]) {
+        [argument_layouts replaceObjectAtIndex:argument_index
+                                    withObject:layout];
+    }
+    return true;
+}
+
+static bool metal_v7_validate_render_stage_arguments(
+    InfernoMetalBackend *backend, const InfernoMetalResourceBatchView *view,
+    const uint8_t *pipeline_record, bool vertex, uint32_t start, uint32_t count,
+    NSArray<id<MTLBinding>> *reflection, NSArray *libraries, NSArray *textures,
+    NSMutableArray *argument_layouts, MetalV5Failure *failure,
+    uint32_t draw_index)
+{
+    uint32_t library_offset =
+        vertex ? INFERNO_METAL_RESOURCE_RENDER_PIPELINE_VERTEX_LIBRARY_OFFSET :
+                 INFERNO_METAL_RESOURCE_RENDER_PIPELINE_FRAGMENT_LIBRARY_OFFSET;
+    size_t name_offset =
+        vertex ? INFERNO_METAL_RESOURCE_RENDER_PIPELINE_VERTEX_NAME_OFFSET :
+                 INFERNO_METAL_RESOURCE_RENDER_PIPELINE_FRAGMENT_NAME_OFFSET;
+    uint32_t function_type = vertex ? INFERNO_METAL_FUNCTION_TYPE_VERTEX :
+                                      INFERNO_METAL_FUNCTION_TYPE_FRAGMENT;
+    uint32_t library_index = ldl_le_p(pipeline_record + library_offset);
+    uint32_t buffer_total = 0;
+    uint32_t texture_total = 0;
+    uint32_t sampler_total = 0;
+
+    for (uint32_t i = 0; i < count; i++) {
+        const uint8_t *binding =
+            inferno_metal_resource_batch_binding(view, start + i);
+        uint32_t kind =
+            ldl_le_p(binding + INFERNO_METAL_RESOURCE_BINDING_KIND_OFFSET);
+        if (kind == INFERNO_METAL_RESOURCE_BINDING_BUFFER ||
+            kind == INFERNO_METAL_RESOURCE_BINDING_INLINE) {
+            buffer_total++;
+        } else if (kind == INFERNO_METAL_RESOURCE_BINDING_TEXTURE) {
+            texture_total++;
+        } else if (kind == INFERNO_METAL_RESOURCE_BINDING_SAMPLER) {
+            sampler_total++;
+        } else if (kind == INFERNO_METAL_RESOURCE_BINDING_ARGUMENT) {
+            uint32_t argument_index = ldl_le_p(
+                binding + INFERNO_METAL_RESOURCE_BINDING_RESOURCE_OFFSET);
+            if (!metal_v5_validate_argument_binding(
+                    backend, view, binding, argument_index, pipeline_record,
+                    name_offset, function_type,
+                    inferno_metal_resource_batch_library(view, library_index),
+                    [libraries objectAtIndex:library_index], reflection,
+                    textures, argument_layouts, &buffer_total, &texture_total,
+                    &sampler_total, failure)) {
+                return false;
+            }
+        }
+        if (buffer_total > 31 || texture_total > 31 || sampler_total > 16) {
+            metal_v5_fail(
+                failure, INFERNO_METAL_RESOURCE_OUTCOME_UNSUPPORTED_STATE,
+                INFERNO_METAL_BATCH_PHASE_VALIDATE,
+                INFERNO_METAL_RESOURCE_RECORD_DRAW, draw_index,
+                @"combined direct and argument resources exceed stage limits");
+            return false;
+        }
+    }
     return true;
 }
 
@@ -3398,9 +3558,14 @@ static bool metal_v5_prepare_arguments(
             uint64_t offset =
                 ldq_le_p(member + INFERNO_METAL_RESOURCE_MEMBER_OFFSET_OFFSET);
             if (kind == INFERNO_METAL_RESOURCE_ARGUMENT_MEMBER_BUFFER) {
-                [encoder setBuffer:[buffers objectAtIndex:resource]
-                            offset:(NSUInteger)offset
-                           atIndex:member_id];
+                bool is_null =
+                    ldl_le_p(member +
+                             INFERNO_METAL_RESOURCE_MEMBER_FLAGS_OFFSET) &
+                    INFERNO_METAL_RESOURCE_MEMBER_NULL;
+                [encoder
+                    setBuffer:is_null ? nil : [buffers objectAtIndex:resource]
+                       offset:is_null ? 0 : (NSUInteger)offset
+                      atIndex:member_id];
             } else if (kind == INFERNO_METAL_RESOURCE_ARGUMENT_MEMBER_TEXTURE) {
                 [encoder setTexture:[textures objectAtIndex:resource]
                             atIndex:member_id];
@@ -3512,6 +3677,10 @@ static void metal_v5_use_compute_resources(
                 kind != INFERNO_METAL_RESOURCE_ARGUMENT_MEMBER_TEXTURE) {
                 continue;
             }
+            if (ldl_le_p(member + INFERNO_METAL_RESOURCE_MEMBER_FLAGS_OFFSET) &
+                INFERNO_METAL_RESOURCE_MEMBER_NULL) {
+                continue;
+            }
             uint32_t member_id =
                 ldl_le_p(member + INFERNO_METAL_RESOURCE_MEMBER_ID_OFFSET);
             uint32_t resource = ldl_le_p(
@@ -3557,7 +3726,8 @@ static void
 metal_v5_set_render_bindings(id<MTLRenderCommandEncoder> encoder, bool vertex,
                              const InfernoMetalResourceBatchView *view,
                              uint32_t start, uint32_t count, NSArray *buffers,
-                             NSArray *textures, NSArray *samplers)
+                             NSArray *textures, NSArray *samplers,
+                             NSArray *argument_backings)
 {
     for (uint32_t i = 0; i < count; i++) {
         const uint8_t *b =
@@ -3597,7 +3767,7 @@ metal_v5_set_render_bindings(id<MTLRenderCommandEncoder> encoder, bool vertex,
                 [encoder setFragmentTexture:[textures objectAtIndex:resource]
                                     atIndex:index];
             }
-        } else {
+        } else if (kind == INFERNO_METAL_RESOURCE_BINDING_SAMPLER) {
             if (vertex) {
                 [encoder setVertexSamplerState:[samplers objectAtIndex:resource]
                                        atIndex:index];
@@ -3606,7 +3776,144 @@ metal_v5_set_render_bindings(id<MTLRenderCommandEncoder> encoder, bool vertex,
                     setFragmentSamplerState:[samplers objectAtIndex:resource]
                                     atIndex:index];
             }
+        } else {
+            id<MTLBuffer> backing = [argument_backings objectAtIndex:resource];
+            if (vertex) {
+                [encoder setVertexBuffer:backing offset:0 atIndex:index];
+            } else {
+                [encoder setFragmentBuffer:backing offset:0 atIndex:index];
+            }
         }
+    }
+}
+
+static void metal_v7_merge_render_resource(NSMutableArray *resources,
+                                           NSMutableArray *usages,
+                                           NSMutableArray *stages, id resource,
+                                           MTLResourceUsage usage,
+                                           MTLRenderStages stage)
+{
+    for (NSUInteger i = 0; i < [resources count]; i++) {
+        if ([resources objectAtIndex:i] == resource) {
+            usages[i] = @([usages[i] unsignedIntegerValue] | usage);
+            stages[i] = @([stages[i] unsignedIntegerValue] | stage);
+            return;
+        }
+    }
+    [resources addObject:resource];
+    [usages addObject:@(usage)];
+    [stages addObject:@(stage)];
+}
+
+static void metal_v7_collect_render_argument_resources(
+    const InfernoMetalResourceBatchView *view, uint32_t start, uint32_t count,
+    MTLRenderStages stage, NSArray *argument_layouts, NSArray *buffers,
+    NSArray *textures, NSMutableArray *resources, NSMutableArray *usages,
+    NSMutableArray *stages)
+{
+    for (uint32_t i = 0; i < count; i++) {
+        const uint8_t *binding =
+            inferno_metal_resource_batch_binding(view, start + i);
+        if (ldl_le_p(binding + INFERNO_METAL_RESOURCE_BINDING_KIND_OFFSET) !=
+            INFERNO_METAL_RESOURCE_BINDING_ARGUMENT) {
+            continue;
+        }
+        uint32_t argument_index =
+            ldl_le_p(binding + INFERNO_METAL_RESOURCE_BINDING_RESOURCE_OFFSET);
+        const uint8_t *argument =
+            inferno_metal_resource_batch_argument(view, argument_index);
+        NSArray *descriptors =
+            [argument_layouts objectAtIndex:argument_index][@"members"];
+        uint32_t member_start = ldl_le_p(
+            argument + INFERNO_METAL_RESOURCE_ARGUMENT_MEMBER_START_OFFSET);
+        uint32_t member_count = ldl_le_p(
+            argument + INFERNO_METAL_RESOURCE_ARGUMENT_MEMBER_COUNT_OFFSET);
+        for (uint32_t j = 0; j < member_count; j++) {
+            const uint8_t *member =
+                inferno_metal_resource_batch_member(view, member_start + j);
+            uint32_t kind =
+                ldl_le_p(member + INFERNO_METAL_RESOURCE_MEMBER_KIND_OFFSET);
+            if ((kind != INFERNO_METAL_RESOURCE_ARGUMENT_MEMBER_BUFFER &&
+                 kind != INFERNO_METAL_RESOURCE_ARGUMENT_MEMBER_TEXTURE) ||
+                (ldl_le_p(member + INFERNO_METAL_RESOURCE_MEMBER_FLAGS_OFFSET) &
+                 INFERNO_METAL_RESOURCE_MEMBER_NULL)) {
+                continue;
+            }
+            uint32_t member_id =
+                ldl_le_p(member + INFERNO_METAL_RESOURCE_MEMBER_ID_OFFSET);
+            uint32_t resource = ldl_le_p(
+                member + INFERNO_METAL_RESOURCE_MEMBER_RESOURCE_OFFSET);
+            NSDictionary *descriptor =
+                metal_v5_argument_member_for_id(descriptors, member_id);
+            MTLResourceUsage usage = MTLResourceUsageRead;
+            if ([descriptor[@"access"] unsignedIntValue] !=
+                MTLBindingAccessReadOnly) {
+                usage |= MTLResourceUsageWrite;
+            }
+            metal_v7_merge_render_resource(
+                resources, usages, stages,
+                kind == INFERNO_METAL_RESOURCE_ARGUMENT_MEMBER_BUFFER ?
+                    [buffers objectAtIndex:resource] :
+                    [textures objectAtIndex:resource],
+                usage, stage);
+        }
+    }
+}
+
+static void
+metal_v7_use_render_resources(id<MTLRenderCommandEncoder> encoder,
+                              const InfernoMetalResourceBatchView *view,
+                              const uint8_t *draw, NSArray *argument_layouts,
+                              NSArray *buffers, NSArray *textures)
+{
+    NSMutableArray *resources = [NSMutableArray array];
+    NSMutableArray *usages = [NSMutableArray array];
+    NSMutableArray *stages = [NSMutableArray array];
+    uint32_t vertex_start = ldl_le_p(
+        draw + INFERNO_METAL_RESOURCE_DRAW_VERTEX_BINDING_START_OFFSET);
+    uint32_t vertex_count = ldl_le_p(
+        draw + INFERNO_METAL_RESOURCE_DRAW_VERTEX_BINDING_COUNT_OFFSET);
+    uint32_t fragment_start = ldl_le_p(
+        draw + INFERNO_METAL_RESOURCE_DRAW_FRAGMENT_BINDING_START_OFFSET);
+    uint32_t fragment_count = ldl_le_p(
+        draw + INFERNO_METAL_RESOURCE_DRAW_FRAGMENT_BINDING_COUNT_OFFSET);
+    metal_v7_collect_render_argument_resources(
+        view, vertex_start, vertex_count, MTLRenderStageVertex,
+        argument_layouts, buffers, textures, resources, usages, stages);
+    metal_v7_collect_render_argument_resources(
+        view, fragment_start, fragment_count, MTLRenderStageFragment,
+        argument_layouts, buffers, textures, resources, usages, stages);
+    uint32_t declaration_start =
+        ldl_le_p(draw + INFERNO_METAL_RESOURCE_DRAW_DECLARATION_START_OFFSET);
+    uint32_t declaration_count =
+        ldl_le_p(draw + INFERNO_METAL_RESOURCE_DRAW_DECLARATION_COUNT_OFFSET);
+    for (uint32_t i = 0; i < declaration_count; i++) {
+        const uint8_t *declaration = inferno_metal_resource_batch_declaration(
+            view, declaration_start + i);
+        uint32_t kind =
+            ldl_le_p(declaration +
+                     INFERNO_METAL_RESOURCE_DECLARATION_RESOURCE_KIND_OFFSET);
+        uint32_t resource = ldl_le_p(
+            declaration + INFERNO_METAL_RESOURCE_DECLARATION_RESOURCE_OFFSET);
+        MTLResourceUsage usage = (MTLResourceUsage)ldl_le_p(
+            declaration + INFERNO_METAL_RESOURCE_DECLARATION_USAGE_OFFSET);
+        uint32_t wire_stage = ldl_le_p(
+            declaration + INFERNO_METAL_RESOURCE_DECLARATION_STAGES_OFFSET);
+        MTLRenderStages stage =
+            wire_stage == INFERNO_METAL_RESOURCE_STAGE_VERTEX ?
+                MTLRenderStageVertex :
+                MTLRenderStageFragment;
+        metal_v7_merge_render_resource(
+            resources, usages, stages,
+            kind == INFERNO_METAL_RESOURCE_DECLARATION_BUFFER ?
+                [buffers objectAtIndex:resource] :
+                [textures objectAtIndex:resource],
+            usage, stage);
+    }
+    for (NSUInteger i = 0; i < [resources count]; i++) {
+        [encoder useResource:[resources objectAtIndex:i]
+                       usage:[usages[i] unsignedIntegerValue]
+                      stages:[stages[i] unsignedIntegerValue]];
     }
 }
 
@@ -3951,8 +4258,15 @@ bool inferno_metal_backend_resource_batch(InfernoMetalBackend *backend,
                         [[compute_reflections objectAtIndex:pipeline_index]
                             bindings],
                         &failure, INFERNO_METAL_BATCH_RECORD_BINDING, 0) ||
-                    !metal_v5_validate_declarations(&view, command, textures,
-                                                    &failure)) {
+                    !metal_v5_validate_declarations(
+                        &view,
+                        ldl_le_p(
+                            command +
+                            INFERNO_METAL_RESOURCE_COMMAND_COMPUTE_DECLARATION_START_OFFSET),
+                        ldl_le_p(
+                            command +
+                            INFERNO_METAL_RESOURCE_COMMAND_COMPUTE_DECLARATION_COUNT_OFFSET),
+                        textures, &failure)) {
                     return metal_v5_batch_finish(c, output, &view, &failure,
                                                  false);
                 }
@@ -3964,7 +4278,8 @@ bool inferno_metal_backend_resource_batch(InfernoMetalBackend *backend,
                         inferno_metal_resource_batch_binding(&view, start + j);
                     uint32_t binding_kind = ldl_le_p(
                         binding + INFERNO_METAL_RESOURCE_BINDING_KIND_OFFSET);
-                    if (binding_kind == INFERNO_METAL_RESOURCE_BINDING_BUFFER) {
+                    if (binding_kind == INFERNO_METAL_RESOURCE_BINDING_BUFFER ||
+                        binding_kind == INFERNO_METAL_RESOURCE_BINDING_INLINE) {
                         buffer_total++;
                     } else if (binding_kind ==
                                INFERNO_METAL_RESOURCE_BINDING_TEXTURE) {
@@ -3986,11 +4301,13 @@ bool inferno_metal_backend_resource_batch(InfernoMetalBackend *backend,
                         if (!metal_v5_validate_argument_binding(
                                 backend, &view, binding, argument_index,
                                 pipeline_record,
+                                INFERNO_METAL_RESOURCE_COMPUTE_PIPELINE_NAME_OFFSET,
+                                INFERNO_METAL_FUNCTION_TYPE_KERNEL,
                                 inferno_metal_resource_batch_library(
                                     &view, library_index),
                                 [libraries objectAtIndex:library_index],
-                                [compute_reflections
-                                    objectAtIndex:pipeline_index],
+                                [[compute_reflections
+                                    objectAtIndex:pipeline_index] bindings],
                                 textures, argument_layouts, &buffer_total,
                                 &texture_total, &sampler_total, &failure)) {
                             return metal_v5_batch_finish(c, output, &view,
@@ -4078,6 +4395,28 @@ bool inferno_metal_backend_resource_batch(InfernoMetalBackend *backend,
                             &view, fragment_start, fragment_count,
                             [reflection fragmentBindings], &failure,
                             INFERNO_METAL_RESOURCE_RECORD_DRAW, draw_index)) {
+                        return metal_v5_batch_finish(c, output, &view, &failure,
+                                                     false);
+                    }
+                    if (!metal_v7_validate_render_stage_arguments(
+                            backend, &view, pipeline_record, true, vertex_start,
+                            vertex_count, [reflection vertexBindings],
+                            libraries, textures, argument_layouts, &failure,
+                            draw_index) ||
+                        !metal_v7_validate_render_stage_arguments(
+                            backend, &view, pipeline_record, false,
+                            fragment_start, fragment_count,
+                            [reflection fragmentBindings], libraries, textures,
+                            argument_layouts, &failure, draw_index) ||
+                        !metal_v5_validate_declarations(
+                            &view,
+                            ldl_le_p(
+                                draw +
+                                INFERNO_METAL_RESOURCE_DRAW_DECLARATION_START_OFFSET),
+                            ldl_le_p(
+                                draw +
+                                INFERNO_METAL_RESOURCE_DRAW_DECLARATION_COUNT_OFFSET),
+                            textures, &failure)) {
                         return metal_v5_batch_finish(c, output, &view, &failure,
                                                      false);
                     }
@@ -4273,12 +4612,15 @@ bool inferno_metal_backend_resource_batch(InfernoMetalBackend *backend,
                         [encoder setVertexSamplerState:nil atIndex:slot];
                         [encoder setFragmentSamplerState:nil atIndex:slot];
                     }
-                    metal_v5_set_render_bindings(encoder, true, &view,
-                                                 vertex_start, vertex_count,
-                                                 buffers, textures, samplers);
-                    metal_v5_set_render_bindings(encoder, false, &view,
-                                                 fragment_start, fragment_count,
-                                                 buffers, textures, samplers);
+                    metal_v5_set_render_bindings(
+                        encoder, true, &view, vertex_start, vertex_count,
+                        buffers, textures, samplers, argument_backings);
+                    metal_v5_set_render_bindings(
+                        encoder, false, &view, fragment_start, fragment_count,
+                        buffers, textures, samplers, argument_backings);
+                    metal_v7_use_render_resources(encoder, &view, draw,
+                                                  argument_layouts, buffers,
+                                                  textures);
                     [encoder
                         setCullMode:
                             ldl_le_p(

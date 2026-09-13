@@ -15,9 +15,13 @@
  * along with this program. If not, see <https://www.gnu.org/licenses/>.
  */
 #import "InfernoMetalRenderCommandEncoder.h"
+#import "InfernoMetalArgumentObjects.h"
 #import "InfernoMetalBuffer.h"
 #import "InfernoMetalCommandBuffer.h"
+#import "InfernoMetalCompilerContext.h"
 #import "InfernoMetalErrors.h"
+#import "InfernoMetalFunction.h"
+#import "InfernoMetalLibrary.h"
 #import "InfernoMetalRenderPipelineState.h"
 #import "InfernoMetalSamplerState.h"
 #import "InfernoMetalTexture.h"
@@ -42,6 +46,8 @@
 @property(nonatomic, strong) NSMutableArray *fragmentBufferSlots;
 @property(nonatomic, strong) NSMutableArray *fragmentTextureSlots;
 @property(nonatomic, strong) NSMutableArray *fragmentSamplerSlots;
+@property(nonatomic, strong)
+    NSMutableArray<InfernoMetalResourceDeclaration *> *resourceDeclarations;
 @property(nonatomic, copy, nullable) NSString *storedLabel;
 @property(nonatomic) MTLCullMode cullMode;
 @property(nonatomic) MTLWinding winding;
@@ -125,6 +131,7 @@ static BOOL finiteColor(MTLClearColor color)
     _fragmentTextureSlots = [NSMutableArray arrayWithCapacity:31];
     _vertexSamplerSlots = [NSMutableArray arrayWithCapacity:16];
     _fragmentSamplerSlots = [NSMutableArray arrayWithCapacity:16];
+    _resourceDeclarations = [NSMutableArray array];
     for (NSUInteger i = 0; i < 31; i++) {
         [_vertexBufferSlots addObject:[NSNull null]];
         [_vertexTextureSlots addObject:[NSNull null]];
@@ -200,6 +207,7 @@ static BOOL finiteColor(MTLClearColor color)
     InfernoMetalCommandBuffer *buffer = _commandBuffer;
     _ended = YES;
     _commandBuffer = nil;
+    [_resourceDeclarations removeAllObjects];
     [buffer infernoEncoderEnded:self];
 }
 - (NSUInteger)tileWidth
@@ -476,14 +484,122 @@ STAGE_METHODS(Fragment, _fragmentBufferSlots, _fragmentTextureSlots,
                 renderInvalid(
                     @"A render attachment cannot be sampled in the same pass");
         }
+    NSArray * (^captureBuffers)(NSArray *, InfernoMetalFunction *,
+                                NSUInteger *) =
+        ^NSArray *(NSArray *slots, InfernoMetalFunction *function,
+                   NSUInteger *bufferEntries) {
+          NSMutableArray *captured = [slots mutableCopy];
+          for (NSUInteger index = 0; index < captured.count; index++) {
+              id slot = captured[index];
+              if (![slot isKindOfClass:[NSDictionary class]])
+                  continue;
+              if ([slot[@"kind"] unsignedIntValue] ==
+                  INFERNO_METAL_RESOURCE_BINDING_INLINE) {
+                  (*bufferEntries)++;
+                  continue;
+              }
+              if ([slot[@"kind"] unsignedIntValue] !=
+                  INFERNO_METAL_RESOURCE_BINDING_BUFFER)
+                  continue;
+              InfernoMetalBuffer *buffer = slot[@"buffer"];
+              NSUInteger offset = [slot[@"offset"] unsignedIntegerValue];
+              InfernoMetalArgumentLayoutKey *key =
+                  [[InfernoMetalArgumentLayoutKey alloc]
+                      initWithPayload:function.infernoLibrary.infernoPayload
+                                 kind:function.infernoLibrary.infernoLibraryKind
+                                 name:function.name
+                         functionType:function.functionType
+                          bufferIndex:index];
+              InfernoMetalEncodedArgument *argument =
+                  [buffer infernoSnapshotArgumentAtOffset:offset
+                                              matchingKey:key];
+              if (argument) {
+                  captured[index] = argument;
+                  for (InfernoMetalEncodedArgumentMember *member in argument
+                           .members)
+                      *bufferEntries +=
+                          member.layout.record.kind ==
+                          INFERNO_METAL_RESOURCE_ARGUMENT_MEMBER_BUFFER;
+              } else if ([_commandBuffer.infernoContext
+                             cachedArgumentLayoutForKey:key]) {
+                  renderInvalid(
+                      @"The selected argument backing has never been encoded");
+              } else {
+                  (*bufferEntries)++;
+              }
+          }
+          return [captured copy];
+        };
+    NSUInteger vertexBuffers = 0, vertexTextures = 0, vertexSamplers = 0;
+    NSUInteger fragmentBuffers = 0, fragmentTextures = 0, fragmentSamplers = 0;
+    NSArray *vertexBindings = captureBuffers(
+        _vertexBufferSlots, _pipeline.infernoVertexFunction, &vertexBuffers);
+    NSArray *fragmentBindings =
+        captureBuffers(_fragmentBufferSlots, _pipeline.infernoFragmentFunction,
+                       &fragmentBuffers);
+    for (NSArray *bindings in @[ vertexBindings, fragmentBindings ])
+        for (id slot in bindings)
+            if ([slot isKindOfClass:[InfernoMetalEncodedArgument class]])
+                for (InfernoMetalEncodedArgumentMember *member in (
+                         (InfernoMetalEncodedArgument *)slot)
+                         .members)
+                    if (member.layout.record.kind ==
+                            INFERNO_METAL_RESOURCE_ARGUMENT_MEMBER_TEXTURE &&
+                        member.resource == _storedPass.attachment)
+                        renderInvalid(@"A render attachment cannot be sampled "
+                                      @"in the same pass");
+    for (id slot in _vertexTextureSlots)
+        vertexTextures += slot != [NSNull null];
+    for (id slot in _fragmentTextureSlots)
+        fragmentTextures += slot != [NSNull null];
+    for (id slot in _vertexSamplerSlots)
+        vertexSamplers += slot != [NSNull null];
+    for (id slot in _fragmentSamplerSlots)
+        fragmentSamplers += slot != [NSNull null];
+    for (id slot in vertexBindings)
+        if ([slot isKindOfClass:[InfernoMetalEncodedArgument class]])
+            for (InfernoMetalEncodedArgumentMember *member in (
+                     (InfernoMetalEncodedArgument *)slot)
+                     .members) {
+                vertexTextures +=
+                    member.layout.record.kind ==
+                    INFERNO_METAL_RESOURCE_ARGUMENT_MEMBER_TEXTURE;
+                vertexSamplers +=
+                    member.layout.record.kind ==
+                    INFERNO_METAL_RESOURCE_ARGUMENT_MEMBER_SAMPLER;
+            }
+    for (id slot in fragmentBindings)
+        if ([slot isKindOfClass:[InfernoMetalEncodedArgument class]])
+            for (InfernoMetalEncodedArgumentMember *member in (
+                     (InfernoMetalEncodedArgument *)slot)
+                     .members) {
+                fragmentTextures +=
+                    member.layout.record.kind ==
+                    INFERNO_METAL_RESOURCE_ARGUMENT_MEMBER_TEXTURE;
+                fragmentSamplers +=
+                    member.layout.record.kind ==
+                    INFERNO_METAL_RESOURCE_ARGUMENT_MEMBER_SAMPLER;
+            }
+    if (vertexBuffers > 31 || vertexTextures > 31 || vertexSamplers > 16 ||
+        fragmentBuffers > 31 || fragmentTextures > 31 || fragmentSamplers > 16)
+        renderInvalid(@"The draw exceeds combined argument resource limits");
     InfernoMetalEncodedDraw *draw = [[InfernoMetalEncodedDraw alloc] init];
     draw.pipeline = _pipeline;
-    draw.vertexBindings = [_vertexBufferSlots copy];
+    draw.vertexBindings = vertexBindings;
     draw.vertexTextureBindings = [_vertexTextureSlots copy];
     draw.vertexSamplerBindings = [_vertexSamplerSlots copy];
-    draw.fragmentBindings = [_fragmentBufferSlots copy];
+    draw.fragmentBindings = fragmentBindings;
     draw.fragmentTextureBindings = [_fragmentTextureSlots copy];
     draw.fragmentSamplerBindings = [_fragmentSamplerSlots copy];
+    NSMutableArray *capturedDeclarations =
+        [NSMutableArray arrayWithCapacity:_resourceDeclarations.count];
+    for (InfernoMetalResourceDeclaration *declaration in _resourceDeclarations)
+        [capturedDeclarations
+            addObject:[[InfernoMetalResourceDeclaration alloc]
+                          initWithResource:declaration.resource
+                               vertexUsage:declaration.vertexUsage
+                             fragmentUsage:declaration.fragmentUsage]];
+    draw.resourceDeclarations = [capturedDeclarations copy];
     draw.primitiveType = type;
     draw.vertexStart = start;
     draw.vertexCount = count;
@@ -1532,19 +1648,54 @@ STAGE_METHODS(Fragment, _fragmentBufferSlots, _fragmentTextureSlots,
 - (void)useResource:(id<MTLResource> _Nonnull __strong)resource
               usage:(MTLResourceUsage)usage
 {
-    (void)resource;
-    (void)usage;
-    [self unsupported];
+    [self useResource:resource
+                usage:usage
+               stages:MTLRenderStageVertex | MTLRenderStageFragment];
 }
 
 - (void)useResource:(id<MTLResource> _Nonnull __strong)resource
               usage:(MTLResourceUsage)usage
              stages:(MTLRenderStages)stages
 {
-    (void)resource;
-    (void)usage;
-    (void)stages;
-    [self unsupported];
+    [self requireActive];
+    MTLResourceUsage sample = (MTLResourceUsage)(1UL << 2);
+    MTLResourceUsage allowedUsage =
+        MTLResourceUsageRead | MTLResourceUsageWrite | sample;
+    MTLRenderStages allowedStages =
+        MTLRenderStageVertex | MTLRenderStageFragment;
+    if (!resource || !(usage & allowedUsage) || (usage & ~allowedUsage) ||
+        !(stages & allowedStages) || (stages & ~allowedStages) ||
+        (![resource isKindOfClass:[InfernoMetalBuffer class]] &&
+         ![resource isKindOfClass:[InfernoMetalTexture class]]) ||
+        (([resource isKindOfClass:[InfernoMetalBuffer class]] ?
+              ((InfernoMetalBuffer *)resource).infernoContext :
+              ((InfernoMetalTexture *)resource).infernoContext) !=
+         _commandBuffer.infernoContext))
+        renderInvalid(@"The declared resource, usage, or stages are invalid");
+    uint32_t normalized = 0;
+    if (usage & (MTLResourceUsageRead | sample))
+        normalized |= INFERNO_METAL_RESOURCE_USAGE_READ;
+    if (usage & MTLResourceUsageWrite)
+        normalized |= INFERNO_METAL_RESOURCE_USAGE_WRITE;
+    for (InfernoMetalResourceDeclaration
+             *declaration in _resourceDeclarations) {
+        if (declaration.resource == resource) {
+            if (stages & MTLRenderStageVertex)
+                declaration.vertexUsage |= normalized;
+            if (stages & MTLRenderStageFragment)
+                declaration.fragmentUsage |= normalized;
+            return;
+        }
+    }
+    [_resourceDeclarations
+        addObject:[[InfernoMetalResourceDeclaration alloc]
+                      initWithResource:resource
+                           vertexUsage:(stages & MTLRenderStageVertex) ?
+                                           normalized :
+                                           0
+                         fragmentUsage:(stages & MTLRenderStageFragment) ?
+                                           normalized :
+                                           0]];
 }
 
 - (void)useResources:
@@ -1553,10 +1704,10 @@ STAGE_METHODS(Fragment, _fragmentBufferSlots, _fragmentTextureSlots,
                count:(NSUInteger)count
                usage:(MTLResourceUsage)usage
 {
-    (void)resources;
-    (void)count;
-    (void)usage;
-    [self unsupported];
+    [self useResources:resources
+                 count:count
+                 usage:usage
+                stages:MTLRenderStageVertex | MTLRenderStageFragment];
 }
 
 - (void)useResources:
@@ -1566,11 +1717,30 @@ STAGE_METHODS(Fragment, _fragmentBufferSlots, _fragmentTextureSlots,
                usage:(MTLResourceUsage)usage
               stages:(MTLRenderStages)stages
 {
-    (void)resources;
-    (void)count;
-    (void)usage;
-    (void)stages;
-    [self unsupported];
+    [self requireActive];
+    MTLResourceUsage sample = (MTLResourceUsage)(1UL << 2);
+    MTLResourceUsage allowedUsage =
+        MTLResourceUsageRead | MTLResourceUsageWrite | sample;
+    MTLRenderStages allowedStages =
+        MTLRenderStageVertex | MTLRenderStageFragment;
+    if ((!resources && count) || !(usage & allowedUsage) ||
+        (usage & ~allowedUsage) || !(stages & allowedStages) ||
+        (stages & ~allowedStages))
+        renderInvalid(
+            @"The declared resource array, usage, or stages are invalid");
+    for (NSUInteger i = 0; i < count; i++) {
+        id resource = resources[i];
+        if (!resource ||
+            (![resource isKindOfClass:[InfernoMetalBuffer class]] &&
+             ![resource isKindOfClass:[InfernoMetalTexture class]]) ||
+            (([resource isKindOfClass:[InfernoMetalBuffer class]] ?
+                  ((InfernoMetalBuffer *)resource).infernoContext :
+                  ((InfernoMetalTexture *)resource).infernoContext) !=
+             _commandBuffer.infernoContext))
+            renderInvalid(@"A declared resource is invalid");
+    }
+    for (NSUInteger i = 0; i < count; i++)
+        [self useResource:resources[i] usage:usage stages:stages];
 }
 
 - (void)waitForFence:(id<MTLFence> _Nonnull __strong)fence

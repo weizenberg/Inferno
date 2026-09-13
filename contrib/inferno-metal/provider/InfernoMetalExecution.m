@@ -280,6 +280,31 @@ static void addUsage(NSMapTable *usages, id resource, uint32_t usage)
     [usages setObject:@(old.unsignedIntValue | usage) forKey:resource];
 }
 
+static void collectArgumentUsages(
+    NSArray *slots,
+    NSMutableArray<InfernoMetalEncodedArgument *> *argumentObjects,
+    NSMapTable *effectiveUsages, uint64_t *memberCount)
+{
+    for (id slot in slots) {
+        if (![slot isKindOfClass:[InfernoMetalEncodedArgument class]])
+            continue;
+        InfernoMetalEncodedArgument *argument = slot;
+        if (identicalIndex(argumentObjects, argument) == NSNotFound) {
+            [argumentObjects addObject:argument];
+            *memberCount += argument.members.count;
+        }
+        for (InfernoMetalEncodedArgumentMember *member in argument.members) {
+            if (!member.resource)
+                continue;
+            uint32_t usage =
+                member.layout.record.access == MTLBindingAccessReadOnly ?
+                    INFERNO_METAL_RESOURCE_USAGE_READ :
+                    INFERNO_METAL_RESOURCE_USAGE_WRITE;
+            addUsage(effectiveUsages, member.resource, usage);
+        }
+    }
+}
+
 static NSUInteger samplerIndex(NSArray<InfernoMetalSamplerState *> *samplers,
                                InfernoMetalSamplerState *sampler)
 {
@@ -315,13 +340,10 @@ static void appendBindings(ImtlBatchBinding *bindings, uint32_t *next,
 {
     for (NSUInteger index = 0; index < 31; index++) {
         id slot = bufferSlots[index];
+        InfernoMetalEncodedArgument *argument = nil;
         if (slot != [NSNull null]) {
             if ([slot isKindOfClass:[InfernoMetalEncodedArgument class]]) {
-                bindings[(*next)++] = (ImtlBatchBinding){
-                    .kind = INFERNO_METAL_RESOURCE_BINDING_ARGUMENT,
-                    .index = (uint32_t)index,
-                    .resource_id = (uint32_t)identicalIndex(arguments, slot),
-                };
+                argument = slot;
             } else {
                 uint32_t kind = [slot[@"kind"] unsignedIntValue];
                 ImtlBatchBinding binding = { .kind = kind, .index = index };
@@ -363,6 +385,13 @@ static void appendBindings(ImtlBatchBinding *bindings, uint32_t *next,
                         (uint32_t)samplerIndex(samplers, slot[@"sampler"]),
                 };
             }
+        }
+        if (argument) {
+            bindings[(*next)++] = (ImtlBatchBinding){
+                .kind = INFERNO_METAL_RESOURCE_BINDING_ARGUMENT,
+                .index = (uint32_t)index,
+                .resource_id = (uint32_t)identicalIndex(arguments, argument),
+            };
         }
     }
 }
@@ -408,24 +437,12 @@ static void appendBindings(ImtlBatchBinding *bindings, uint32_t *next,
             collectDeclarations(dispatch.resourceDeclarations, bufferObjects,
                                 textureObjects);
             declarationCountWide += dispatch.resourceDeclarations.count;
+            collectArgumentUsages(dispatch.bindings, argumentObjects,
+                                  effectiveUsages, &memberCountWide);
             for (id slot in dispatch.bindings) {
-                if ([slot isKindOfClass:[InfernoMetalEncodedArgument class]]) {
-                    InfernoMetalEncodedArgument *argument = slot;
-                    if (identicalIndex(argumentObjects, argument) == NSNotFound)
-                        [argumentObjects addObject:argument];
-                    memberCountWide += argument.members.count;
-                    for (InfernoMetalEncodedArgumentMember *member in argument
-                             .members) {
-                        uint32_t usage = member.layout.record.access ==
-                                                 MTLBindingAccessReadOnly ?
-                                             INFERNO_METAL_RESOURCE_USAGE_READ :
-                                             INFERNO_METAL_RESOURCE_USAGE_WRITE;
-                        if (member.resource)
-                            addUsage(effectiveUsages, member.resource, usage);
-                    }
-                } else if ([slot isKindOfClass:[NSDictionary class]] &&
-                           [slot[@"kind"] unsignedIntValue] ==
-                               INFERNO_METAL_RESOURCE_BINDING_BUFFER) {
+                if ([slot isKindOfClass:[NSDictionary class]] &&
+                    [slot[@"kind"] unsignedIntValue] ==
+                        INFERNO_METAL_RESOURCE_BINDING_BUFFER) {
                     addUsage(effectiveUsages, slot[@"buffer"],
                              INFERNO_METAL_RESOURCE_USAGE_WRITE);
                 }
@@ -467,6 +484,8 @@ static void appendBindings(ImtlBatchBinding *bindings, uint32_t *next,
                     draw.vertexBindings, draw.vertexTextureBindings,
                     draw.vertexSamplerBindings, bufferObjects, textureObjects,
                     samplerObjects);
+                collectArgumentUsages(draw.vertexBindings, argumentObjects,
+                                      effectiveUsages, &memberCountWide);
                 for (id slot in draw.vertexBindings) {
                     if ([slot isKindOfClass:[NSDictionary class]] &&
                         [slot[@"kind"] unsignedIntValue] ==
@@ -492,6 +511,18 @@ static void appendBindings(ImtlBatchBinding *bindings, uint32_t *next,
                     draw.fragmentBindings, draw.fragmentTextureBindings,
                     draw.fragmentSamplerBindings, bufferObjects, textureObjects,
                     samplerObjects);
+                collectArgumentUsages(draw.fragmentBindings, argumentObjects,
+                                      effectiveUsages, &memberCountWide);
+                collectDeclarations(draw.resourceDeclarations, bufferObjects,
+                                    textureObjects);
+                for (InfernoMetalResourceDeclaration *declaration in draw
+                         .resourceDeclarations) {
+                    declarationCountWide += declaration.vertexUsage != 0;
+                    declarationCountWide += declaration.fragmentUsage != 0;
+                    addUsage(effectiveUsages, declaration.resource,
+                             declaration.vertexUsage |
+                                 declaration.fragmentUsage);
+                }
                 bindingCountWide += bindingCountForSlots(
                     draw.vertexBindings, draw.vertexTextureBindings,
                     draw.vertexSamplerBindings);
@@ -656,9 +687,13 @@ static void appendBindings(ImtlBatchBinding *bindings, uint32_t *next,
                 .member_id = (uint32_t)member.memberIndex,
             };
             if (layout.kind == INFERNO_METAL_RESOURCE_ARGUMENT_MEMBER_BUFFER) {
-                wire.resource =
-                    (uint32_t)identicalIndex(bufferObjects, member.resource);
-                wire.offset = member.offset;
+                if (member.explicitlyNull) {
+                    wire.flags = INFERNO_METAL_RESOURCE_MEMBER_NULL;
+                } else {
+                    wire.resource = (uint32_t)identicalIndex(bufferObjects,
+                                                             member.resource);
+                    wire.offset = member.offset;
+                }
             } else if (layout.kind ==
                        INFERNO_METAL_RESOURCE_ARGUMENT_MEMBER_TEXTURE) {
                 wire.resource =
@@ -771,6 +806,68 @@ static void appendBindings(ImtlBatchBinding *bindings, uint32_t *next,
                                nil, draw.fragmentTextureBindings,
                                draw.fragmentSamplerBindings, argumentObjects,
                                bufferObjects, textureObjects, samplerObjects);
+                NSArray<InfernoMetalResourceDeclaration *>
+                    *orderedDeclarations = [draw.resourceDeclarations
+                        sortedArrayUsingComparator:^NSComparisonResult(
+                            InfernoMetalResourceDeclaration *a,
+                            InfernoMetalResourceDeclaration *b) {
+                          uint32_t ak =
+                              [a.resource
+                                  isKindOfClass:[InfernoMetalBuffer class]] ?
+                                  INFERNO_METAL_RESOURCE_DECLARATION_BUFFER :
+                                  INFERNO_METAL_RESOURCE_DECLARATION_TEXTURE;
+                          uint32_t bk =
+                              [b.resource
+                                  isKindOfClass:[InfernoMetalBuffer class]] ?
+                                  INFERNO_METAL_RESOURCE_DECLARATION_BUFFER :
+                                  INFERNO_METAL_RESOURCE_DECLARATION_TEXTURE;
+                          NSUInteger ai =
+                              ak == INFERNO_METAL_RESOURCE_DECLARATION_BUFFER ?
+                                  identicalIndex(bufferObjects, a.resource) :
+                                  identicalIndex(textureObjects, a.resource);
+                          NSUInteger bi =
+                              bk == INFERNO_METAL_RESOURCE_DECLARATION_BUFFER ?
+                                  identicalIndex(bufferObjects, b.resource) :
+                                  identicalIndex(textureObjects, b.resource);
+                          if (ak != bk)
+                              return ak < bk ? NSOrderedAscending :
+                                               NSOrderedDescending;
+                          if (ai == bi)
+                              return NSOrderedSame;
+                          return ai < bi ? NSOrderedAscending :
+                                           NSOrderedDescending;
+                        }];
+                uint32_t declarationStart = nextDeclaration;
+                for (InfernoMetalResourceDeclaration
+                         *declaration in orderedDeclarations) {
+                    BOOL isBuffer = [declaration.resource
+                        isKindOfClass:[InfernoMetalBuffer class]];
+                    uint32_t resource =
+                        (uint32_t)(isBuffer ?
+                                       identicalIndex(bufferObjects,
+                                                      declaration.resource) :
+                                       identicalIndex(textureObjects,
+                                                      declaration.resource));
+                    uint32_t kind =
+                        isBuffer ? INFERNO_METAL_RESOURCE_DECLARATION_BUFFER :
+                                   INFERNO_METAL_RESOURCE_DECLARATION_TEXTURE;
+                    if (declaration.vertexUsage)
+                        declarations[nextDeclaration++] =
+                            (ImtlBatch5ResourceDeclaration){
+                                .resource_kind = kind,
+                                .resource = resource,
+                                .usage = declaration.vertexUsage,
+                                .stages = INFERNO_METAL_RESOURCE_STAGE_VERTEX,
+                            };
+                    if (declaration.fragmentUsage)
+                        declarations[nextDeclaration++] =
+                            (ImtlBatch5ResourceDeclaration){
+                                .resource_kind = kind,
+                                .resource = resource,
+                                .usage = declaration.fragmentUsage,
+                                .stages = INFERNO_METAL_RESOURCE_STAGE_FRAGMENT,
+                            };
+                }
                 uint32_t flags = 0;
                 if (draw.hasScissor)
                     flags |= INFERNO_METAL_RESOURCE_DRAW_SCISSOR;
@@ -790,6 +887,8 @@ static void appendBindings(ImtlBatchBinding *bindings, uint32_t *next,
                     .vertex_binding_count = fragmentStart - vertexStart,
                     .fragment_binding_start = fragmentStart,
                     .fragment_binding_count = nextBinding - fragmentStart,
+                    .declaration_start = declarationStart,
+                    .declaration_count = nextDeclaration - declarationStart,
                     .cull_mode = (uint32_t)draw.cullMode,
                     .winding = (uint32_t)draw.winding,
                     .fill_mode = (uint32_t)draw.fillMode,

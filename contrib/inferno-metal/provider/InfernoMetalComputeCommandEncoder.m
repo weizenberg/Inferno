@@ -15,11 +15,11 @@
  * along with this program. If not, see <https://www.gnu.org/licenses/>.
  */
 
+#import "InfernoMetalComputeCommandEncoder.h"
 #import "InfernoMetalArgumentObjects.h"
 #import "InfernoMetalBuffer.h"
 #import "InfernoMetalCommandBuffer.h"
 #import "InfernoMetalCompilerContext.h"
-#import "InfernoMetalComputeCommandEncoder.h"
 #import "InfernoMetalComputePipelineState.h"
 #import "InfernoMetalErrors.h"
 #import "InfernoMetalFunction.h"
@@ -227,6 +227,11 @@ static BOOL dimensionsWithin(MTLSize value, uint64_t limit)
         id slot = capturedSlots[index];
         if (![slot isKindOfClass:[NSDictionary class]])
             continue;
+        if ([slot[@"kind"] unsignedIntValue] ==
+            INFERNO_METAL_RESOURCE_BINDING_INLINE) {
+            bufferEntries++;
+            continue;
+        }
         if ([slot[@"kind"] unsignedIntValue] !=
             INFERNO_METAL_RESOURCE_BINDING_BUFFER)
             continue;
@@ -237,6 +242,7 @@ static BOOL dimensionsWithin(MTLSize value, uint64_t limit)
                 initWithPayload:function.infernoLibrary.infernoPayload
                            kind:function.infernoLibrary.infernoLibraryKind
                            name:function.name
+                   functionType:function.functionType
                     bufferIndex:index];
         InfernoMetalEncodedArgument *argument =
             [buffer infernoSnapshotArgumentAtOffset:offset matchingKey:key];

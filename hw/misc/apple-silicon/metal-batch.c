@@ -751,12 +751,14 @@ static bool validSampler(const uint8_t *record)
             min_filter == mag_filter && anisotropy == 1);
 }
 
-static bool validResourceBindings(
-    const InfernoMetalResourceBatchView *view, uint32_t start, uint32_t count,
-    uint32_t allowed_kinds, uint32_t *expected_inline, bool *referenced_buffers,
-    bool *referenced_textures, bool *referenced_samplers,
-    bool *referenced_arguments, uint32_t forbidden_texture,
-    uint32_t compute_pipeline, InfernoMetalBatchParseError *error)
+static bool
+validResourceBindings(const InfernoMetalResourceBatchView *view, uint32_t start,
+                      uint32_t count, uint32_t allowed_kinds,
+                      uint32_t *expected_inline, bool *referenced_buffers,
+                      bool *referenced_textures, bool *referenced_samplers,
+                      bool *referenced_arguments, uint32_t forbidden_texture,
+                      uint32_t argument_library, const uint8_t *argument_name,
+                      InfernoMetalBatchParseError *error)
 {
     uint32_t prior_index = 0, prior_kind = 0;
     bool have_prior = false;
@@ -838,16 +840,10 @@ static bool validResourceBindings(
             }
         } else if (kind == INFERNO_METAL_RESOURCE_BINDING_ARGUMENT) {
             valid = valid && resource < view->argument_count && !length &&
-                    !offset && compute_pipeline < view->compute_pipeline_count;
+                    !offset && argument_name;
             if (valid) {
                 const uint8_t *argument =
                     inferno_metal_resource_batch_argument(view, resource);
-                const uint8_t *pipeline =
-                    inferno_metal_resource_batch_compute_pipeline(
-                        view, compute_pipeline);
-                uint32_t library = get32(
-                    pipeline +
-                    INFERNO_METAL_RESOURCE_COMPUTE_PIPELINE_LIBRARY_OFFSET);
                 valid =
                     get32(
                         argument +
@@ -855,12 +851,31 @@ static bool validResourceBindings(
                         index &&
                     get32(argument +
                           INFERNO_METAL_RESOURCE_ARGUMENT_LIBRARY_OFFSET) ==
-                        library &&
-                    !memcmp(
-                        argument + INFERNO_METAL_RESOURCE_ARGUMENT_NAME_OFFSET,
-                        pipeline +
-                            INFERNO_METAL_RESOURCE_COMPUTE_PIPELINE_NAME_OFFSET,
-                        INFERNO_METAL_RESOURCE_FUNCTION_NAME_SIZE);
+                        argument_library &&
+                    !memcmp(argument +
+                                INFERNO_METAL_RESOURCE_ARGUMENT_NAME_OFFSET,
+                            argument_name,
+                            INFERNO_METAL_RESOURCE_FUNCTION_NAME_SIZE);
+                uint32_t member_start =
+                    get32(argument +
+                          INFERNO_METAL_RESOURCE_ARGUMENT_MEMBER_START_OFFSET);
+                uint32_t member_count =
+                    get32(argument +
+                          INFERNO_METAL_RESOURCE_ARGUMENT_MEMBER_COUNT_OFFSET);
+                for (uint32_t j = 0; valid && forbidden_texture != UINT32_MAX &&
+                                     j < member_count;
+                     j++) {
+                    const uint8_t *member = inferno_metal_resource_batch_member(
+                        view, member_start + j);
+                    if (get32(member +
+                              INFERNO_METAL_RESOURCE_MEMBER_KIND_OFFSET) ==
+                            INFERNO_METAL_RESOURCE_ARGUMENT_MEMBER_TEXTURE &&
+                        get32(member +
+                              INFERNO_METAL_RESOURCE_MEMBER_RESOURCE_OFFSET) ==
+                            forbidden_texture) {
+                        valid = false;
+                    }
+                }
             }
             if (valid) {
                 referenced_arguments[resource] = true;
@@ -1275,30 +1290,37 @@ bool inferno_metal_resource_batch_parse(const void *opaque, size_t size,
                 get32(member + INFERNO_METAL_RESOURCE_MEMBER_LENGTH_OFFSET);
             uint64_t member_offset =
                 get64(member + INFERNO_METAL_RESOURCE_MEMBER_OFFSET_OFFSET);
+            uint32_t flags =
+                get32(member + INFERNO_METAL_RESOURCE_MEMBER_FLAGS_OFFSET);
             bool valid =
                 (!j || id > prior_id) &&
-                !get64(member + INFERNO_METAL_RESOURCE_MEMBER_RESERVED_OFFSET);
+                !(flags & ~INFERNO_METAL_RESOURCE_MEMBER_FLAG_MASK) &&
+                allZero(member + INFERNO_METAL_RESOURCE_MEMBER_RESERVED_OFFSET,
+                        INFERNO_METAL_RESOURCE_MEMBER_RESERVED_SIZE);
             if (kind == INFERNO_METAL_RESOURCE_ARGUMENT_MEMBER_BUFFER) {
-                valid = valid && resource < view.buffer_count && !length;
-                if (valid) {
+                bool is_null = flags & INFERNO_METAL_RESOURCE_MEMBER_NULL;
+                valid = valid && !length &&
+                        (is_null ? (!resource && !member_offset) :
+                                   resource < view.buffer_count);
+                if (valid && !is_null) {
                     uint32_t buffer_length = get32(
                         inferno_metal_resource_batch_buffer(&view, resource) +
                         INFERNO_METAL_RESOURCE_BUFFER_LENGTH_OFFSET);
                     valid = member_offset < buffer_length;
                 }
-                if (valid) {
+                if (valid && !is_null) {
                     referenced_buffers[resource] = true;
                 }
             } else if (kind == INFERNO_METAL_RESOURCE_ARGUMENT_MEMBER_TEXTURE) {
-                valid = valid && resource < view.texture_count && !length &&
-                        !member_offset;
+                valid = valid && !flags && resource < view.texture_count &&
+                        !length && !member_offset;
                 if (valid) {
                     referenced_textures[resource] = true;
                 }
             } else if (kind == INFERNO_METAL_RESOURCE_ARGUMENT_MEMBER_SAMPLER) {
                 valid =
-                    valid && resource < view.sampler_count && !length &&
-                    !member_offset &&
+                    valid && !flags && resource < view.sampler_count &&
+                    !length && !member_offset &&
                     get32(
                         inferno_metal_resource_batch_sampler(&view, resource) +
                         INFERNO_METAL_RESOURCE_SAMPLER_SUPPORT_ARGUMENT_BUFFERS_OFFSET);
@@ -1307,7 +1329,8 @@ bool inferno_metal_resource_batch_parse(const void *opaque, size_t size,
                 }
             } else if (kind ==
                        INFERNO_METAL_RESOURCE_ARGUMENT_MEMBER_CONSTANT) {
-                valid = valid && resource == expected_constant && length &&
+                valid = valid && !flags && resource == expected_constant &&
+                        length &&
                         length <= INFERNO_METAL_ARGUMENT_MAX_CONSTANT &&
                         !member_offset && resource <= view.constants_size &&
                         length <= view.constants_size - resource;
@@ -1404,7 +1427,14 @@ bool inferno_metal_resource_batch_parse(const void *opaque, size_t size,
                         (1U << INFERNO_METAL_RESOURCE_BINDING_ARGUMENT),
                     &expected_inline, referenced_buffers, referenced_textures,
                     referenced_samplers, referenced_arguments, UINT32_MAX,
-                    pipeline, error) ||
+                    get32(
+                        inferno_metal_resource_batch_compute_pipeline(
+                            &view, pipeline) +
+                        INFERNO_METAL_RESOURCE_COMPUTE_PIPELINE_LIBRARY_OFFSET),
+                    inferno_metal_resource_batch_compute_pipeline(&view,
+                                                                  pipeline) +
+                        INFERNO_METAL_RESOURCE_COMPUTE_PIPELINE_NAME_OFFSET,
+                    error) ||
                 declaration_start != expected_declaration ||
                 declaration_start > view.declaration_count ||
                 declaration_count >
@@ -1433,7 +1463,7 @@ bool inferno_metal_resource_batch_parse(const void *opaque, size_t size,
                     ordered && usage &&
                     !(usage & ~INFERNO_METAL_RESOURCE_USAGE_MASK) &&
                     !get32(declaration +
-                           INFERNO_METAL_RESOURCE_DECLARATION_RESERVED_OFFSET);
+                           INFERNO_METAL_RESOURCE_DECLARATION_STAGES_OFFSET);
                 if (resource_kind ==
                     INFERNO_METAL_RESOURCE_DECLARATION_BUFFER) {
                     valid = valid && resource < view.buffer_count;
@@ -1533,7 +1563,8 @@ bool inferno_metal_resource_batch_parse(const void *opaque, size_t size,
                     (1U << INFERNO_METAL_RESOURCE_BINDING_BUFFER) |
                     (1U << INFERNO_METAL_RESOURCE_BINDING_INLINE) |
                     (1U << INFERNO_METAL_RESOURCE_BINDING_TEXTURE) |
-                    (1U << INFERNO_METAL_RESOURCE_BINDING_SAMPLER);
+                    (1U << INFERNO_METAL_RESOURCE_BINDING_SAMPLER) |
+                    (1U << INFERNO_METAL_RESOURCE_BINDING_ARGUMENT);
                 if (!pipeline_record ||
                     get32(
                         pipeline_record +
@@ -1552,8 +1583,14 @@ bool inferno_metal_resource_batch_parse(const void *opaque, size_t size,
                 if (!validResourceBindings(
                         &view, vertex_start, vertex_count, render_kinds,
                         &expected_inline, referenced_buffers,
-                        referenced_textures, referenced_samplers, NULL, texture,
-                        UINT32_MAX, error)) {
+                        referenced_textures, referenced_samplers,
+                        referenced_arguments, texture,
+                        get32(
+                            pipeline_record +
+                            INFERNO_METAL_RESOURCE_RENDER_PIPELINE_VERTEX_LIBRARY_OFFSET),
+                        pipeline_record +
+                            INFERNO_METAL_RESOURCE_RENDER_PIPELINE_VERTEX_NAME_OFFSET,
+                        error)) {
                     return false;
                 }
                 expected_binding += vertex_count;
@@ -1566,11 +1603,84 @@ bool inferno_metal_resource_batch_parse(const void *opaque, size_t size,
                 if (!validResourceBindings(
                         &view, fragment_start, fragment_count, render_kinds,
                         &expected_inline, referenced_buffers,
-                        referenced_textures, referenced_samplers, NULL, texture,
-                        UINT32_MAX, error)) {
+                        referenced_textures, referenced_samplers,
+                        referenced_arguments, texture,
+                        get32(
+                            pipeline_record +
+                            INFERNO_METAL_RESOURCE_RENDER_PIPELINE_FRAGMENT_LIBRARY_OFFSET),
+                        pipeline_record +
+                            INFERNO_METAL_RESOURCE_RENDER_PIPELINE_FRAGMENT_NAME_OFFSET,
+                        error)) {
                     return false;
                 }
                 expected_binding += fragment_count;
+                uint32_t declaration_start =
+                    get32(draw +
+                          INFERNO_METAL_RESOURCE_DRAW_DECLARATION_START_OFFSET);
+                uint32_t declaration_count =
+                    get32(draw +
+                          INFERNO_METAL_RESOURCE_DRAW_DECLARATION_COUNT_OFFSET);
+                if (declaration_start != expected_declaration ||
+                    declaration_start > view.declaration_count ||
+                    declaration_count >
+                        view.declaration_count - declaration_start) {
+                    return fail(error, INFERNO_METAL_RESOURCE_RECORD_DRAW,
+                                draw_index);
+                }
+                uint32_t prior_kind = 0, prior_resource = 0, prior_stages = 0;
+                for (uint32_t k = 0; k < declaration_count; k++) {
+                    uint32_t declaration_index = declaration_start + k;
+                    const uint8_t *declaration =
+                        inferno_metal_resource_batch_declaration(
+                            &view, declaration_index);
+                    uint32_t resource_kind = get32(
+                        declaration +
+                        INFERNO_METAL_RESOURCE_DECLARATION_RESOURCE_KIND_OFFSET);
+                    uint32_t resource = get32(
+                        declaration +
+                        INFERNO_METAL_RESOURCE_DECLARATION_RESOURCE_OFFSET);
+                    uint32_t usage =
+                        get32(declaration +
+                              INFERNO_METAL_RESOURCE_DECLARATION_USAGE_OFFSET);
+                    uint32_t stages =
+                        get32(declaration +
+                              INFERNO_METAL_RESOURCE_DECLARATION_STAGES_OFFSET);
+                    bool ordered = !k || resource_kind > prior_kind ||
+                                   (resource_kind == prior_kind &&
+                                    (resource > prior_resource ||
+                                     (resource == prior_resource &&
+                                      stages > prior_stages)));
+                    bool valid =
+                        ordered && usage &&
+                        !(usage & ~INFERNO_METAL_RESOURCE_USAGE_MASK) &&
+                        (stages == INFERNO_METAL_RESOURCE_STAGE_VERTEX ||
+                         stages == INFERNO_METAL_RESOURCE_STAGE_FRAGMENT);
+                    if (resource_kind ==
+                        INFERNO_METAL_RESOURCE_DECLARATION_BUFFER) {
+                        valid = valid && resource < view.buffer_count;
+                        if (valid) {
+                            referenced_buffers[resource] = true;
+                        }
+                    } else if (resource_kind ==
+                               INFERNO_METAL_RESOURCE_DECLARATION_TEXTURE) {
+                        valid = valid && resource < view.texture_count &&
+                                resource != texture;
+                        if (valid) {
+                            referenced_textures[resource] = true;
+                        }
+                    } else {
+                        valid = false;
+                    }
+                    if (!valid) {
+                        return fail(error,
+                                    INFERNO_METAL_RESOURCE_RECORD_DECLARATION,
+                                    declaration_index);
+                    }
+                    prior_kind = resource_kind;
+                    prior_resource = resource;
+                    prior_stages = stages;
+                }
+                expected_declaration += declaration_count;
                 referenced_render[pipeline] = true;
                 referenced_draws[draw_index] = true;
             }
@@ -1662,12 +1772,22 @@ bool inferno_metal_typed_query_parse(uint32_t opcode, const void *opaque,
                     bytes +
                     INFERNO_METAL_RESOURCE_QUERY_ARGUMENT_BUFFER_INDEX_OFFSET) :
                 0,
+        .argument_function_type =
+            opcode == INFERNO_METAL_QUERY_ARGUMENT_LAYOUT ?
+                get32(
+                    bytes +
+                    INFERNO_METAL_RESOURCE_QUERY_ARGUMENT_FUNCTION_TYPE_OFFSET) :
+                0,
         .libraries_offset = INFERNO_METAL_RESOURCE_QUERY_HEADER_SIZE,
     };
     uint32_t required_libraries =
         opcode == INFERNO_METAL_QUERY_RENDER_PIPELINE ? 0 : 1;
     if (view.library_count > INFERNO_METAL_RESOURCE_MAX_LIBRARIES ||
         view.payload_size > INFERNO_METAL_RESOURCE_MAX_PAYLOAD ||
+        (opcode == INFERNO_METAL_QUERY_ARGUMENT_LAYOUT &&
+         view.argument_function_type != INFERNO_METAL_FUNCTION_TYPE_VERTEX &&
+         view.argument_function_type != INFERNO_METAL_FUNCTION_TYPE_FRAGMENT &&
+         view.argument_function_type != INFERNO_METAL_FUNCTION_TYPE_KERNEL) ||
         (required_libraries && view.library_count != required_libraries) ||
         (!required_libraries &&
          (view.library_count < 1 || view.library_count > 2))) {

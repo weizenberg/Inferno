@@ -36,6 +36,20 @@ static uint32_t wireGet32(const uint8_t *p)
            (uint32_t)p[3] << 24;
 }
 
+static uint32_t compilerStageForFunctionType(uint32_t type)
+{
+    switch (type) {
+    case INFERNO_METAL_FUNCTION_TYPE_KERNEL:
+        return INFERNO_METAL_RESOURCE_COMPILER_STAGE_NONE;
+    case INFERNO_METAL_FUNCTION_TYPE_VERTEX:
+        return INFERNO_METAL_RESOURCE_COMPILER_STAGE_VERTEX;
+    case INFERNO_METAL_FUNCTION_TYPE_FRAGMENT:
+        return INFERNO_METAL_RESOURCE_COMPILER_STAGE_FRAGMENT;
+    default:
+        return UINT32_MAX;
+    }
+}
+
 static uint64_t monotonicNS(void)
 {
     struct timespec value;
@@ -442,10 +456,31 @@ static bool queryTyped(ImtlCoordinator *c, uint32_t opcode,
         return fail(error, IMTL_COORDINATOR_ERROR_INVALID_ARGUMENT,
                     kIOReturnBadArgument, NULL, 0, 0);
     }
+    uint32_t expected_stage =
+        argument ?
+            compilerStageForFunctionType(wireGet32(
+                bytes +
+                INFERNO_METAL_RESOURCE_QUERY_ARGUMENT_FUNCTION_TYPE_OFFSET)) :
+            INFERNO_METAL_RESOURCE_COMPILER_STAGE_NONE;
+    ImtlQueryReply temporary = { 0 };
     pthread_mutex_lock(&c->mutex);
-    bool result = monotonicNS() < deadline &&
-                  queryLocked(c, opcode, NULL, 0, NULL, width, height, depth,
-                              bytes, size, out, error, deadline);
+    bool result =
+        monotonicNS() < deadline &&
+        queryLocked(c, opcode, NULL, 0, NULL, width, height, depth, bytes, size,
+                    argument ? &temporary : out, error, deadline);
+    if (result && argument && temporary.result.stage != expected_stage) {
+        uint64_t sequence = temporary.sequence;
+        IOReturn timer_error = temporary.timer_error;
+        IOReturn cleanup = temporary.cleanup_io;
+        imtl_query_reply_free(&temporary);
+        result = fail(error, IMTL_COORDINATOR_ERROR_PROTOCOL,
+                      kIOReturnBadMessageID, NULL, sequence, cleanup);
+        if (error) {
+            error->timer_error = timer_error;
+        }
+    } else if (result && argument) {
+        *out = temporary;
+    }
     if (!result && error && error->kind == IMTL_COORDINATOR_ERROR_NONE) {
         fail(error, IMTL_COORDINATOR_ERROR_TIMEOUT, kIOReturnTimeout, NULL, 0,
              0);

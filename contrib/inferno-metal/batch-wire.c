@@ -642,6 +642,19 @@ static bool validBatch5ComputePipeline(const ImtlBatch5ComputePipeline *p,
     return p->library_id < library_count && validBatch5Name(p->function_name);
 }
 
+static bool validBatch5ArgumentFunction(const ImtlBatch5ArgumentFunction *f,
+                                        uint32_t library_count)
+{
+    return f->library_id < library_count && validBatch5Name(f->function_name);
+}
+
+static bool validArgumentFunctionType(uint32_t type)
+{
+    return type == INFERNO_METAL_FUNCTION_TYPE_KERNEL ||
+           type == INFERNO_METAL_FUNCTION_TYPE_VERTEX ||
+           type == INFERNO_METAL_FUNCTION_TYPE_FRAGMENT;
+}
+
 static bool sameBatch5ComputePipeline(const ImtlBatch5ComputePipeline *a,
                                       const ImtlBatch5ComputePipeline *b)
 {
@@ -782,7 +795,8 @@ validBatch5Bindings(const ImtlBatch5Manifest *m, uint32_t start, uint32_t count,
                     uint32_t allowed_kinds, size_t *inline_size,
                     bool *referenced_buffers, bool *referenced_textures,
                     bool *referenced_samplers, bool *referenced_arguments,
-                    uint32_t forbidden_texture, uint32_t compute_pipeline)
+                    uint32_t forbidden_texture, uint32_t expected_library,
+                    const char *expected_function)
 {
     if (start > m->binding_count || count > m->binding_count - start) {
         return false;
@@ -842,17 +856,24 @@ validBatch5Bindings(const ImtlBatch5Manifest *m, uint32_t start, uint32_t count,
             }
         } else if (b->kind == INFERNO_METAL_RESOURCE_BINDING_ARGUMENT) {
             valid = valid && b->resource_id < m->argument_count && !b->offset &&
-                    !b->bytes && !b->length &&
-                    compute_pipeline < m->compute_pipeline_count;
+                    !b->bytes && !b->length && expected_function;
             if (valid) {
                 const ImtlBatch5Argument *argument =
                     &m->arguments[b->resource_id];
-                const ImtlBatch5ComputePipeline *pipeline =
-                    &m->compute_pipelines[compute_pipeline];
-                valid =
-                    argument->buffer_index == b->index &&
-                    argument->library_id == pipeline->library_id &&
-                    !strcmp(argument->function_name, pipeline->function_name);
+                valid = argument->buffer_index == b->index &&
+                        argument->library_id == expected_library &&
+                        !strcmp(argument->function_name, expected_function);
+                for (uint32_t j = 0; valid && forbidden_texture != UINT32_MAX &&
+                                     j < argument->member_count;
+                     j++) {
+                    const ImtlBatch5ArgumentMember *member =
+                        &m->members[argument->member_start + j];
+                    if (member->kind ==
+                            INFERNO_METAL_RESOURCE_ARGUMENT_MEMBER_TEXTURE &&
+                        member->resource == forbidden_texture) {
+                        valid = false;
+                    }
+                }
             }
             if (valid) {
                 referenced_arguments[b->resource_id] = true;
@@ -1021,21 +1042,25 @@ static bool validateBatch5Manifest(const ImtlBatch5Manifest *m,
             if ((j && member->member_id <= prior_id) ||
                 member->kind < INFERNO_METAL_RESOURCE_ARGUMENT_MEMBER_BUFFER ||
                 member->kind >
-                    INFERNO_METAL_RESOURCE_ARGUMENT_MEMBER_CONSTANT) {
+                    INFERNO_METAL_RESOURCE_ARGUMENT_MEMBER_CONSTANT ||
+                member->flags & ~INFERNO_METAL_RESOURCE_MEMBER_FLAG_MASK) {
                 return false;
             }
+            bool is_null = member->flags & INFERNO_METAL_RESOURCE_MEMBER_NULL;
             bool valid = false;
             switch (member->kind) {
             case INFERNO_METAL_RESOURCE_ARGUMENT_MEMBER_BUFFER:
-                valid = member->resource < m->buffer_count &&
-                        member->offset < m->buffers[member->resource].length &&
-                        !member->constant_bytes && !member->constant_length;
-                if (valid) {
+                valid = !member->constant_bytes && !member->constant_length &&
+                        (is_null ? (!member->resource && !member->offset) :
+                                   (member->resource < m->buffer_count &&
+                                    member->offset <
+                                        m->buffers[member->resource].length));
+                if (valid && !is_null) {
                     referenced_buffers[member->resource] = true;
                 }
                 break;
             case INFERNO_METAL_RESOURCE_ARGUMENT_MEMBER_TEXTURE:
-                valid = member->resource < m->texture_count &&
+                valid = !member->flags && member->resource < m->texture_count &&
                         !member->offset && !member->constant_bytes &&
                         !member->constant_length;
                 if (valid) {
@@ -1043,7 +1068,7 @@ static bool validateBatch5Manifest(const ImtlBatch5Manifest *m,
                 }
                 break;
             case INFERNO_METAL_RESOURCE_ARGUMENT_MEMBER_SAMPLER:
-                valid = member->resource < m->sampler_count &&
+                valid = !member->flags && member->resource < m->sampler_count &&
                         !member->offset && !member->constant_bytes &&
                         !member->constant_length &&
                         m->samplers[member->resource].support_argument_buffers;
@@ -1052,8 +1077,9 @@ static bool validateBatch5Manifest(const ImtlBatch5Manifest *m,
                 }
                 break;
             case INFERNO_METAL_RESOURCE_ARGUMENT_MEMBER_CONSTANT:
-                valid = !member->resource && !member->offset &&
-                        member->constant_bytes && member->constant_length &&
+                valid = !member->flags && !member->resource &&
+                        !member->offset && member->constant_bytes &&
+                        member->constant_length &&
                         member->constant_length <=
                             INFERNO_METAL_ARGUMENT_MAX_CONSTANT &&
                         checkedAdd(constants_size, member->constant_length) &&
@@ -1077,6 +1103,10 @@ static bool validateBatch5Manifest(const ImtlBatch5Manifest *m,
         const ImtlBatch5Command *command = &m->commands[i];
         if (command->kind == INFERNO_METAL_RESOURCE_COMMAND_COMPUTE) {
             const ImtlBatch5ComputeCommand *compute = &command->value.compute;
+            const ImtlBatch5ComputePipeline *pipeline =
+                compute->pipeline_id < m->compute_pipeline_count ?
+                    &m->compute_pipelines[compute->pipeline_id] :
+                    NULL;
             uint64_t grid_product = 0, group_product = 0;
             bool grid_valid = checkedProduct(
                 compute->grid_width, compute->grid_height, compute->grid_depth,
@@ -1102,7 +1132,8 @@ static bool validateBatch5Manifest(const ImtlBatch5Manifest *m,
                         (1U << INFERNO_METAL_RESOURCE_BINDING_ARGUMENT),
                     inline_size, referenced_buffers, referenced_textures,
                     referenced_samplers, referenced_arguments, UINT32_MAX,
-                    compute->pipeline_id) ||
+                    pipeline ? pipeline->library_id : UINT32_MAX,
+                    pipeline ? pipeline->function_name : NULL) ||
                 compute->declaration_start != expected_declaration ||
                 compute->declaration_count >
                     m->declaration_count - expected_declaration) {
@@ -1116,7 +1147,7 @@ static bool validateBatch5Manifest(const ImtlBatch5Manifest *m,
                                (declaration->resource_kind == prior_kind &&
                                 declaration->resource > prior_resource);
                 bool valid =
-                    ordered && declaration->usage &&
+                    ordered && declaration->usage && !declaration->stages &&
                     !(declaration->usage & ~INFERNO_METAL_RESOURCE_USAGE_MASK);
                 if (declaration->resource_kind ==
                     INFERNO_METAL_RESOURCE_DECLARATION_BUFFER) {
@@ -1163,10 +1194,15 @@ static bool validateBatch5Manifest(const ImtlBatch5Manifest *m,
                 (1U << INFERNO_METAL_RESOURCE_BINDING_BUFFER) |
                 (1U << INFERNO_METAL_RESOURCE_BINDING_INLINE) |
                 (1U << INFERNO_METAL_RESOURCE_BINDING_TEXTURE) |
-                (1U << INFERNO_METAL_RESOURCE_BINDING_SAMPLER);
+                (1U << INFERNO_METAL_RESOURCE_BINDING_SAMPLER) |
+                (1U << INFERNO_METAL_RESOURCE_BINDING_ARGUMENT);
             for (uint32_t j = 0; j < render->draw_count; j++) {
                 uint32_t draw_index = render->draw_start + j;
                 const ImtlBatch5Draw *draw = &m->draws[draw_index];
+                const ImtlBatch5RenderPipeline *pipeline =
+                    draw->render_pipeline_id < m->render_pipeline_count ?
+                        &m->render_pipelines[draw->render_pipeline_id] :
+                        NULL;
                 if (draw->render_pipeline_id >= m->render_pipeline_count ||
                     m->render_pipelines[draw->render_pipeline_id]
                             .color0_pixel_format !=
@@ -1180,7 +1216,9 @@ static bool validateBatch5Manifest(const ImtlBatch5Manifest *m,
                         draw->vertex_binding_count, render_kinds, inline_size,
                         referenced_buffers, referenced_textures,
                         referenced_samplers, referenced_arguments,
-                        render->texture_id, UINT32_MAX)) {
+                        render->texture_id,
+                        pipeline ? pipeline->vertex_library_id : UINT32_MAX,
+                        pipeline ? pipeline->vertex_function_name : NULL)) {
                     return false;
                 }
                 expected_binding += draw->vertex_binding_count;
@@ -1190,10 +1228,59 @@ static bool validateBatch5Manifest(const ImtlBatch5Manifest *m,
                         draw->fragment_binding_count, render_kinds, inline_size,
                         referenced_buffers, referenced_textures,
                         referenced_samplers, referenced_arguments,
-                        render->texture_id, UINT32_MAX)) {
+                        render->texture_id,
+                        pipeline ? pipeline->fragment_library_id : UINT32_MAX,
+                        pipeline ? pipeline->fragment_function_name : NULL)) {
                     return false;
                 }
                 expected_binding += draw->fragment_binding_count;
+                if (draw->declaration_start != expected_declaration ||
+                    draw->declaration_count >
+                        m->declaration_count - expected_declaration) {
+                    return false;
+                }
+                uint32_t prior_kind = 0, prior_resource = 0, prior_stages = 0;
+                for (uint32_t k = 0; k < draw->declaration_count; k++) {
+                    const ImtlBatch5ResourceDeclaration *declaration =
+                        &m->declarations[draw->declaration_start + k];
+                    bool ordered = !k ||
+                                   declaration->resource_kind > prior_kind ||
+                                   (declaration->resource_kind == prior_kind &&
+                                    (declaration->resource > prior_resource ||
+                                     (declaration->resource == prior_resource &&
+                                      declaration->stages > prior_stages)));
+                    bool valid = ordered && declaration->usage &&
+                                 !(declaration->usage &
+                                   ~INFERNO_METAL_RESOURCE_USAGE_MASK) &&
+                                 (declaration->stages ==
+                                      INFERNO_METAL_RESOURCE_STAGE_VERTEX ||
+                                  declaration->stages ==
+                                      INFERNO_METAL_RESOURCE_STAGE_FRAGMENT);
+                    if (declaration->resource_kind ==
+                        INFERNO_METAL_RESOURCE_DECLARATION_BUFFER) {
+                        valid =
+                            valid && declaration->resource < m->buffer_count;
+                        if (valid) {
+                            referenced_buffers[declaration->resource] = true;
+                        }
+                    } else if (declaration->resource_kind ==
+                               INFERNO_METAL_RESOURCE_DECLARATION_TEXTURE) {
+                        valid =
+                            valid && declaration->resource < m->texture_count;
+                        if (valid) {
+                            referenced_textures[declaration->resource] = true;
+                        }
+                    } else {
+                        valid = false;
+                    }
+                    if (!valid) {
+                        return false;
+                    }
+                    prior_kind = declaration->resource_kind;
+                    prior_resource = declaration->resource;
+                    prior_stages = declaration->stages;
+                }
+                expected_declaration += draw->declaration_count;
                 referenced_render[draw->render_pipeline_id] = true;
                 referenced_draws[draw_index] = true;
             }
@@ -1235,6 +1322,16 @@ static void putBatch5ComputePipeline(uint8_t *record,
           pipeline->library_id);
     memcpy(record + INFERNO_METAL_RESOURCE_COMPUTE_PIPELINE_NAME_OFFSET,
            pipeline->function_name, strlen(pipeline->function_name));
+}
+
+static void
+putBatch5ArgumentFunction(uint8_t *record,
+                          const ImtlBatch5ArgumentFunction *function)
+{
+    put32(record + INFERNO_METAL_RESOURCE_COMPUTE_PIPELINE_LIBRARY_OFFSET,
+          function->library_id);
+    memcpy(record + INFERNO_METAL_RESOURCE_COMPUTE_PIPELINE_NAME_OFFSET,
+           function->function_name, strlen(function->function_name));
 }
 
 static void putBatch5RenderPipeline(uint8_t *record,
@@ -1618,6 +1715,10 @@ bool imtl_batch5_builder_build(const ImtlBatch5Manifest *m, uint8_t **out,
         put32(record + INFERNO_METAL_RESOURCE_DRAW_FILL_MODE_OFFSET,
               draw->fill_mode);
         put32(record + INFERNO_METAL_RESOURCE_DRAW_FLAGS_OFFSET, draw->flags);
+        put32(record + INFERNO_METAL_RESOURCE_DRAW_DECLARATION_START_OFFSET,
+              draw->declaration_start);
+        put32(record + INFERNO_METAL_RESOURCE_DRAW_DECLARATION_COUNT_OFFSET,
+              draw->declaration_count);
         if (draw->flags & INFERNO_METAL_RESOURCE_DRAW_SCISSOR) {
             uint8_t *scissor =
                 record + INFERNO_METAL_RESOURCE_DRAW_SCISSOR_OFFSET;
@@ -1705,6 +1806,8 @@ bool imtl_batch5_builder_build(const ImtlBatch5Manifest *m, uint8_t **out,
         put32(record + INFERNO_METAL_RESOURCE_MEMBER_KIND_OFFSET, member->kind);
         put32(record + INFERNO_METAL_RESOURCE_MEMBER_ID_OFFSET,
               member->member_id);
+        put32(record + INFERNO_METAL_RESOURCE_MEMBER_FLAGS_OFFSET,
+              member->flags);
         if (member->kind == INFERNO_METAL_RESOURCE_ARGUMENT_MEMBER_CONSTANT) {
             put32(record + INFERNO_METAL_RESOURCE_MEMBER_RESOURCE_OFFSET,
                   (uint32_t)constants_cursor);
@@ -1731,6 +1834,8 @@ bool imtl_batch5_builder_build(const ImtlBatch5Manifest *m, uint8_t **out,
               declaration->resource);
         put32(record + INFERNO_METAL_RESOURCE_DECLARATION_USAGE_OFFSET,
               declaration->usage);
+        put32(record + INFERNO_METAL_RESOURCE_DECLARATION_STAGES_OFFSET,
+              declaration->stages);
     }
     *out = bytes;
     *out_size = size;
@@ -1758,16 +1863,20 @@ bool imtl_typed_query_builder_build(uint32_t opcode,
              (m->library_count < 1 || m->library_count > 2) :
              m->library_count != 1) ||
         ((opcode == INFERNO_METAL_QUERY_LIBRARY_TYPED) &&
-         (m->compute_pipeline || m->render_pipeline)) ||
+         (m->compute_pipeline || m->render_pipeline || m->argument_function)) ||
         ((opcode == INFERNO_METAL_QUERY_PIPELINE_TYPED ||
-          opcode == INFERNO_METAL_QUERY_IMAGEBLOCK_TYPED ||
-          opcode == INFERNO_METAL_QUERY_ARGUMENT_LAYOUT) &&
-         (!m->compute_pipeline || m->render_pipeline)) ||
+          opcode == INFERNO_METAL_QUERY_IMAGEBLOCK_TYPED) &&
+         (!m->compute_pipeline || m->render_pipeline ||
+          m->argument_function)) ||
         (opcode == INFERNO_METAL_QUERY_RENDER_PIPELINE &&
-         (m->compute_pipeline || !m->render_pipeline)) ||
+         (m->compute_pipeline || !m->render_pipeline ||
+          m->argument_function)) ||
+        (opcode == INFERNO_METAL_QUERY_ARGUMENT_LAYOUT &&
+         (m->compute_pipeline || m->render_pipeline || !m->argument_function ||
+          !validArgumentFunctionType(m->argument_function_type))) ||
         (opcode == INFERNO_METAL_QUERY_ARGUMENT_LAYOUT ?
              m->argument_buffer_index > 30 :
-             m->argument_buffer_index != 0)) {
+             (m->argument_buffer_index || m->argument_function_type))) {
         return false;
     }
 
@@ -1800,6 +1909,13 @@ bool imtl_typed_query_builder_build(uint32_t opcode,
         referenced[m->render_pipeline->vertex_library_id] = true;
         referenced[m->render_pipeline->fragment_library_id] = true;
         pipeline_size = INFERNO_METAL_RESOURCE_RENDER_PIPELINE_RECORD_SIZE;
+    } else if (m->argument_function) {
+        if (!validBatch5ArgumentFunction(m->argument_function,
+                                         m->library_count)) {
+            return false;
+        }
+        referenced[m->argument_function->library_id] = true;
+        pipeline_size = INFERNO_METAL_RESOURCE_COMPUTE_PIPELINE_RECORD_SIZE;
     } else {
         referenced[0] = true;
     }
@@ -1829,6 +1945,9 @@ bool imtl_typed_query_builder_build(uint32_t opcode,
     if (opcode == INFERNO_METAL_QUERY_ARGUMENT_LAYOUT) {
         put32(bytes + INFERNO_METAL_RESOURCE_QUERY_ARGUMENT_BUFFER_INDEX_OFFSET,
               m->argument_buffer_index);
+        put32(bytes +
+                  INFERNO_METAL_RESOURCE_QUERY_ARGUMENT_FUNCTION_TYPE_OFFSET,
+              m->argument_function_type);
     }
     size_t libraries_offset = INFERNO_METAL_RESOURCE_QUERY_HEADER_SIZE;
     size_t pipeline_offset =
@@ -1854,6 +1973,9 @@ bool imtl_typed_query_builder_build(uint32_t opcode,
         putBatch5ComputePipeline(bytes + pipeline_offset, m->compute_pipeline);
     } else if (m->render_pipeline) {
         putBatch5RenderPipeline(bytes + pipeline_offset, m->render_pipeline);
+    } else if (m->argument_function) {
+        putBatch5ArgumentFunction(bytes + pipeline_offset,
+                                  m->argument_function);
     }
     *out = bytes;
     *out_size = size;

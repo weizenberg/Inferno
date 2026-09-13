@@ -27,11 +27,12 @@ NS_ASSUME_NONNULL_BEGIN
 
     @interface InfernoMetalArgumentLayoutKey : NSObject <NSCopying>
     -(instancetype)initWithPayload : (NSData *)payload kind
-        : (uint32_t)kind name : (NSString *)name bufferIndex
-        : (NSUInteger)index;
+        : (uint32_t)kind name : (NSString *)name functionType
+        : (MTLFunctionType)type bufferIndex : (NSUInteger)index;
     @property(nonatomic, readonly) NSData *payload;
     @property(nonatomic, readonly) uint32_t libraryKind;
     @property(nonatomic, readonly) NSString *functionName;
+    @property(nonatomic, readonly) MTLFunctionType functionType;
     @property(nonatomic, readonly) NSUInteger bufferIndex;
     @end
 
@@ -57,12 +58,14 @@ NS_ASSUME_NONNULL_BEGIN
     -(instancetype)initWithLayout
         : (InfernoMetalArgumentMemberLayout *)layout memberIndex
         : (NSUInteger)memberIndex resource : (nullable id)resource offset
-        : (NSUInteger)offset constantData : (nullable NSData *)data;
+        : (NSUInteger)offset constantData
+        : (nullable NSData *)data explicitlyNull : (BOOL)explicitlyNull;
     @property(nonatomic, readonly) InfernoMetalArgumentMemberLayout *layout;
     @property(nonatomic, readonly) NSUInteger memberIndex;
     @property(nonatomic, readonly, nullable) id resource;
     @property(nonatomic, readonly) NSUInteger offset;
     @property(nonatomic, readonly, nullable) NSData *constantData;
+    @property(nonatomic, readonly) BOOL explicitlyNull;
     @end
 
     @interface InfernoMetalEncodedArgument : NSObject
@@ -86,8 +89,12 @@ NS_ASSUME_NONNULL_BEGIN
 
     @interface InfernoMetalResourceDeclaration : NSObject
     -(instancetype)initWithResource : (id)resource usage : (uint32_t)usage;
+    -(instancetype)initWithResource : (id)resource vertexUsage
+        : (uint32_t)vertexUsage fragmentUsage : (uint32_t)fragmentUsage;
     @property(nonatomic, readonly) id resource;
     @property(nonatomic) uint32_t usage;
+    @property(nonatomic) uint32_t vertexUsage;
+    @property(nonatomic) uint32_t fragmentUsage;
     @end
 
 NS_ASSUME_NONNULL_END

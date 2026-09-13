@@ -19,6 +19,7 @@
 
 @class InfernoMetalCommandBuffer;
 @class InfernoMetalRenderPipelineState;
+@class InfernoMetalResourceDeclaration;
 @class InfernoMetalTexture;
 
 NS_ASSUME_NONNULL_BEGIN
@@ -30,6 +31,8 @@ NS_ASSUME_NONNULL_BEGIN
     @property(nonatomic, copy) NSArray *fragmentBindings;
     @property(nonatomic, copy) NSArray *fragmentTextureBindings;
     @property(nonatomic, copy) NSArray *fragmentSamplerBindings;
+    @property(nonatomic, copy)
+        NSArray<InfernoMetalResourceDeclaration *> *resourceDeclarations;
     @property(nonatomic) MTLPrimitiveType primitiveType;
     @property(nonatomic) NSUInteger vertexStart;
     @property(nonatomic) NSUInteger vertexCount;

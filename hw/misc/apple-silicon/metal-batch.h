@@ -103,6 +103,7 @@ typedef struct InfernoMetalTypedQueryView {
     uint32_t library_count;
     uint32_t payload_size;
     uint32_t argument_buffer_index;
+    uint32_t argument_function_type;
     size_t libraries_offset;
     size_t pipeline_offset;
     size_t pipeline_size;

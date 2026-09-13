@@ -209,6 +209,8 @@ typedef struct ImtlBatch5Draw {
     float blend_green;
     float blend_blue;
     float blend_alpha;
+    uint32_t declaration_start;
+    uint32_t declaration_count;
 } ImtlBatch5Draw;
 
 typedef struct ImtlBatch5Argument {
@@ -228,13 +230,20 @@ typedef struct ImtlBatch5ArgumentMember {
     uint64_t offset;
     const void *constant_bytes;
     uint32_t constant_length;
+    uint32_t flags;
 } ImtlBatch5ArgumentMember;
 
 typedef struct ImtlBatch5ResourceDeclaration {
     uint32_t resource_kind;
     uint32_t resource;
     uint32_t usage;
+    uint32_t stages;
 } ImtlBatch5ResourceDeclaration;
+
+typedef struct ImtlBatch5ArgumentFunction {
+    uint32_t library_id;
+    const char *function_name;
+} ImtlBatch5ArgumentFunction;
 
 typedef struct ImtlBatch5Manifest {
     const ImtlBatch5Library *libraries;
@@ -268,7 +277,9 @@ typedef struct ImtlTypedQueryManifest {
     uint32_t library_count;
     const ImtlBatch5ComputePipeline *compute_pipeline;
     const ImtlBatch5RenderPipeline *render_pipeline;
+    const ImtlBatch5ArgumentFunction *argument_function;
     uint32_t argument_buffer_index;
+    uint32_t argument_function_type;
 } ImtlTypedQueryManifest;
 
 typedef struct ImtlBatch5Result {
@@ -309,7 +320,7 @@ bool imtl_batch_decode_result(const uint8_t *bytes, size_t size,
                               uint32_t expected_images_size,
                               ImtlBatchResult *out);
 
-/* Builds an immutable copied version-6 resource manifest. Raw payload, inline,
+/* Builds an immutable copied version-7 resource manifest. Raw payload, inline,
  * and image bytes are packed without padding in their canonical region order.
  */
 bool imtl_batch5_builder_build(const ImtlBatch5Manifest *manifest,
@@ -321,7 +332,7 @@ bool imtl_typed_query_builder_build(uint32_t opcode,
                                     const ImtlTypedQueryManifest *manifest,
                                     uint8_t **bytes, size_t *size);
 
-/* Validates the complete version-6 resource result before publishing out. */
+/* Validates the complete version-7 resource result before publishing out. */
 bool imtl_batch5_decode_result(const uint8_t *bytes, size_t size,
                                uint64_t expected_sequence,
                                uint32_t expected_buffer_count,

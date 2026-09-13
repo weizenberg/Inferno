@@ -14,11 +14,11 @@
  * You should have received a copy of the GNU Affero General Public License
  * along with this program. If not, see <https://www.gnu.org/licenses/>.
  */
+#import "InfernoMetalCompilerContext.h"
 #import "InfernoMetalArgumentEncoder.h"
 #import "InfernoMetalArgumentObjects.h"
 #import "InfernoMetalBuffer.h"
 #import "InfernoMetalCommandQueue.h"
-#import "InfernoMetalCompilerContext.h"
 #import "InfernoMetalComputePipelineState.h"
 #import "InfernoMetalContextPrivate.h"
 #import "InfernoMetalErrors.h"
@@ -278,11 +278,21 @@ static BOOL defaultSwizzle(MTLTextureSwizzleChannels value)
                               (InfernoMetalFunction *)function
                                             bufferIndex:(NSUInteger)index
 {
+    MTLFunctionType functionType = function.functionType;
+    if (functionType != MTLFunctionTypeKernel &&
+        functionType != MTLFunctionTypeVertex &&
+        functionType != MTLFunctionTypeFragment)
+        raiseQueryException(
+            InfernoMetalUnsupportedException,
+            InfernoMetalMakeError(InfernoMetalErrorUnsupported,
+                                  @"This function type does not support "
+                                   "argument layout queries"));
     InfernoMetalLibrary *library = function.infernoLibrary;
     InfernoMetalArgumentLayoutKey *key = [[InfernoMetalArgumentLayoutKey alloc]
         initWithPayload:library.infernoPayload
                    kind:library.infernoLibraryKind
                    name:function.name
+           functionType:functionType
             bufferIndex:index];
     InfernoMetalArgumentLayout *layout = [self cachedArgumentLayoutForKey:key];
     id<MTLDevice> owner = [self executionOwner];
@@ -297,15 +307,16 @@ static BOOL defaultSwizzle(MTLTextureSwizzleChannels value)
             .bytes = library.infernoPayload.bytes,
             .size = library.infernoPayload.length,
         };
-        ImtlBatch5ComputePipeline pipelineRecord = {
+        ImtlBatch5ArgumentFunction functionRecord = {
             .library_id = 0,
             .function_name = function.name.UTF8String,
         };
         ImtlTypedQueryManifest manifest = {
             .libraries = &libraryRecord,
             .library_count = 1,
-            .compute_pipeline = &pipelineRecord,
+            .argument_function = &functionRecord,
             .argument_buffer_index = (uint32_t)index,
+            .argument_function_type = (uint32_t)functionType,
         };
         ImtlQueryReply reply = { 0 };
         ImtlCoordinatorError coordinatorError = { 0 };
@@ -467,8 +478,8 @@ static NSError *localLibraryError(InfernoMetalErrorCode code,
                 @"The device owner is no longer available");
         return nil;
     }
-    NSData *snapshot =
-        [NSData dataWithBytes:payload.bytes length:payload.length];
+    NSData *snapshot = [NSData dataWithBytes:payload.bytes
+                                      length:payload.length];
     ImtlBatch5Library record = {
         .kind = kind,
         .bytes = snapshot.bytes,
@@ -1051,8 +1062,8 @@ invalid:
                                            @"Pipeline options are unsupported");
         return nil;
     }
-    if (!descriptor ||
-        ![self validateRenderPipelineDescriptor:descriptor error:error])
+    if (!descriptor || ![self validateRenderPipelineDescriptor:descriptor
+                                                         error:error])
         return nil;
     id<MTLDevice> owner = [self executionOwner];
     if (!owner) {

@@ -99,9 +99,9 @@ typedef struct ImtlArgumentLayoutMember {
  * bytes passed to the decoder. They remain valid only while those bytes remain
  * unchanged and alive. Kernel ACK does not invalidate a private reply buffer;
  * the buffer owner determines the lifetime of every decoded view. stage is
- * meaningful only for an opcode-11 function failure. render_pipeline is
- * meaningful only for an opcode-11 success; the library fields are meaningful
- * only for a successful library query.
+ * meaningful for an opcode-11 function failure and every opcode-13 result.
+ * render_pipeline is meaningful only for an opcode-11 success; the library
+ * fields are meaningful only for a successful library query.
  */
 typedef struct ImtlCompilerResult {
     uint32_t opcode;
